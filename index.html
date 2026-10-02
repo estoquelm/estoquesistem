@@ -687,6 +687,31 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const [abaPedidoSepar, setAbaPedidoSepar] = useState("itens"); // 'itens' | 'historico'
   const [filtrosSepar, setFiltrosSepar] = useState({ loja: "", status: "", busca: "" });
   const scanInputSeparRef = useRef(null);
+  // Porta-palete escolhido para cada item do pedido { [itemId]: ppId }. Fica salvo no navegador
+  // (não exige nenhuma coluna nova no banco). Sem escolha = "Automático".
+  const [ppEscolhaSepar, setPpEscolhaSepar] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("ppEscolhaSepar") || "{}"); } catch (e) { return {}; }
+  });
+  // Quanto foi bipado de cada porta-palete em cada item { [itemId]: { [ppId | "auto"]: qtd } }.
+  // Assim o mesmo produto pode sair de vários porta-paletes no mesmo pedido.
+  const [ppAlocSepar, setPpAlocSepar] = useState(() => {
+    try { return JSON.parse(localStorage.getItem("ppAlocSepar") || "{}"); } catch (e) { return {}; }
+  });
+  function salvarAlocSepar(fn) {
+    setPpAlocSepar(prev => {
+      const n = fn(prev);
+      try { localStorage.setItem("ppAlocSepar", JSON.stringify(n)); } catch (e) {}
+      return n;
+    });
+  }
+  function escolherPPItemSepar(itemId, ppId) {
+    setPpEscolhaSepar(prev => {
+      const n = { ...prev };
+      if (ppId) n[itemId] = Number(ppId); else delete n[itemId];
+      try { localStorage.setItem("ppEscolhaSepar", JSON.stringify(n)); } catch (e) {}
+      return n;
+    });
+  }
 
   const [notaEmpresaSel, setNotaEmpresaSel] = useState("");
   const [notaFornecedorSel, setNotaFornecedorSel] = useState("");
@@ -1349,7 +1374,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       const origemTxt = ppAtivo ? ` de ${portaPaleteLabel(ppAtivo)}` : "";
       if (sepQtdModoPP === "bip") {
         adicionarSepPP(prod, 1);
-        setSepMsgPP({ tipo: "ok", texto: `+1 unidade de ${prod.nome} (${prod.sku})${origemTxt}` });
+        const emVarios = !ppAtivo && distribuicaoDoProduto(prod).filter(r => r.ppId).length > 1;
+        setSepMsgPP({ tipo: emVarios ? "info" : "ok", texto: `+1 unidade de ${prod.nome} (${prod.sku})${origemTxt}${emVarios ? " — este produto está em mais de um porta-palete: escolha de qual retirar na lista ao lado." : ""}` });
       } else {
         const qtdStr = window.prompt(`Quantidade de "${prod.nome}" a separar${origemTxt}:`);
         const qtd = parseInt(qtdStr);
@@ -1375,9 +1401,34 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     const locais = distribuicaoDoProduto(prod).map(r => `${r.ppId ? portaPaleteLabel(portaPaleteById(r.ppId)) : "sem porta-palete"}: ${r.qtd} un`);
     const estoqueAtual = ppId ? qtdNaPP(prod, ppId) : prod.qtd;
     setItensSeparPP(prev => {
-      const ex = prev.find(i => i.produtoId === prod.id && (i.ppId || null) === ppId);
+      const ex = ppId
+        ? prev.find(i => i.produtoId === prod.id && (i.ppId || null) === ppId)
+        : prev.find(i => i.produtoId === prod.id);
       if (ex) return prev.map(i => i === ex ? { ...i, qtd: i.qtd + qtdAdd } : i);
       return [...prev, { produtoId: prod.id, ppId, ppLabel: ppAtivo ? portaPaleteLabel(ppAtivo) : "", nome: prod.nome, sku: prod.sku, qtd: qtdAdd, estoqueAtual, locais }];
+    });
+  }
+
+  // Troca de qual porta-palete um item da lista vai sair ("" = automático)
+  function trocarPPItemSepPP(idx, novoPpId) {
+    setItensSeparPP(prev => {
+      const item = prev[idx];
+      if (!item) return prev;
+      const prod = produtos.find(p => p.id === item.produtoId);
+      const ppId = novoPpId ? Number(novoPpId) : null;
+      const pp = ppId ? portaPaleteById(ppId) : null;
+      const atualizado = {
+        ...item, ppId, ppLabel: pp ? portaPaleteLabel(pp) : "",
+        estoqueAtual: prod ? (ppId ? qtdNaPP(prod, ppId) : prod.qtd) : item.estoqueAtual,
+      };
+      // se já existe outro item igual (mesmo produto e mesmo porta-palete), junta os dois
+      const outro = prev.findIndex((i, ii) => ii !== idx && i.produtoId === item.produtoId && (i.ppId || null) === ppId);
+      if (outro >= 0) {
+        return prev
+          .map((i, ii) => ii === outro ? { ...i, qtd: i.qtd + item.qtd } : i)
+          .filter((_, ii) => ii !== idx);
+      }
+      return prev.map((i, ii) => ii === idx ? atualizado : i);
     });
   }
 
@@ -2025,13 +2076,31 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       setScanMsgSepar({ tipo: "excesso", texto: `Quantidade excedida para: ${item.descricao} — restam apenas ${item.quantidade - item.quantidadeBipada}, você tentou adicionar ${qtdAdicional}.` });
       return;
     }
+    // Porta-palete escolhido para este item: não deixa bipar mais do que existe nele
+    const ppEsc = ppEscolhaSepar[item.id];
+    const prodItem = produtos.find(p => p.id === item.produtoId);
+    const ppEscLabel = ppEsc ? portaPaleteLabel(portaPaleteById(ppEsc)) : "";
+    if (ppEsc && prodItem) {
+      const dispPP = qtdNaPP(prodItem, ppEsc);
+      // soma o que já foi bipado deste produto nesse porta-palete (em qualquer item do pedido)
+      const jaDoPP = getItensDoPedidoSepar(pedidoSeparAtivo.id)
+        .filter(it => it.produtoId === item.produtoId)
+        .reduce((t, it) => t + ((ppAlocSepar[it.id] || {})[ppEsc] || 0), 0);
+      if (jaDoPP + qtdAdicional > dispPP) {
+        tocarSom("erro");
+        setScanMsgSepar({ tipo: "erro", texto: `${item.descricao}: só há ${dispPP} un. em ${ppEscLabel}${jaDoPP ? ` (já bipou ${jaDoPP})` : ""}. Escolha outro porta-palete em "Retirar de" para continuar.` });
+        return;
+      }
+    }
+    const chaveAloc = ppEsc ? String(ppEsc) : "auto";
+    salvarAlocSepar(prev => ({ ...prev, [item.id]: { ...(prev[item.id] || {}), [chaveAloc]: ((prev[item.id] || {})[chaveAloc] || 0) + qtdAdicional } }));
     setItensSeparacaoPorPedido(prev => ({
       ...prev,
       [pedidoSeparAtivo.id]: (prev[pedidoSeparAtivo.id] || []).map(it => it.id === item.id ? { ...it, quantidadeBipada: novaQtd } : it),
     }));
     const completo = novaQtd >= item.quantidade;
     tocarSom(completo ? "completo" : "ok");
-    setScanMsgSepar({ tipo: "ok", texto: `✓ ${item.descricao} +${qtdAdicional}${completo ? " — COMPLETO!" : ` (${novaQtd}/${item.quantidade})`}` });
+    setScanMsgSepar({ tipo: "ok", texto: `✓ ${item.descricao} +${qtdAdicional}${completo ? " — COMPLETO!" : ` (${novaQtd}/${item.quantidade})`}${ppEscLabel ? ` · de ${ppEscLabel}` : ""}` });
     setScanQtdSepar(1);
     const { error } = await supabaseClient.from("itens_pedidos_separacao").update({ quantidade_bipada: novaQtd }).eq("id", item.id);
     if (error) {
@@ -2046,7 +2115,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }
     await supabaseClient.from("logs_separacao").insert({
       pedido_id: pedidoSeparAtivo.id, numero_pedido: pedidoSeparAtivo.numeroPedido,
-      usuario: usuarioLogado.email, acao: "Produto bipado", produto: item.descricao, quantidade: qtdAdicional,
+      usuario: usuarioLogado.email, acao: "Produto bipado", produto: item.descricao + (ppEscLabel ? ` (${ppEscLabel})` : ""), quantidade: qtdAdicional,
     });
   }
 
@@ -2054,13 +2123,64 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     if (!pedidoSeparAtivo) return;
     setFinalizandoSepar(true);
     try {
+      // Monta como ficará a distribuição por porta-palete depois da baixa
+      const itensFin = getItensDoPedidoSepar(pedidoSeparAtivo.id);
+      const planos = [];
+      // por item: o que foi bipado em cada porta-palete + o que sobrou sem porta-palete (automático)
+      const retiradas = (it) => {
+        const aloc = ppAlocSepar[it.id] || {};
+        const especificas = Object.entries(aloc).filter(([k, q]) => k !== "auto" && q > 0).map(([k, q]) => ({ ppId: Number(k), qtd: q }));
+        const somaEsp = especificas.reduce((t, r) => t + r.qtd, 0);
+        return { especificas, auto: Math.max(0, it.quantidadeBipada - somaEsp) };
+      };
+      const idsProdutos = [...new Set(itensFin.filter(it => retiradas(it).especificas.length > 0).map(it => it.produtoId))];
+      for (const pid of idsProdutos) {
+        const produto = produtos.find(p => p.id === pid);
+        if (!produto) continue;
+        const original = distribuicaoDoProduto(produto);
+        let nova = original.map(r => ({ ...r }));
+        const doProduto = itensFin.filter(it => it.produtoId === pid);
+        // primeiro o que tem porta-palete definido, depois o automático
+        for (const it of doProduto) {
+          for (const r of retiradas(it).especificas) {
+            const disp = nova.find(x => x.ppId === r.ppId)?.qtd || 0;
+            if (r.qtd > disp) {
+              alert(`⛔ Operação cancelada — nenhuma baixa foi aplicada:\n\n${it.descricao}: só há ${disp} un. em ${portaPaleteLabel(portaPaleteById(r.ppId))}, mas foram bipadas ${r.qtd}.`);
+              return;
+            }
+            nova = descontarDist(nova, r.qtd, r.ppId);
+          }
+        }
+        for (const it of doProduto) {
+          const a = retiradas(it).auto;
+          if (a > 0) nova = descontarDist(nova, a, undefined);
+        }
+        planos.push({ produto, original, nova });
+      }
+      const aplicados = [];
+      const desfazer = async () => {
+        for (const pl of aplicados) { try { await gravarDistribuicao(pl.produto.id, pl.original); } catch (_) {} }
+      };
+      try {
+        for (const pl of planos) { await gravarDistribuicao(pl.produto.id, pl.nova); aplicados.push(pl); }
+      } catch (e) { await desfazer(); throw e; }
+
       const { data, error } = await supabaseClient.rpc("finalizar_separacao", {
         p_pedido_id: pedidoSeparAtivo.id, p_usuario: usuarioLogado.email,
       });
       if (error) {
+        await desfazer();
         alert("⛔ Operação cancelada — nenhuma baixa foi aplicada:\n\n" + error.message);
         return;
       }
+      // limpa as escolhas de porta-palete deste pedido
+      setPpEscolhaSepar(prev => {
+        const n = { ...prev };
+        itensFin.forEach(it => { delete n[it.id]; });
+        try { localStorage.setItem("ppEscolhaSepar", JSON.stringify(n)); } catch (e) {}
+        return n;
+      });
+      salvarAlocSepar(prev => { const n = { ...prev }; itensFin.forEach(it => { delete n[it.id]; }); return n; });
       await Promise.all([recarregarSeparacao(), recarregarTudo()]);
       alert(`✅ Pedido ${pedidoSeparAtivo.numeroPedido} finalizado! Estoque atualizado com sucesso.`);
       setTelaSepar("lista");
@@ -3011,7 +3131,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
               {abaPedidoSepar === "itens" && (
                 <div style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, overflow: "auto" }}>
                   <table>
-                    <thead><tr><th>SKU</th><th>Produto</th><th>Localização</th><th>Solicitado</th><th>Bipado</th><th>Restante</th><th>Progresso</th></tr></thead>
+                    <thead><tr><th>SKU</th><th>Produto</th><th>Localização</th><th>Retirar de</th><th>Solicitado</th><th>Bipado</th><th>Restante</th><th>Progresso</th></tr></thead>
                     <tbody>
                       {itens.map(it => {
                         const completo = it.quantidadeBipada >= it.quantidade;
@@ -3029,6 +3149,34 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                               )}
                             </td>
                             <td><span style={{ color: "#6FB0E0", fontFamily: "monospace", fontSize: 12 }}>{it.localizacao || "—"}</span></td>
+                            <td style={{ minWidth: 170 }}>
+                              {(() => {
+                                const dist = produtoAtual ? distribuicaoDoProduto(produtoAtual).filter(r => r.ppId) : [];
+                                const escolha = ppEscolhaSepar[it.id];
+                                const travado = pedAtual.status === "Finalizado" || pedAtual.status === "Cancelado";
+                                if (dist.length <= 1) {
+                                  return dist.length === 1
+                                    ? <span style={{ color: "#8893A6", fontFamily: "monospace", fontSize: 12 }}>{portaPaleteLabel(portaPaleteById(dist[0].ppId))} — {dist[0].qtd} un</span>
+                                    : <span style={{ color: "#5C6678" }}>—</span>;
+                                }
+                                const semSaldo = escolha && !dist.some(r => r.ppId === Number(escolha));
+                                const aloc = ppAlocSepar[it.id] || {};
+                                const resumo = Object.entries(aloc).filter(([, q]) => q > 0).map(([k, q]) => `${k === "auto" ? "Automático" : portaPaleteLabel(portaPaleteById(k))}: ${q}`);
+                                return (
+                                  <div>
+                                  <div style={{ fontSize: 10.5, color: "#8893A6", marginBottom: 3 }}>Próximas bipadas saem de:</div>
+                                  <select value={escolha ? String(escolha) : ""} disabled={travado}
+                                    onChange={e => escolherPPItemSepar(it.id, e.target.value)}
+                                    style={{ ...inputStyle, padding: "6px 8px", fontSize: 12.5, borderColor: escolha ? "#D2A256" : "#2A3445" }}>
+                                    <option value="">Automático</option>
+                                    {dist.map(r => <option key={r.ppId} value={r.ppId}>{portaPaleteLabel(portaPaleteById(r.ppId))} — {r.qtd} un</option>)}
+                                    {semSaldo && <option value={escolha}>{portaPaleteLabel(portaPaleteById(escolha))} — 0 un</option>}
+                                  </select>
+                                  {resumo.length > 0 && <div style={{ fontSize: 11, color: "#D2A256", marginTop: 4 }}>Bipado: {resumo.join(" · ")}</div>}
+                                  </div>
+                                );
+                              })()}
+                            </td>
                             <td style={{ textAlign: "center", fontWeight: 700 }}>{it.quantidade}</td>
                             <td style={{ textAlign: "center", fontWeight: 700, color: it.quantidadeBipada > 0 ? "#5CC98E" : "#5C6678" }}>{it.quantidadeBipada}</td>
                             <td style={{ textAlign: "center", color: restante > 0 ? "#E07A7A" : "#5CC98E", fontWeight: 700 }}>{restante}</td>
@@ -3255,9 +3403,23 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                               </span>
                             ))}
                           </div>
-                          {(item.locais || []).length > 1 && (
-                            <div style={{ color: "#D2A256", fontSize: 11, marginTop: 4 }}>⚠ Este produto também está em outro(s) porta-palete — confira antes de bipar mais unidades.</div>
-                          )}
+                          {(() => {
+                            const prodItem = produtos.find(p => p.id === item.produtoId);
+                            const dist = prodItem ? distribuicaoDoProduto(prodItem).filter(r => r.ppId) : [];
+                            if (dist.length <= 1) return null;
+                            return (
+                              <div style={{ marginTop: 8 }}>
+                                <div style={{ color: "#D2A256", fontSize: 11, marginBottom: 4 }}>
+                                  {item.ppId ? "Retirar de qual porta-palete?" : "⚠ Produto em mais de um porta-palete — escolha de qual retirar (ou deixe Automático)"}
+                                </div>
+                                <select value={item.ppId ? String(item.ppId) : ""} onChange={e => trocarPPItemSepPP(idx, e.target.value)}
+                                  style={{ ...inputStyle, padding: "6px 8px", fontSize: 12.5, maxWidth: 260, borderColor: item.ppId ? "#D2A256" : "#2A3445" }}>
+                                  <option value="">Automático</option>
+                                  {dist.map(r => <option key={r.ppId} value={r.ppId}>{portaPaleteLabel(portaPaleteById(r.ppId))} — {r.qtd} un</option>)}
+                                </select>
+                              </div>
+                            );
+                          })()}
                           {insuf && <div style={{ color: "#E07A7A", fontSize: 11.5, marginTop: 4 }}>⚠ Estoque insuficiente ({item.estoqueAtual} disponível)</div>}
                         </div>
                         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
