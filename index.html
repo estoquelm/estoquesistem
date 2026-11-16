@@ -668,7 +668,9 @@ function carregarThree() {
 // Medidas padrão (metros). NÃO são as medidas reais do galpão: ajuste em "Configurar galpão".
 const GALPAO_PADRAO = {
   larguraBaia: 2.7, profundidade: 1.1, alturaNivel: 1.6, larguraCorredor: 3.2, peDireito: 9,
-  margem: 6, docaParede: "fundo", docaPosicao: 0.15, docaLargura: 3.5, inverterLetras: false, inverterCorredores: false,
+  margem: 6, docaParede: "esquerda", docaPosicao: 0.8, docaLargura: 4.5, inverterLetras: false, inverterCorredores: false,
+  // área de preparação (bancadas de embalagem, mesa, estantes, mezanino com escada) — fica numa ponta dos corredores
+  prepLado: "esquerda", prepProfundidade: 14, prepMezanino: true,
 };
 const pad2 = (n) => String(n).padStart(2, "0");
 const enderecoPP = (pp) => pp ? `${pad2(pp.fileira)}-${String(pp.porta || "").trim().toUpperCase()}-${pad2(pp.nivel)}` : "";
@@ -705,8 +707,20 @@ function mapa3dLayout(portaPaletes, cfg) {
   // caixas de colisão das estruturas (para câmera e rota não atravessarem)
   const solidos = Object.values(baias).map(b => ({ x0: b.x - BW / 2 - 0.08, x1: b.x + BW / 2 + 0.08, z0: b.z - D / 2 - 0.08, z1: b.z + D / 2 + 0.08, h: b.niveis * LH + 0.2 }));
   const m = cfg.margem;
-  const minX = xL - m, maxX = xR + m, minZ = -D / 2 - m - 1, maxZ = zMax + D / 2 + A + m;
-  return { corredores, letras, celulas, baias, semPosicao, duplicadas, xL, xR, corredorZ, zMax, nivelMax, solidos, BW, D, LH, A,
+  let minX = xL - m, maxX = xR + m, minZ = -D / 2 - m - 1, maxZ = zMax + D / 2 + A + m;
+  // área de preparação: o prédio cresce para o lado escolhido. Sistema local da área: u = ao longo da parede, v = da borda interna até a parede.
+  let prep = null;
+  const Dp = Math.max(4, Number(cfg.prepProfundidade) || 0);
+  if (cfg.prepLado && cfg.prepLado !== "nenhuma" && Dp) {
+    if (cfg.prepLado === "esquerda") { prep = { lado: "esquerda", ox: minX, oz: minZ, rot: -Math.PI / 2, Up: maxZ - minZ, Dp }; minX -= Dp; }
+    else if (cfg.prepLado === "direita") { prep = { lado: "direita", ox: maxX, oz: maxZ, rot: Math.PI / 2, Up: maxZ - minZ, Dp }; maxX += Dp; }
+    else if (cfg.prepLado === "frente") { prep = { lado: "frente", ox: minX, oz: maxZ, rot: 0, Up: maxX - minX, Dp }; maxZ += Dp; }
+    else { prep = { lado: "fundo", ox: maxX, oz: minZ, rot: Math.PI, Up: maxX - minX, Dp }; minZ -= Dp; }
+    // ponto local (u, v) → mundo (x, z)
+    const c = Math.cos(prep.rot), sn = Math.sin(prep.rot);
+    prep.mundo = (u, v) => ({ x: prep.ox + u * c + v * sn, z: prep.oz - u * sn + v * c });
+  }
+  return { corredores, letras, celulas, baias, semPosicao, duplicadas, xL, xR, corredorZ, zMax, nivelMax, solidos, BW, D, LH, A, prep,
     predio: { minX, maxX, minZ, maxZ, W: maxX - minX, P: maxZ - minZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2, H: Math.max(cfg.peDireito, nivelMax * LH + 2.5) } };
 }
 
@@ -737,6 +751,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   const [selPP, setSelPP] = useState(null);
   const [selCorredor, setSelCorredor] = useState(null);
   const [selDoca, setSelDoca] = useState(false);
+  const [selPrep, setSelPrep] = useState(false);
   const [versao, setVersao] = useState(0);
   const [vista, setVista] = useState("geral");
   const [pessoa, setPessoa] = useState(false);
@@ -760,7 +775,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   }, []);
   async function salvarCfg(nova) {
     const limpa = { ...nova };
-    ["larguraBaia", "profundidade", "alturaNivel", "larguraCorredor", "peDireito", "margem", "docaPosicao", "docaLargura"].forEach(k => { limpa[k] = Math.max(0.05, Number(limpa[k]) || GALPAO_PADRAO[k]); });
+    ["larguraBaia", "profundidade", "alturaNivel", "larguraCorredor", "peDireito", "margem", "docaPosicao", "docaLargura", "prepProfundidade"].forEach(k => { limpa[k] = Math.max(0.05, Number(limpa[k]) || GALPAO_PADRAO[k]); });
     limpa.docaPosicao = Math.min(0.95, limpa.docaPosicao);
     const { error } = await supabaseClient.from("config_galpao").upsert({ id: 1, dados: limpa, atualizado_em: new Date().toISOString(), atualizado_por: usuarioEmail || null }, { onConflict: "id" });
     if (error) { setCfgMsg(/row-level|permission|policy/i.test(error.message) ? "Somente administradores podem alterar as medidas do galpão." : "Não foi possível salvar: " + error.message); return; }
@@ -796,7 +811,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
 
   // --- rotas dos pedidos (com progresso: o que já foi bipado aparece como feito) ---
   const pedidosAbertos = useMemo(() => pedidos.filter(p => p.status !== "Finalizado" && p.status !== "Cancelado"), [pedidos]);
-  const rotas = useMemo(() => pedidoIds.map((pid, idx) => pedidos.find(p => String(p.id) === String(pid))).filter(Boolean).map((ped, idx) => {
+  const calcRota = useMemo(() => (ped, idx) => {
     const cor = CORES_ROTA[idx % CORES_ROTA.length];
     const itens = itensPorPedido[ped.id] || [];
     const porProd = {};
@@ -818,7 +833,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         if (resta <= 0 || !layout.celulas[e.ppId]) return;
         const pega = Math.min(e.qtd, resta); resta -= pega;
         const feito = Math.min(pega, jaBip); jaBip -= feito;
-        (paradas[e.ppId] = paradas[e.ppId] || { ppId: e.ppId, itens: [], falta: false }).itens.push({ nome, qtd: pega, feito });
+        (paradas[e.ppId] = paradas[e.ppId] || { ppId: e.ppId, itens: [], falta: false }).itens.push({ nome, qtd: pega, feito, pid });
       });
       const faltaBipar = need.total - need.bip;
       if (faltaBipar > 0 && total < faltaBipar) {
@@ -843,7 +858,8 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     });
     const tot = Object.values(porProd).reduce((s, x) => s + x.total, 0), bip = Object.values(porProd).reduce((s, x) => s + x.bip, 0);
     return { ped, cor, idx, paradas: ordenada, alertas, total: tot, bipado: bip, proxima: ordenada.findIndex(s => !s.ok) };
-  }), [pedidoIds, pedidos, itensPorPedido, estoquePP, prodPorId, layout, cfg]);
+  }, [pedidos, itensPorPedido, estoquePP, prodPorId, layout, cfg]);
+  const rotas = useMemo(() => pedidoIds.map(pid => pedidos.find(p => String(p.id) === String(pid))).filter(Boolean).map(calcRota), [pedidoIds, pedidos, calcRota]);
   const rota = rotas.length ? rotas[0] : null;   // compatibilidade: "há rota na tela"
   const pedidoId = pedidoIds.join(",");
 
@@ -884,10 +900,40 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   const aoVivo = useMemo(() => {
     const contando = presencas.filter(p => p.tipo === "contagem" && p.ppId);
     const separando = presencas.filter(p => p.tipo === "separacao" && p.pedidoId);
+    const separandoPP = []; presencas.forEach(p => { if (p.tipo === "separacaoPP" && !separandoPP.some(q => q.usuario === p.usuario)) separandoPP.push(p); });
     const porPP = {}; contando.forEach(p => { (porPP[p.ppId] = porPP[p.ppId] || []).push(p); });
     const porPedido = {}; separando.forEach(p => { (porPedido[p.pedidoId] = porPedido[p.pedidoId] || []).push(p); });
-    return { contando, separando, porPP, porPedido };
+    return { contando, separando, separandoPP, porPP, porPedido };
   }, [presencas]);
+  // paleteiras automáticas: só trabalham para os pedidos que alguém abriu para separar (presença ao vivo)
+  const rotasAuto = useMemo(() => Object.keys(aoVivo.porPedido).map(id => pedidos.find(p => String(p.id) === String(id))).filter(Boolean)
+    .filter(p => p.status !== "Finalizado" && p.status !== "Cancelado").slice(0, 4).map(calcRota), [aoVivo, pedidos, calcRota]);
+  // último produto bipado em cada pedido (vem em tempo real pelo banco)
+  const ultimoBipRef = useRef({}); const snapBipRef = useRef(null); const [bipVersao, setBipVersao] = useState(0);
+  useEffect(() => {
+    const atual = {}; let mudou = false;
+    Object.entries(itensPorPedido).forEach(([pid, its]) => (its || []).forEach(it => {
+      const k = pid + ":" + it.id; atual[k] = it.quantidadeBipada;
+      if (snapBipRef.current && it.quantidadeBipada > (snapBipRef.current[k] || 0)) { ultimoBipRef.current[pid] = String(it.produtoId); mudou = true; }
+    }));
+    snapBipRef.current = atual; if (mudou) setBipVersao(v => v + 1);
+  }, [itensPorPedido]);
+  // quem está contando agora: um bonequinho por pessoa, na porta-palete que ela está contando
+  const contadores = useMemo(() => {
+    const vistos = {}; aoVivo.contando.forEach(p => { const c = layout.celulas[p.ppId]; if (c && !vistos[p.usuario]) vistos[p.usuario] = { usuario: p.usuario, ppId: String(p.ppId), x: c.x, z: c.z, f: c.f, pecas: p.pecas || 0, cod: c.pp ? c.pp.codigo : "", nivel: c.n, y: c.y }; });
+    return Object.values(vistos);
+  }, [aoVivo, layout]);
+  const alvosAuto = useMemo(() => rotasAuto.map(r => {
+    const pend = r.paradas.filter(s2 => !s2.ok && !s2.falta && s2.itens.length);
+    const ult = ultimoBipRef.current[r.ped.id];
+    let alvo = ult ? pend.find(s2 => s2.itens.some(it => String(it.pid) === ult && it.feito < it.qtd)) : null;
+    if (!alvo) alvo = pend[0] || null;   // ainda não bipou (ou terminou o produto): próxima porta-palete da rota
+    return { pedidoId: String(r.ped.id), alvo: alvo ? { ppId: alvo.ppId, x: alvo.c.x, f: alvo.c.f, n: alvo.c.n, y: alvo.c.y, z: alvo.c.z } : null };
+  }).concat(aoVivo.separandoPP.map(p => {   // separação por porta-palete: vai na porta-palete que a pessoa bipou
+    const c = p.ppId ? layout.celulas[p.ppId] : null;
+    return { pedidoId: "pp:" + p.usuario, alvo: c ? { ppId: p.ppId, x: c.x, f: c.f, n: c.n, y: c.y, z: c.z } : null };
+  })).concat(contadores.filter(u => u.nivel > 1).map(u => ({   // contagem no 2º/3º nível: uma paleteira desce o palete para contar
+    pedidoId: "ct:" + u.usuario, alvo: { ppId: u.ppId, x: u.x, f: u.f, n: u.nivel, y: u.y, z: u.z, contagem: true } }))).slice(0, 4), [rotasAuto, bipVersao, aoVivo, layout, contadores]);
   const emSeparacaoAgora = useMemo(() => pedidosAbertos.filter(p => aoVivo.porPedido[p.id] || p.status === "Em Separação").map(p => String(p.id)), [pedidosAbertos, aoVivo]);
 
   // destaque de cada porta-palete conforme o modo ativo (rota > busca > divergências > corredor)
@@ -988,26 +1034,43 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         g.fillStyle = "#e9eef5"; g.fillRect(0, 0, 3, h); g.fillRect(w - 3, 0, 3, h);
         g.fillStyle = "#2b3240"; for (let y = 4; y < h; y += 12) { g.beginPath(); g.moveTo(w * 0.38, y); g.lineTo(w * 0.62, y); g.lineTo(w * 0.62, y + 5); g.lineTo(w * 0.5, y + 7); g.lineTo(w * 0.38, y + 5); g.fill(); }
       });
-      const parede = tela(512, 512, (g, w, h) => {
-        g.fillStyle = "#cfd3d8"; g.fillRect(0, 0, w, h * 0.82);
-        for (let x = 0; x < w; x += 32) { const gr = g.createLinearGradient(x, 0, x + 32, 0); gr.addColorStop(0, "rgba(0,0,0,0.10)"); gr.addColorStop(0.2, "rgba(255,255,255,0.10)"); gr.addColorStop(0.5, "rgba(0,0,0,0.02)"); gr.addColorStop(0.8, "rgba(255,255,255,0.06)"); gr.addColorStop(1, "rgba(0,0,0,0.12)"); g.fillStyle = gr; g.fillRect(x, 0, 32, h * 0.82); }
-        g.fillStyle = "#7d8187"; g.fillRect(0, h * 0.82, w, h * 0.18);                      // rodapé de concreto
-        for (let i = 0; i < 1500; i++) { g.fillStyle = `rgba(0,0,0,${rnd() * 0.08})`; g.fillRect(rnd() * w, h * 0.82 + rnd() * h * 0.18, 2, 2); }
-        g.fillStyle = "#595d63"; g.fillRect(0, h * 0.82, w, 3);
-      });
+      // parede como nas fotos: bloco de concreto embaixo, chapa ondulada em cima, janelas altas com veneziana (luz alaranjada) e tubo vermelho de incêndio
+      const desenharParede = (g, w, h, soLuz) => {
+        const yBloco = h * 0.7, yJan0 = h * 0.2, yJan1 = h * 0.48;
+        if (!soLuz) {
+          g.fillStyle = "#b4b8bc"; g.fillRect(0, 0, w, yBloco);
+          for (let x = 0; x < w; x += 12) { g.fillStyle = "rgba(0,0,0,0.13)"; g.fillRect(x, 0, 3, yBloco); g.fillStyle = "rgba(255,255,255,0.16)"; g.fillRect(x + 5, 0, 2, yBloco); }
+          g.fillStyle = "#a59c8f"; g.fillRect(0, yBloco, w, h - yBloco);
+          const bh = (h - yBloco) / 7, bw = bh * 2.1;
+          for (let r = 0; r < 7; r++) for (let x = (r % 2) * -bw / 2; x < w; x += bw) {
+            g.fillStyle = `rgba(${150 + rnd() * 30},${140 + rnd() * 25},${125 + rnd() * 20},1)`; g.fillRect(x + 1.5, yBloco + r * bh + 1.5, bw - 3, bh - 3);
+            for (let k = 0; k < 6; k++) { g.fillStyle = `rgba(0,0,0,${rnd() * 0.15})`; g.fillRect(x + rnd() * bw, yBloco + r * bh + rnd() * bh, 2, 2); }
+          }
+          g.fillStyle = "rgba(0,0,0,0.25)"; g.fillRect(0, yBloco, w, 3);
+          g.fillStyle = "#c0392b"; g.fillRect(0, h * 0.13, w, 6); g.fillStyle = "rgba(255,255,255,0.25)"; g.fillRect(0, h * 0.13, w, 2);   // tubo de incêndio
+        } else { g.fillStyle = "#000"; g.fillRect(0, 0, w, h); }
+        const jx = w * 0.32, jw = w * 0.36;
+        g.fillStyle = soLuz ? "#000" : "#3a3328"; g.fillRect(jx - 4, yJan0 - 4, jw + 8, yJan1 - yJan0 + 8);
+        for (let y = yJan0; y < yJan1; y += 7) { g.fillStyle = soLuz ? "#d98a3a" : "#f4c27a"; g.fillRect(jx, y, jw, 4.5); }
+        if (!soLuz) { g.fillStyle = "#3a3328"; for (let x = jx; x <= jx + jw; x += jw / 4) g.fillRect(x - 1.5, yJan0, 3, yJan1 - yJan0); }
+      };
+      const parede = tela(512, 512, (g, w, h) => desenharParede(g, w, h, false));
+      const paredeLuz = tela(512, 512, (g, w, h) => desenharParede(g, w, h, true));
+      const ripas = tela(256, 256, (g, w, h) => { g.fillStyle = "#2c3036"; g.fillRect(0, 0, w, h); for (let x = 0; x < w; x += 16) { const gr = g.createLinearGradient(x, 0, x + 16, 0); gr.addColorStop(0, "#1d2025"); gr.addColorStop(0.5, "#3c4148"); gr.addColorStop(1, "#22252a"); g.fillStyle = gr; g.fillRect(x + 1, 0, 14, h); } g.fillStyle = "#1a1c20"; g.fillRect(0, h * 0.48, w, 8); });
+      const tela3 = tela(256, 160, (g, w, h) => { g.fillStyle = "#0d1a2b"; g.fillRect(0, 0, w, h); g.fillStyle = "#1e3a5f"; g.fillRect(0, 0, w, 18); g.fillStyle = "#cfe3ff"; for (let i = 0; i < 9; i++) g.fillRect(12, 28 + i * 13, 60 + rnd() * 150, 6); g.fillStyle = "#3fbf7f"; g.fillRect(w - 50, 30, 36, 36); });
       const telhaT = tela(256, 256, (g, w, h) => { g.fillStyle = "#b9bec5"; g.fillRect(0, 0, w, h); for (let x = 0; x < w; x += 16) { g.fillStyle = "rgba(0,0,0,0.12)"; g.fillRect(x, 0, 4, h); g.fillStyle = "rgba(255,255,255,0.14)"; g.fillRect(x + 6, 0, 3, h); } });
       const porta = tela(256, 256, (g, w, h) => { for (let y = 0; y < h; y += 10) { const gr = g.createLinearGradient(0, y, 0, y + 10); gr.addColorStop(0, "#8f969e"); gr.addColorStop(0.5, "#c9ced4"); gr.addColorStop(1, "#767c84"); g.fillStyle = gr; g.fillRect(0, y, w, 9); } });
       const zebra = tela(128, 16, (g, w, h) => { for (let x = -16; x < w; x += 16) { g.fillStyle = (Math.round(x / 16) % 2) ? "#f2c200" : "#1d1d1d"; g.beginPath(); g.moveTo(x, 0); g.lineTo(x + 16, 0); g.lineTo(x + 32, h); g.lineTo(x + 16, h); g.fill(); } });
       const sombraT = tela(128, 128, (g, w, h) => { const gr = g.createRadialGradient(64, 64, 10, 64, 64, 64); gr.addColorStop(0, "rgba(0,0,0,0.55)"); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
       const brilho = tela(128, 128, (g, w, h) => { const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64); gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.3, "rgba(255,255,255,0.4)"); gr.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
       const tracos = tela(128, 16, (g, w, h) => { const gr = g.createLinearGradient(0, 0, w, 0); gr.addColorStop(0, "rgba(255,255,255,0)"); gr.addColorStop(0.5, "rgba(255,255,255,1)"); gr.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = gr; g.fillRect(0, 0, w * 0.5, h); });
-      const T = { concreto: tex(concreto), rug: tex(rugosidade, false), papelao: tex(papelao), madeira: tex(madeira), perfil: tex(perfil), parede: tex(parede), telha: tex(telhaT), porta: tex(porta), zebra: tex(zebra), sombra: tex(sombraT), brilho: tex(brilho), tracos: tex(tracos) };
+      const T = { concreto: tex(concreto), rug: tex(rugosidade, false), papelao: tex(papelao), madeira: tex(madeira), perfil: tex(perfil), parede: tex(parede), paredeLuz: tex(paredeLuz), ripas: tex(ripas), tela3: tex(tela3), telha: tex(telhaT), porta: tex(porta), zebra: tex(zebra), sombra: tex(sombraT), brilho: tex(brilho), tracos: tex(tracos) };
       T.perfil.repeat.set(1, 8);
 
       const std = (o) => new THREE.MeshStandardMaterial(o);
       const mat = {
         piso: std({ map: T.concreto, roughnessMap: T.rug, roughness: 0.55, metalness: 0.0, envMapIntensity: 0.9 }),
-        parede: std({ map: T.parede, roughness: 0.7, metalness: 0.25, side: THREE.BackSide }),
+        parede: std({ map: T.parede, emissiveMap: T.paredeLuz, emissive: new THREE.Color(1.1, 0.75, 0.45), roughness: 0.75, metalness: 0.2 }),
         telha: std({ map: T.telha, roughness: 0.6, metalness: 0.5, side: THREE.BackSide }),
         estrutura: std({ color: "#5d6670", roughness: 0.5, metalness: 0.7 }),
         luminaria: std({ color: "#2a2e34", roughness: 0.4, metalness: 0.8 }),
@@ -1018,7 +1081,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         faixa: std({ color: "#e8b800", roughness: 0.55 }),
         faixaBranca: std({ color: "#e6e8ea", roughness: 0.6 }),
         amarelo: std({ color: "#f2b705", roughness: 0.45, metalness: 0.2 }),
-        montante: std({ color: "#1f4fa8", map: T.perfil, roughness: 0.38, metalness: 0.45 }),
+        montante: std({ color: "#2a2e35", map: T.perfil, roughness: 0.42, metalness: 0.5 }),   // colunas escuras, como as estruturas reais
         travessa: std({ color: "#9aa3ad", roughness: 0.35, metalness: 0.85 }),
         longarina: std({ color: "#e86f17", roughness: 0.35, metalness: 0.4 }),
         sapata: std({ color: "#e86f17", roughness: 0.45, metalness: 0.4 }),
@@ -1076,7 +1139,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       const colide = (x, z, folga = 0.35) => {
         const L = st.current.layoutAtual; if (!L) return false; const p = L.predio;
         if (x < p.minX + folga || x > p.maxX - folga || z < p.minZ + folga || z > p.maxZ - folga) return true;
-        return L.solidos.some(s => x > s.x0 - folga && x < s.x1 + folga && z > s.z0 - folga && z < s.z1 + folga);
+        return L.solidos.concat(st.current.solidosExtras || []).some(s => x > s.x0 - folga && x < s.x1 + folga && z > s.z0 - folga && z < s.z1 + folga);
       };
       function posicionar() {
         if (st.current.modoPessoa) {
@@ -1143,33 +1206,116 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         st.current.aoEscolher && st.current.aoEscolher(hit ? hit.object.userData : null);
       }
 
-      // ---- empilhadeira (modelada em 3D: chassi, contrapeso, cabine, mastro, garfos, rodas) ----
-      const amarelo = std({ color: "#f2b200", roughness: 0.32, metalness: 0.25 });
-      const grafite = std({ color: "#202329", roughness: 0.5, metalness: 0.45 });
+      // ---- empilhadeira patolada elétrica (como a das fotos): corpo laranja, base preta, timão, mastro com correntes ----
+      const laranja = std({ color: "#f39a12", roughness: 0.38, metalness: 0.15 });
+      const grafite = std({ color: "#1c1e22", roughness: 0.55, metalness: 0.45 });
       const aco = std({ color: "#8e959d", roughness: 0.28, metalness: 0.9 });
-      const giroflex = std({ color: "#ff8a00", emissive: "#ff6a00", emissiveIntensity: 2 });
+      const giroflex = std({ color: "#ff3b30", emissive: "#ff2a1f", emissiveIntensity: 2 });
+      const grade = new THREE.MeshStandardMaterial({ color: "#16181b", roughness: 0.6, metalness: 0.6, transparent: true, opacity: 0.55, side: THREE.DoubleSide });
       const emp = new THREE.Group();
-      emp.add(peca(geo.cubo, amarelo, [0, 0.46, -0.05], [1.05, 0.44, 1.5]));
-      emp.add(peca(geo.cubo, amarelo, [0, 0.72, 0.42], [1.0, 0.12, 0.5]));
-      emp.add(peca(geo.cubo, grafite, [0, 0.66, -0.76], [1.08, 0.66, 0.34]));
-      emp.add(peca(geo.cubo, grafite, [0, 0.84, -0.22], [0.48, 0.12, 0.48]));
-      emp.add(peca(geo.cubo, grafite, [0, 1.1, -0.44], [0.48, 0.48, 0.08]));
-      emp.add(peca(geo.cil, grafite, [0, 1.15, 0.3], [0.17, 0.05, 0.17], [-0.9, 0, 0]));
-      emp.add(peca(geo.cil, aco, [0.38, 1.05, -0.85], [0.17, 0.65, 0.17], [0, 0, Math.PI / 2]));   // cilindro de gás
-      [[-0.45, -0.62], [0.45, -0.62], [-0.45, 0.38], [0.45, 0.38]].forEach(([x, z]) => emp.add(peca(geo.cil, grafite, [x, 1.35, z], [0.035, 1.38, 0.035])));
-      [-0.45, 0.45].forEach(x => emp.add(peca(geo.cubo, grafite, [x, 2.04, -0.12], [0.06, 0.06, 1.04])));
-      for (let i = 0; i < 5; i++) emp.add(peca(geo.cubo, grafite, [0, 2.04, -0.6 + i * 0.24], [0.94, 0.035, 0.045]));
-      emp.add(peca(new THREE.SphereGeometry(0.08, 12, 8), giroflex, [0, 2.12, -0.55]));
-      [-0.32, 0.32].forEach(x => emp.add(peca(geo.cubo, aco, [x, 1.3, 0.8], [0.09, 2.5, 0.12])));
-      emp.add(peca(geo.cubo, aco, [0, 2.5, 0.8], [0.72, 0.08, 0.12]));
-      const garfo = new THREE.Group();
-      garfo.add(peca(geo.cubo, grafite, [0, 0.52, 0.89], [0.82, 0.58, 0.06]));
-      [-0.24, 0.24].forEach(x => garfo.add(peca(geo.cubo, aco, [x, 0.22, 1.42], [0.11, 0.045, 1.08])));
+      emp.add(peca(geo.cubo, grafite, [0, 0.2, -0.32], [0.8, 0.34, 0.78]));             // base/chassi
+      emp.add(peca(geo.cubo, laranja, [0, 0.62, -0.36], [0.76, 0.5, 0.64]));            // capô (bateria)
+      emp.add(peca(geo.cubo, laranja, [0, 0.9, -0.5], [0.66, 0.08, 0.34]));
+      const logoForza = placa("FORZA", { fundo: "#1c1e22", cor: "#ffffff", altura: 0.09, fonte: "800" });
+      [-1, 1].forEach(sx => { const lg = logoForza.clone(); lg.position.set(sx * 0.385, 0.66, -0.36); lg.rotation.y = sx * Math.PI / 2; emp.add(lg); });
+      emp.add(peca(geo.cil, grafite, [0, 0.98, -0.56], [0.05, 0.12, 0.05]));
+      const timao = new THREE.Group(); timao.position.set(0, 0.95, -0.6); timao.rotation.x = -1.2;   // timão (braço de direção) inclinado na altura da cintura
+      timao.add(peca(geo.cil, grafite, [0, 0.3, 0], [0.028, 0.6, 0.028]));
+      timao.add(peca(geo.cubo, laranja, [0, 0.62, 0], [0.26, 0.07, 0.09]));
+      timao.add(peca(geo.cubo, grafite, [0, 0.62, 0.035], [0.3, 0.045, 0.045]));
+      emp.add(timao);
+      emp.add(peca(new THREE.SphereGeometry(0.035, 10, 8), giroflex, [0.22, 0.96, -0.62]));
+      [-0.34, 0.34].forEach(x => emp.add(peca(geo.cubo, grafite, [x, 1.25, 0.04], [0.08, 2.3, 0.1])));   // mastro
+      [0.25, 1.25, 2.35].forEach(y => emp.add(peca(geo.cubo, grafite, [0, y, 0.04], [0.76, 0.06, 0.08])));
+      [-0.15, 0.15].forEach(x => emp.add(peca(geo.cil, aco, [x, 1.25, 0.0], [0.012, 2.2, 0.012])));        // correntes
+      const gradeM = new THREE.Mesh(geo.plano, grade); gradeM.scale.set(0.66, 1.0, 1); gradeM.position.set(0, 1.85, 0.09); emp.add(gradeM);
+      // mastro triplex: o estágio do meio sobe metade do curso e o interno o curso todo — sempre sobrepostos, sem vão
+      const mastroMeio = new THREE.Group(); mastroMeio.name = "mastroMeio";
+      [-0.3, 0.3].forEach(x => mastroMeio.add(peca(geo.cubo, grafite, [x, 1.2, 0.06], [0.06, 2.2, 0.08])));
+      mastroMeio.add(peca(geo.cubo, grafite, [0, 2.28, 0.06], [0.66, 0.06, 0.07]));
+      [-0.12, 0.12].forEach(x => mastroMeio.add(peca(geo.cil, aco, [x, 1.2, 0.0], [0.01, 2.1, 0.01])));
+      emp.add(mastroMeio);
+      const mastroInt = new THREE.Group(); mastroInt.name = "mastroInterno";
+      [-0.25, 0.25].forEach(x => mastroInt.add(peca(geo.cubo, grafite, [x, 1.2, 0.1], [0.055, 2.2, 0.07])));
+      mastroInt.add(peca(geo.cubo, grafite, [0, 2.28, 0.1], [0.56, 0.06, 0.07]));
+      emp.add(mastroInt);
+      const garfo = new THREE.Group(); garfo.name = "garfo";
+      garfo.add(peca(geo.cubo, grafite, [0, 0.42, 0.12], [0.72, 0.5, 0.05]));
+      [-0.2, 0.2].forEach(x => garfo.add(peca(geo.cubo, aco, [x, 0.14, 0.68], [0.12, 0.05, 1.1])));
+      const carga = new THREE.Group(); carga.name = "carga"; carga.visible = false;   // palete que ela pega na porta-palete
+      [-0.42, 0, 0.42].forEach(oz => carga.add(peca(geo.cubo, mat.madeira, [oz, 0.2, 0.68], [0.1, 0.09, 1.0])));
+      for (let k = 0; k < 7; k++) carga.add(peca(geo.cubo, mat.madeira, [0, 0.26, 0.68 - 0.5 + (k + 0.5) / 7], [1.1, 0.022, 0.11]));
+      const caixaCarga = mat.caixa.clone(); caixaCarga.color.set("#c8975e");
+      [[-0.27, 0.43], [0.27, 0.43], [-0.27, 0.93], [0.27, 0.93]].forEach(([x, z], k) => { const cx = peca(geo.cubo, caixaCarga, [x, 0.5, z], [0.52, 0.45, 0.47]); carga.add(cx);
+        if (k < 2) carga.add(peca(geo.cubo, caixaCarga, [x, 0.95, z + 0.1], [0.5, 0.42, 0.46])); });
+      carga.add(peca(geo.cubo, mat.filme, [0, 0.72, 0.68], [1.12, 0.9, 1.02]));
+      garfo.add(carga);
       emp.add(garfo);
-      [[-0.52, -0.55, 0.2], [0.52, -0.55, 0.2], [-0.52, 0.48, 0.27], [0.52, 0.48, 0.27]].forEach(([x, z, r]) => { emp.add(peca(geo.cil, mat.borracha, [x, r, z], [r, 0.2, r], [0, 0, Math.PI / 2])); emp.add(peca(geo.cil, aco, [x + Math.sign(x) * 0.01, r, z], [r * 0.5, 0.205, r * 0.5], [0, 0, Math.PI / 2])); });
-      const sombraEmp = new THREE.Mesh(geo.plano, mat.sombra); sombraEmp.rotation.x = -Math.PI / 2; sombraEmp.scale.set(2.2, 2.8, 1); sombraEmp.position.y = 0.012; emp.add(sombraEmp);
+      [-0.3, 0.3].forEach(x => { emp.add(peca(geo.cubo, grafite, [x, 0.05, 0.6], [0.09, 0.08, 1.1])); emp.add(peca(geo.cil, mat.borracha, [x, 0.05, 1.08], [0.05, 0.08, 0.05], [0, 0, Math.PI / 2])); });  // patolas
+      emp.add(peca(geo.cil, mat.borracha, [0, 0.12, -0.5], [0.12, 0.1, 0.12], [0, 0, Math.PI / 2]));
+      const sombraEmp = new THREE.Mesh(geo.plano, mat.sombra); sombraEmp.rotation.x = -Math.PI / 2; sombraEmp.scale.set(1.5, 2.4, 1); sombraEmp.position.set(0, 0.012, 0.2); emp.add(sombraEmp);
       scene.add(emp);
-      const frota = [emp];   // uma empilhadeira por pedido na tela
+      const frota = [emp];   // uma paleteira por pedido em separação
+      const chao = [];       // palete deixado na área de separação (um por paleteira)
+      // ---- bonequinho de quem está contando (um por pessoa, em tempo real) ----
+      const pele = std({ color: "#d9a57b", roughness: 0.7 }), calca = std({ color: "#27344d", roughness: 0.8 }), sapato = std({ color: "#15171a", roughness: 0.6 });
+      const colete = std({ color: "#d4ef3a", roughness: 0.5, emissive: "#3a4a00", emissiveIntensity: 0.25 }), faixa = std({ color: "#dfe4e8", roughness: 0.25, metalness: 0.6 });
+      const capacete = std({ color: "#f5f5f0", roughness: 0.35 }), leitorM = std({ color: "#202326", roughness: 0.4 }), laser = new THREE.MeshBasicMaterial({ color: "#ff2b2b", transparent: true, opacity: 0.8, toneMapped: false });
+      function criarBoneco(usuario) {
+        let hsh = 0; for (const ch of usuario) hsh = (hsh * 31 + ch.charCodeAt(0)) >>> 0;
+        const camisa = std({ color: new THREE.Color().setHSL((hsh % 360) / 360, 0.55, 0.42), roughness: 0.75 });
+        const g = new THREE.Group(), corpo = new THREE.Group(); g.add(corpo);
+        const perna = (x) => { const p = new THREE.Group(); p.position.set(x, 0.92, 0); p.add(peca(geo.cil, calca, [0, -0.44, 0], [0.075, 0.86, 0.075])); p.add(peca(geo.cubo, sapato, [0, -0.88, 0.05], [0.12, 0.08, 0.26])); corpo.add(p); return p; };
+        const pE = perna(-0.1), pD = perna(0.1);
+        corpo.add(peca(geo.cubo, calca, [0, 0.95, 0], [0.36, 0.14, 0.22]));
+        corpo.add(peca(geo.cubo, camisa, [0, 1.24, 0], [0.4, 0.5, 0.22]));
+        corpo.add(peca(geo.cubo, colete, [0, 1.23, 0], [0.42, 0.42, 0.24]));
+        [1.12, 1.3].forEach(y => corpo.add(peca(geo.cubo, faixa, [0, y, 0], [0.43, 0.035, 0.25])));
+        const braco = (x) => { const b = new THREE.Group(); b.position.set(x, 1.46, 0); b.add(peca(geo.cil, camisa, [0, -0.27, 0], [0.055, 0.54, 0.055])); b.add(peca(new THREE.SphereGeometry(0.05, 10, 8), pele, [0, -0.56, 0])); corpo.add(b); return b; };
+        const bE = braco(-0.26), bD = braco(0.26);
+        const leitor = new THREE.Group(); leitor.position.set(0, -0.6, 0.05);
+        leitor.add(peca(geo.cubo, leitorM, [0, 0, 0.04], [0.07, 0.05, 0.16])); leitor.add(peca(geo.cubo, leitorM, [0, -0.06, -0.01], [0.045, 0.1, 0.05]));
+        const feixe = new THREE.Mesh(geo.cubo, laser); feixe.scale.set(0.01, 0.01, 0.9); feixe.position.set(0, 0, 0.57); feixe.visible = false; leitor.add(feixe); bD.add(leitor);
+        corpo.add(peca(geo.cil, pele, [0, 1.53, 0], [0.05, 0.08, 0.05]));
+        const cabeca = new THREE.Group(); cabeca.position.set(0, 1.66, 0); corpo.add(cabeca);
+        cabeca.add(peca(new THREE.SphereGeometry(0.12, 16, 12), pele, [0, 0, 0]));
+        const cap = peca(new THREE.SphereGeometry(0.135, 16, 10, 0, Math.PI * 2, 0, Math.PI / 2), capacete, [0, 0.03, 0]); cabeca.add(cap);
+        cabeca.add(peca(geo.cubo, capacete, [0, 0.03, 0.12], [0.2, 0.02, 0.08]));
+        const sombra = new THREE.Mesh(geo.plano, mat.sombra); sombra.rotation.x = -Math.PI / 2; sombra.scale.set(0.7, 0.7, 1); sombra.position.y = 0.012; g.add(sombra);
+        // nome e peças contadas, sempre de frente para a câmera
+        const cv = document.createElement("canvas"); cv.width = 512; cv.height = 128; const tx = new THREE.CanvasTexture(cv); tx.encoding = THREE.sRGBEncoding;
+        const rot = new THREE.Sprite(new THREE.SpriteMaterial({ map: tx, depthTest: false, transparent: true, toneMapped: false })); rot.scale.set(1.5, 0.375, 1); rot.position.y = 2.15; rot.renderOrder = 25; g.add(rot);
+        const escrever = (l1, l2) => { const c = cv.getContext("2d"); c.clearRect(0, 0, 512, 128); c.fillStyle = "rgba(24,18,46,0.88)"; c.beginPath(); (c.roundRect ? c.roundRect(4, 4, 504, 120, 26) : c.rect(4, 4, 504, 120)); c.fill();
+          c.strokeStyle = "#a78bfa"; c.lineWidth = 5; c.stroke(); c.textAlign = "center"; c.fillStyle = "#ffffff"; c.font = "700 46px Inter, Segoe UI, sans-serif"; c.fillText(l1, 256, 56);
+          c.fillStyle = "#c9b8ff"; c.font = "600 32px Inter, Segoe UI, sans-serif"; c.fillText(l2, 256, 100); tx.needsUpdate = true; };
+        scene.add(g);
+        return { g, corpo, pE, pD, bE, bD, cabeca, feixe, escrever, tx, camisa, texto: "" };
+      }
+      const ESCALA_ZERO = new THREE.Matrix4().makeScale(0, 0, 0);
+      // posição/estado da paleteira num instante da sequência (função pura: dá para pausar a paleteira na fila)
+      const angLerpP = (a, b, k) => { let d = b - a; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; return a + d * k; };
+      function poseNa(pista, tempo) {
+        const ini = pista.ini || {}; let tt = pista.semLaco ? Math.min(tempo, pista.duracao - 1e-6) : tempo % pista.duracao, ac = null, carga = !!ini.carga, chaoV = !!ini.chao, fora = ini.fora || null;
+        for (const a of pista.acoes) { if (tt <= a.dur) { ac = a; break; } tt -= a.dur; if (a.pega) { carga = true; if (a.deChao) chaoV = false; if (a.fora) fora = a.fora; } if (a.solta) { carga = false; if (a.chao) chaoV = true; if (a.devolve) fora = null; } }
+        if (!ac) ac = pista.acoes[pista.acoes.length - 1];
+        const k = ac.dur ? Math.min(1, tt / ac.dur) : 1, sv = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+        if (k >= 0.5 && ac.pega) { carga = true; if (ac.deChao) chaoV = false; if (ac.fora) fora = ac.fora; }
+        if (k >= 0.5 && ac.solta) { carga = false; if (ac.chao) chaoV = true; if (ac.devolve) fora = null; }
+        if (ac.tipo === "andar") {
+          const d = ac.comp * k; let i = 0; while (i < ac.acum.length - 2 && ac.acum[i + 1] < d) i++;
+          const a = ac.pts[i], b = ac.pts[i + 1], seg = (ac.acum[i + 1] - ac.acum[i]) || 1, kk = Math.min(1, (d - ac.acum[i]) / seg);
+          let ang = Math.atan2(b.x - a.x, b.z - a.z);
+          const r = 0.6, dFim = (ac.acum[i + 1] - d), dIni = d - ac.acum[i];
+          if (dFim < r && i + 2 < ac.pts.length) ang = angLerpP(ang, Math.atan2(ac.pts[i + 2].x - b.x, ac.pts[i + 2].z - b.z), (1 - dFim / r) * 0.5);
+          else if (dIni < r && i > 0) ang = angLerpP(ang, Math.atan2(a.x - ac.pts[i - 1].x, a.z - ac.pts[i - 1].z), (1 - dIni / r) * 0.5);
+          return { x: a.x + (b.x - a.x) * kk, z: a.z + (b.z - a.z) * kk, ang, h: 0.05, carga, chao: chaoV, fora };
+        }
+        if (ac.tipo === "parado") return { x: ac.x, z: ac.z, ang: ac.ang, h: 0.05, carga, chao: chaoV, fora };
+        const ang = ac.tipo === "girar" ? angLerpP(ac.de, ac.para, sv) : ac.ang;
+        const av = ac.tipo === "avanco" ? ac.de + (ac.para - ac.de) * sv : (ac.av || 0);
+        const h = ac.tipo === "garfo" ? ac.de + (ac.para - ac.de) * sv : (ac.h !== undefined ? ac.h : 0.05);
+        return { x: ac.x + Math.sin(ac.ang) * av, z: ac.z + Math.cos(ac.ang) * av, ang, h, carga, chao: chaoV, fora };
+      }
 
       const ro = new ResizeObserver(() => { const w = el.clientWidth, h = el.clientHeight; if (!w || !h) return; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); });
       ro.observe(el);
@@ -1179,7 +1325,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       const v3 = new THREE.Vector3();
       const loop = (t) => {
         raf = requestAnimationFrame(loop);
-        const dt = Math.min(0.05, (t - antes) / 1000); antes = t; quadro++;
+        let dt = Math.min(0.05, (t - antes) / 1000); antes = t; quadro++;
         if (st.current.modoPessoa) {
           const k = fp.teclas, b = fp.botoes, vel = (k.shift ? 5 : 2.6) * dt;
           const fr = (k.w || k.arrowup || b.frente ? 1 : 0) - (k.s || k.arrowdown || b.tras ? 1 : 0);
@@ -1211,22 +1357,245 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         (st.current.tracosLista || []).forEach(tr => { tr.offset.x -= dt * 0.9; });
         foco.intensity += ((st.current.focoAlvo || 0) - foco.intensity) * Math.min(1, dt * 4);
         giroflex.emissiveIntensity = (Math.floor(t / 380) % 2) ? 2.5 : 0.15;
-        const pistas = st.current.pistas || [];
-        while (frota.length < pistas.length) { const nova = emp.clone(); scene.add(nova); frota.push(nova); }
+        if (st.current.velTeste) dt *= st.current.velTeste;   // só testes locais (acelera)
+        const alvosV = st.current.alvosAuto || [];
+        const fp = st.current.frotaPorPedido = st.current.frotaPorPedido || {};
+        const est = st.current.frotaEstado = st.current.frotaEstado || [];
+        const L0 = st.current.layoutAtual, vagasPk = st.current.vagasParada || [], vagasSep = st.current.vagasSeparacao || [];
+        // libera a paleteira de pedido que saiu da separação só depois que ela devolveu o palete e estacionou
+        Object.keys(fp).forEach(pid => { const es = est[fp[pid]]; if (!alvosV.some(a => a.pedidoId === pid) && (!es || (es.fase === "livre" && es.estacionada && !es.fila))) delete fp[pid]; });
+        alvosV.forEach(a => { if (fp[a.pedidoId] === undefined) { const usados = new Set(Object.values(fp)); let n = 0; while (usados.has(n)) n++; if (n < 4) fp[a.pedidoId] = n; } });
+        const nFrota = Math.max(1, ...Object.values(fp).map(n => n + 1));
+        while (frota.length < nFrota) { const nova = emp.clone(); scene.add(nova); frota.push(nova); }
+        while (chao.length < frota.length) { const c = emp.getObjectByName("carga").clone(); c.visible = false; scene.add(c); chao.push(c); }
+        const corredorDe = (q) => { if (!L0 || !q) return null; for (const f of L0.corredores) { if (Math.abs(q.z - L0.corredorZ(f)) < L0.A / 2 - 0.05 && q.x > L0.xL + 0.5 && q.x < L0.xR - 0.5) return f; } return null; };
+        // monta a próxima sequência de movimentos a partir de onde a paleteira está
+        const planejar = (es, n, tipo, alvo) => {
+          if (!L0) return null;
+          const vel = 2.2, AV = 1.05, lane = 0.35 + n * 1.1, eL = L0.xL - lane, eR = L0.xR + lane;
+          const acoes = []; let pos = { x: es.pos.x, z: es.pos.z }, ang = es.ang;
+          const girarPara = (alvoA) => { let d = alvoA - ang; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; if (Math.abs(d) > 0.05) acoes.push({ tipo: "girar", x: pos.x, z: pos.z, ang, de: ang, para: ang + d, dur: 0.35 + Math.abs(d) * 0.4 }); ang += d; };
+          const andar = (lista) => {
+            const pts = [{ x: pos.x, z: pos.z }]; lista.forEach(q => { const u = pts[pts.length - 1]; if (Math.hypot(q.x - u.x, q.z - u.z) > 0.01) pts.push({ x: q.x, z: q.z }); });
+            if (pts.length < 2) return;
+            girarPara(Math.atan2(pts[1].x - pts[0].x, pts[1].z - pts[0].z));
+            const acum = [0]; for (let k = 1; k < pts.length; k++) acum.push(acum[k - 1] + Math.hypot(pts[k].x - pts[k - 1].x, pts[k].z - pts[k - 1].z));
+            const comp = acum[acum.length - 1]; acoes.push({ tipo: "andar", pts, acum, comp, dur: comp / vel });
+            const u2 = pts[pts.length - 2], u3 = pts[pts.length - 1]; ang = Math.atan2(u3.x - u2.x, u3.z - u2.z); pos = { x: u3.x, z: u3.z };
+          };
+          const caminho = (q) => { const c0 = corredorDe(pos); if (c0 !== null && c0 === corredorDe(q)) { andar([{ x: q.x, z: q.z }]); return; } const e = (Math.abs(pos.x - eL) + Math.abs(eL - q.x)) <= (Math.abs(pos.x - eR) + Math.abs(eR - q.x)) ? eL : eR; andar([{ x: e, z: pos.z }, { x: e, z: q.z }, { x: q.x, z: q.z }]); };
+          const fixo = (extra) => Object.assign({ x: pos.x, z: pos.z, ang }, extra);
+          const rack = (a) => { const za = L0.corredorZ(a.f), yPal = a.n > 1 ? a.y + 0.02 : 0; return { x: a.x, z: za, face: Math.atan2(0, Math.sign(a.z - za) || -1), h: Math.max(0.02, yPal + 0.075 - 0.14) }; };
+          const vaga = vagasSep[n % Math.max(1, vagasSep.length)];
+          let ini = { carga: false, chao: false, fora: null }, fim = {};
+          if (tipo === "buscar") {
+            const R = rack(alvo);
+            caminho({ x: R.x, z: R.z }); girarPara(R.face);
+            acoes.push(fixo({ tipo: "garfo", de: 0.05, para: R.h, dur: 0.5 + R.h / 0.55 }));
+            acoes.push(fixo({ tipo: "avanco", de: 0, para: AV, h: R.h, dur: 1.1 }));
+            acoes.push(fixo({ tipo: "garfo", de: R.h, para: R.h + 0.12, av: AV, dur: 0.6, pega: true, fora: alvo.ppId }));
+            acoes.push(fixo({ tipo: "avanco", de: AV, para: 0, h: R.h + 0.12, dur: 1.1 }));
+            acoes.push(fixo({ tipo: "garfo", de: R.h + 0.12, para: 0.05, dur: 0.5 + R.h / 0.65 }));
+            if (alvo.contagem) {   // contagem em nível alto: desce o palete no corredor para a pessoa contar
+              girarPara(R.x + 3 < L0.xR - 0.5 ? Math.PI / 2 : -Math.PI / 2);
+              const cp = { x: pos.x, z: pos.z, ang };
+              acoes.push(fixo({ tipo: "garfo", de: 0.05, para: 0.0, dur: 0.5, solta: true, chao: true }));
+              acoes.push(fixo({ tipo: "avanco", de: 0, para: -1.3, h: 0.0, dur: 1.4 }));
+              pos = { x: pos.x - Math.sin(ang) * 1.3, z: pos.z - Math.cos(ang) * 1.3 };
+              fim = { naVaga: true, chaoPose: cp, recuo: 1.3 };
+            } else if (vaga) {
+              caminho(vaga.A); girarPara(vaga.ang);
+              acoes.push(fixo({ tipo: "avanco", de: 0, para: AV, h: 0.05, dur: 1.1 }));
+              acoes.push(fixo({ tipo: "garfo", de: 0.05, para: 0.0, av: AV, dur: 0.4, solta: true, chao: true }));
+              acoes.push(fixo({ tipo: "avanco", de: AV, para: 0, h: 0.0, dur: 1.1 }));
+              fim = { naVaga: true, chaoPose: { x: vaga.A.x + Math.sin(vaga.ang) * AV, z: vaga.A.z + Math.cos(vaga.ang) * AV, ang: vaga.ang } };
+            } else fim = { naVaga: false };
+          } else if (tipo === "devolver") {
+            const R = rack(alvo);
+            if (es.naVaga) {
+              ini = { carga: false, chao: true, fora: alvo.ppId };
+              const rc = es.recuo || AV;
+              acoes.push(fixo({ tipo: "avanco", de: 0, para: rc, h: 0.0, dur: 1.1 }));
+              acoes.push(fixo({ tipo: "garfo", de: 0.0, para: 0.05, av: rc, dur: 0.4, pega: true, deChao: true }));
+              if (es.recuo) pos = { x: pos.x + Math.sin(ang) * rc, z: pos.z + Math.cos(ang) * rc };   // pegou do chão do corredor: já está na porta-palete
+              else acoes.push(fixo({ tipo: "avanco", de: AV, para: 0, h: 0.05, dur: 1.1 }));
+              caminho({ x: R.x, z: R.z }); girarPara(R.face);
+            } else ini = { carga: true, chao: false, fora: alvo.ppId };
+            acoes.push(fixo({ tipo: "garfo", de: 0.05, para: R.h + 0.12, dur: 0.5 + R.h / 0.55 }));
+            acoes.push(fixo({ tipo: "avanco", de: 0, para: AV, h: R.h + 0.12, dur: 1.1 }));
+            acoes.push(fixo({ tipo: "garfo", de: R.h + 0.12, para: R.h, av: AV, dur: 0.6, solta: true, devolve: true }));
+            acoes.push(fixo({ tipo: "avanco", de: AV, para: 0, h: R.h, dur: 1.1 }));
+            acoes.push(fixo({ tipo: "garfo", de: R.h, para: 0.05, dur: 0.5 + R.h / 0.65 }));
+          } else {
+            const pk = vagasPk[n] || vagasPk[0]; if (!pk) return null;
+            caminho({ x: pk.x, z: pk.z }); girarPara(pk.ang);
+          }
+          if (!acoes.length) return null;
+          const corredores = new Set(); acoes.forEach(a2 => (a2.pts || [a2]).forEach(q => { const f2 = q.x !== undefined ? corredorDe(q) : null; if (f2 !== null) corredores.add(f2); }));
+          return { corredores, acoes, duracao: acoes.reduce((a, b) => a + b.dur, 0), ini, semLaco: true, fim, tipo, chaoPose: fim.chaoPose || es.chaoPose };
+        };
+        const foraAgora = new Set();
         frota.forEach((e, n) => {
-          const pista = pistas[n];
-          if (pista && pista.total > 0) {
-            const vel = 2.4, ciclo = pista.total / vel + 3;
-            const d = Math.min(pista.total, ((t / 1000 + n * 2.7) % ciclo) * vel);
-            let i = 0; while (i < pista.acum.length - 2 && pista.acum[i + 1] < d) i++;
-            const a = pista.pts[i], b = pista.pts[i + 1];
-            const seg = (pista.acum[i + 1] - pista.acum[i]) || 1, k = Math.min(1, (d - pista.acum[i]) / seg);
-            e.position.set(a.x + (b.x - a.x) * k, 0, a.z + (b.z - a.z) * k);
-            let dif = Math.atan2(b.x - a.x, b.z - a.z) - e.rotation.y; while (dif > Math.PI) dif -= 2 * Math.PI; while (dif < -Math.PI) dif += 2 * Math.PI;
-            e.rotation.y += dif * Math.min(1, dt * 7); e.visible = true;
-          } else if (n === 0 && st.current.estacionada) { e.position.copy(st.current.estacionada.p); e.rotation.y = st.current.estacionada.r; e.visible = true; }
-          else e.visible = false;
+          const gf = e.getObjectByName("garfo"), mm = e.getObjectByName("mastroMeio"), mi = e.getObjectByName("mastroInterno"), cg = e.getObjectByName("carga");
+          if (n >= nFrota) { e.visible = false; est[n] = null; return; }
+          const pk = vagasPk[n] || vagasPk[0];
+          let es = est[n];
+          if (!es) { if (!pk) { e.visible = false; return; } es = est[n] = { pos: { x: pk.x, z: pk.z }, ang: pk.ang, fase: "livre", estacionada: true, fila: null, relogio: 0, pose: null, alvoPP: null, naVaga: false, chaoPose: null }; }
+          const pid = Object.keys(fp).find(k => fp[k] === n);
+          const info = pid ? alvosV.find(a => a.pedidoId === pid) : null, alvo = info ? info.alvo : null;
+          // decide o próximo passo quando termina o anterior (comandado pelos bipes da separação)
+          const bonecoOk = !pid || !pid.startsWith("ct:") || !!((st.current.bonecos || {})[pid.slice(3)] || {}).montado;
+          if (!es.fila) {
+            if (es.fase === "livre") {
+              if (alvo && bonecoOk) { es.fila = planejar(es, n, "buscar", alvo); if (es.fila) { es.fase = "buscando"; es.alvoPP = alvo; es.estacionada = false; } }
+              else if (!alvo && !es.estacionada) { es.fila = planejar(es, n, "estacionar"); es.fase = es.fila ? "estacionando" : "livre"; if (!es.fila) es.estacionada = true; }
+            } else if (es.fase === "comPalete") {
+              if ((!alvo || String(alvo.ppId) !== String(es.alvoPP.ppId)) && bonecoOk) { es.fila = planejar(es, n, "devolver", es.alvoPP); if (es.fila) es.fase = "devolvendo"; }
+            }
+            es.relogio = 0;
+          }
+          let pose;
+          if (es.fila) {
+            const cand = poseNa(es.fila, es.relogio + dt), atual = es.pose || poseNa(es.fila, es.relogio);
+            let bloqueada = false; const fc = corredorDe(cand), fa = corredorDe(atual); es.esperaPor = null;
+            if (fc !== null && fc !== fa) bloqueada = est.some((o, m) => m !== n && o && o.pose && corredorDe(o.pose) === fc);
+            // corredor ocupado: espera longe da boca (fora do caminho de quem está saindo)
+            if (!bloqueada && L0) for (const f of L0.corredores) {
+              if (f === fa || !(es.fila.corredores && es.fila.corredores.has(f))) continue;   // só espera se for entrar nesse corredor
+              const zc = L0.corredorZ(f), dB = (q) => Math.min(Math.hypot(q.x - L0.xL, q.z - zc), Math.hypot(q.x - L0.xR, q.z - zc));
+              if (!(dB(cand) < 2.3 && dB(cand) < dB(atual))) continue;
+              if (est.some((o, m) => m !== n && o && o.pose && (corredorDe(o.pose) === f || (dB(o.pose) < 1.7 && o.fila)))) { bloqueada = true; es.esperaPor = f; break; }
+            }
+            // fora dos corredores: cede para quem tem prioridade, para quem está parado e nunca encosta na traseira de quem vai na frente
+            if (!bloqueada && fa === null) bloqueada = est.some((o, m) => {
+              if (m === n || !o || !o.pose) return false;
+              if (o.esperaPor != null && Math.abs(atual.z - L0.corredorZ(o.esperaPor)) < L0.A / 2 + 0.7) return false;   // ela está me esperando sair
+              const d1 = Math.hypot(cand.x - o.pose.x, cand.z - o.pose.z), d0 = Math.hypot(atual.x - o.pose.x, atual.z - o.pose.z);
+              if (!(d1 < 2.0 && d1 < d0)) return false;
+              if (m < n || !o.fila) return true;
+              const pv = o.posePrev || o.pose, vx = o.pose.x - pv.x, vz = o.pose.z - pv.z;
+              return vx * (atual.x - o.pose.x) + vz * (atual.z - o.pose.z) <= 1e-4;   // a outra não vem na minha direção: vou atrás dela
+            });
+            if (!bloqueada) es.relogio += dt;
+            pose = bloqueada ? atual : cand;
+            if (es.relogio >= es.fila.duracao) {   // terminou a sequência
+              const f = es.fila; pose = poseNa(f, f.duracao);
+              es.pos = { x: pose.x, z: pose.z }; es.ang = pose.ang;
+              if (f.tipo === "buscar") { es.fase = "comPalete"; es.naVaga = !!f.fim.naVaga; es.chaoPose = f.fim.chaoPose || null; es.recuo = f.fim.recuo || 0; }
+              else if (f.tipo === "devolver") { es.fase = "livre"; es.naVaga = false; es.alvoPP = null; es.recuo = 0; }
+              else { es.fase = "livre"; es.estacionada = true; }
+              es.fila = null;
+            }
+          } else {
+            const comPal = es.fase === "comPalete";
+            pose = { x: es.pos.x, z: es.pos.z, ang: es.ang, h: comPal && !es.naVaga ? 0.05 : (comPal ? 0.0 : 0.05), carga: comPal && !es.naVaga, chao: comPal && es.naVaga, fora: comPal ? es.alvoPP.ppId : null };
+          }
+          es.posePrev = es.pose || pose; es.pose = pose;
+          e.visible = true; e.position.set(pose.x, 0, pose.z); e.rotation.y = pose.ang;
+          if (gf) gf.position.y = pose.h;
+          const curso = Math.max(0, pose.h - 0.55);
+          if (mm) mm.position.y = curso * 0.5; if (mi) mi.position.y = curso;
+          if (cg) cg.visible = pose.carga;
+          const c = chao[n], cp = (es.fila && es.fila.chaoPose) || es.chaoPose;
+          if (c) { c.visible = !!(pose.chao && cp); if (cp) { c.position.set(cp.x, 0.02, cp.z); c.rotation.y = cp.ang; } }
+          if (pose.fora) foraAgora.add(String(pose.fora));
         });
+        for (let n = frota.length; n < chao.length; n++) chao[n].visible = false;
+        // ---- bonequinhos: cada pessoa contando vai até a porta-palete; no 2º/3º nível ela pilota uma paleteira, desce o palete, conta e devolve ----
+        const bon = st.current.bonecos = st.current.bonecos || {};
+        if (L0) {
+          const lista = st.current.contadores || [], v0 = vagasSep[0] || vagasPk[0], casa = v0 ? { x: v0.x, z: v0.z } : { x: L0.xL - 3, z: 0 };
+          const zonaCorr = (q) => { for (const f of L0.corredores) { const zc = L0.corredorZ(f); if (Math.abs(q.z - zc) < L0.A / 2 && q.x > L0.xL - 0.3 && q.x < L0.xR + 0.3) return f; } return null; };
+          const posto = (u) => { const za = L0.corredorZ(u.f), lado = Math.sign(u.z - za) || -1; return { x: u.x + 0.85, z: za + lado * (L0.A / 2 - 0.55), ang: lado > 0 ? 0 : Math.PI }; };
+          const rotaP = (de, para) => {
+            const pts = [{ x: de.x, z: de.z }], ca = zonaCorr(de), cb = zonaCorr(para);
+            if (!(ca !== null && ca === cb) && Math.hypot(de.x - para.x, de.z - para.z) > 2.5) {
+              const eL = L0.xL - 0.9, eR = L0.xR + 0.9, e = (Math.abs(de.x - eL) + Math.abs(eL - para.x)) <= (Math.abs(de.x - eR) + Math.abs(eR - para.x)) ? eL : eR;
+              pts.push({ x: e, z: de.z }, { x: e, z: para.z });
+            }
+            pts.push({ x: para.x, z: para.z }); return pts;
+          };
+          const timaoDe = (es) => { const p = es.pose || { x: es.pos.x, z: es.pos.z, ang: es.ang }; return { x: p.x - Math.sin(p.ang) * 1.6, z: p.z - Math.cos(p.ang) * 1.6, ang: p.ang }; };
+          // contorna a paleteira pelo lado (nunca atravessa): ponto atrás e ao lado dela
+          const ladoDe = (es) => { const tm = timaoDe(es); return { x: tm.x + Math.cos(tm.ang) * 0.95, z: tm.z - Math.sin(tm.ang) * 0.95 }; };
+          const aoLadoDoPalete = (cp) => { const cx = cp.x + Math.sin(cp.ang) * 0.68, cz = cp.z + Math.cos(cp.ang) * 0.68; return { x: cx + Math.cos(cp.ang) * 0.95, z: cz - Math.sin(cp.ang) * 0.95, ang: cp.ang - Math.PI / 2 }; };
+          const nomeDe = (u) => { const a = String(u || "").split("@")[0]; return a.charAt(0).toUpperCase() + a.slice(1); };
+          lista.forEach(u => { if (!bon[u.usuario]) bon[u.usuario] = Object.assign(criarBoneco(u.usuario), { pos: { ...casa }, ang: 0, pts: null, i: 0, meta: null, montado: false, ocioso: 0, fase: 0 }); });
+          Object.keys(bon).forEach(k => {
+            const b = bon[k], u = lista.find(x => x.usuario === k) || null;
+            const nK = fp["ct:" + k], esK = nK !== undefined ? est[nK] : null;
+            // rótulo
+            if (u) { b.ocioso = 0; const t1 = nomeDe(k), t2 = (b.montado ? `paleteira · ${u.cod || ""}` : `contando ${u.cod || ""}`) + ` · ${u.pecas} pç`; if (b.texto !== t1 + t2) { b.texto = t1 + t2; b.escrever(t1, t2); } }
+            else { if (!b.ocioso) { b.escrever(nomeDe(k), "contagem finalizada ✓"); b.texto = ""; } b.ocioso = (b.ocioso || 0) + dt; }
+            // o que a pessoa deve fazer agora
+            let meta = null, contarAqui = false, querMontar = false;
+            if (esK) {
+              const alvoAqui = u && esK.alvoPP && String(u.ppId) === String(esK.alvoPP.ppId);
+              if (esK.fila) querMontar = b.montado;
+              else if (esK.fase === "comPalete" && esK.naVaga && alvoAqui && esK.chaoPose) { meta = { ...aoLadoDoPalete(esK.chaoPose), k: "palete" + esK.alvoPP.ppId, via: b.montado || Math.hypot(b.pos.x - timaoDe(esK).x, b.pos.z - timaoDe(esK).z) < 0.3 ? [ladoDe(esK)] : null }; contarAqui = true; }
+              else if (esK.fase === "comPalete") querMontar = true;
+              else if (u && u.nivel > 1) querMontar = true;
+              else if (!u && !esK.estacionada) querMontar = b.montado;
+            }
+            if (!querMontar && b.montado) { b.montado = false; b.pts = null; b.meta = null; }
+            if (querMontar && !b.montado) { const tm = timaoDe(esK), ld = ladoDe(esK), perto = Math.hypot(b.pos.x - ld.x, b.pos.z - ld.z) < 4;
+              meta = { ...tm, k: "timao" + Math.round(tm.x * 4) + "," + Math.round(tm.z * 4), via: esK.naVaga && perto ? [ld] : null }; }
+            if (!meta && !querMontar) {
+              if (u && !(esK && u.nivel > 1)) { const p = posto(u); meta = { ...p, k: "posto" + u.ppId }; contarAqui = true; }
+              else if (!u && b.ocioso > 6) meta = { ...casa, k: "casa", casa: true };
+              else if (!u) contarAqui = false;
+            }
+            let andando = false;
+            if (b.montado) {   // pilotando: anda atrás do timão
+              const tm = timaoDe(esK), mv = Math.hypot(tm.x - b.pos.x, tm.z - b.pos.z);
+              andando = mv > 0.004; if (andando) b.fase += mv * 5.2;
+              b.pos = { x: tm.x, z: tm.z }; b.ang = tm.ang; b.alvoAng = tm.ang;
+            } else if (meta) {
+              if (b.meta !== meta.k) { b.meta = meta.k; b.pts = meta.via ? [{ x: b.pos.x, z: b.pos.z }, ...meta.via, { x: meta.x, z: meta.z }] : rotaP(b.pos, meta); b.i = 1; b.alvoAng = meta.ang; }
+              let passo = 1.25 * dt;
+              while (b.pts && passo > 0 && b.i < b.pts.length) {
+                const q = b.pts[b.i], dx = q.x - b.pos.x, dz = q.z - b.pos.z, d = Math.hypot(dx, dz);
+                if (d < 1e-4) { b.i++; continue; }
+                const m = Math.min(d, passo); b.pos.x += dx / d * m; b.pos.z += dz / d * m; passo -= m; b.rumo = Math.atan2(dx, dz); andando = true;
+                if (m >= d) b.i++;
+              }
+              if (andando) b.fase += 1.25 * dt * 5.2;
+              const chegou = b.pts && b.i >= b.pts.length;
+              if (chegou && querMontar) { b.montado = true; b.pts = null; b.meta = null; }
+              if (chegou && meta.casa) { scene.remove(b.g); b.tx.dispose(); b.camisa.dispose(); delete bon[k]; return; }
+            }
+            const angAlvo = andando && !b.montado ? b.rumo : (b.alvoAng !== undefined ? b.alvoAng : b.ang);
+            if (!b.montado) b.ang = angLerpP(b.ang, angAlvo, Math.min(1, dt * 8));
+            b.g.position.set(b.pos.x, 0, b.pos.z); b.g.rotation.y = b.ang;
+            const contando = !andando && !b.montado && contarAqui && !!u;
+            const tt = t / 1000;
+            if (andando) {
+              const sw = Math.sin(b.fase);
+              b.pE.rotation.x = sw * 0.55; b.pD.rotation.x = -sw * 0.55; b.corpo.position.y = Math.abs(Math.cos(b.fase)) * 0.035; b.cabeca.rotation.x = 0; b.cabeca.rotation.y = 0;
+              if (b.montado) { b.bE.rotation.x = -0.95; b.bD.rotation.x = -0.95; b.bD.rotation.z = 0; } else { b.bE.rotation.x = -sw * 0.45; b.bD.rotation.x = sw * 0.45; b.bD.rotation.z = 0; }
+            } else {
+              b.pE.rotation.x *= 0.8; b.pD.rotation.x *= 0.8; b.corpo.position.y *= 0.8;
+              if (b.montado) { b.bE.rotation.x = -0.95; b.bD.rotation.x = -0.95; b.bD.rotation.z = 0; b.cabeca.rotation.x = -0.25; b.cabeca.rotation.y = 0; }   // segurando o timão, olhando o garfo
+              else {
+                b.bD.rotation.x = contando ? -1.15 + Math.sin(tt * 2.6) * 0.18 : 0; b.bD.rotation.z = contando ? Math.sin(tt * 0.9) * 0.15 : 0;
+                b.bE.rotation.x = contando ? -0.5 : 0;
+                b.cabeca.rotation.x = contando ? -0.12 + Math.sin(tt * 0.7) * 0.1 : 0; b.cabeca.rotation.y = contando ? Math.sin(tt * 0.45) * 0.35 : 0;
+              }
+            }
+            b.feixe.visible = contando && (Math.sin(tt * 2.6) > 0.55);
+            b.contando = contando;
+          });
+        }
+        // palete que saiu da porta-palete some de lá enquanto está fora (e volta quando é devolvido)
+        const foraAntes = st.current.foraAnterior || new Set();
+        if ([...foraAgora].some(x => !foraAntes.has(x)) || [...foraAntes].some(x => !foraAgora.has(x))) {
+          (st.current.instancias || []).forEach(im => {
+            const { pps, mats } = im.userData; if (!mats || !pps.some(x => x !== null)) return; let mudou = false;
+            pps.forEach((id, k) => { if (id === null) return; const key = String(id); if (foraAgora.has(key) !== foraAntes.has(key)) { im.setMatrixAt(k, foraAgora.has(key) ? ESCALA_ZERO : mats[k]); mudou = true; } });
+            if (mudou) im.instanceMatrix.needsUpdate = true;
+          });
+          st.current.foraAnterior = foraAgora;
+        }
         renderer.render(scene, camera);
         qual.n++; qual.soma += dt;
         if (qual.n >= 90) { const media = qual.soma / qual.n; qual.n = 0; qual.soma = 0; if (media > 0.045 && qual.pr > 0.75) { qual.pr = Math.max(0.75, qual.pr - 0.25); renderer.setPixelRatio(qual.pr); renderer.setSize(el.clientWidth, el.clientHeight); } }
@@ -1235,13 +1604,18 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
 
       st.current = { ...st.current, THREE, renderer, scene, camera, conteudo, telhado, rotaGrupo, mat, geo, T, peca, placa, etiqueta, cam, fp, voar, sol, foco, colide,
         limpar: () => { cancelAnimationFrame(raf); ro.disconnect(); renderer.dispose(); pmrem.dispose(); Object.values(T).forEach(x => x.dispose()); Object.values(placas).forEach(x => { x.t.dispose(); x.m && x.m.dispose(); }); if (dom.parentNode) dom.parentNode.removeChild(dom); } };
+      if (location.hostname === "localhost") window.__m3d = st;   // só para testes locais
       setPronto(true);
     }).catch(e => vivo && setErro(e.message));
     return () => { vivo = false; st.current.limpar && st.current.limpar(); st.current = {}; };
   }, []);
 
+  st.current.alvosAuto = alvosAuto;
+  st.current.contadores = contadores;
   st.current.aoEscolher = (u) => {
-    if (!u) { setSelPP(null); setSelCorredor(null); setSelDoca(false); return; }
+    if (!u) { setSelPP(null); setSelCorredor(null); setSelDoca(false); setSelPrep(false); return; }
+    if (u.preparo) { setSelPrep(v => !v); setSelPP(null); setSelCorredor(null); setSelDoca(false); return; }
+    setSelPrep(false);
     if (u.ppId) { setSelPP(u.ppId === selPP ? null : u.ppId); setSelCorredor(null); setSelDoca(false); }
     else if (u.corredor !== undefined) { setSelCorredor(u.corredor === selCorredor ? null : u.corredor); setSelPP(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); }
     else if (u.doca) { setSelDoca(d => !d); setSelPP(null); setSelCorredor(null); }
@@ -1251,6 +1625,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   useEffect(() => {
     if (!pronto) return;
     const { THREE, conteudo, telhado, mat, geo, T, placa, sol, cam } = st.current;
+    const std = (o) => new THREE.MeshStandardMaterial(o);
     (st.current.descartar || []).forEach(x => x.dispose && x.dispose());
     st.current.descartar = [];
     const descartar = (x) => { st.current.descartar.push(x); return x; };
@@ -1258,6 +1633,18 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     const L = layout; st.current.layoutAtual = L;
     const { BW, D, LH, A } = L; const p = L.predio; const H = p.H;
     const placasPos = [], placasCorr = [], hits = [];
+    const placaCorredor = (txt) => {   // como as placas reais: quadro branco, quadrado azul, número branco
+      const k = "corr|" + txt; st.current.cachePlacas = st.current.cachePlacas || {};
+      if (!st.current.cachePlacas[k]) {
+        const c = document.createElement("canvas"); c.width = 256; c.height = 200; const g = c.getContext("2d");
+        g.fillStyle = "#f7f7f5"; g.fillRect(0, 0, 256, 200); g.strokeStyle = "#d7d7d2"; g.lineWidth = 4; g.strokeRect(2, 2, 252, 196);
+        g.fillStyle = "#1f2a8f"; g.fillRect(38, 22, 180, 156);
+        g.fillStyle = "#ffffff"; g.font = "800 112px Inter, Segoe UI, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(txt, 128, 106);
+        const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8;
+        st.current.cachePlacas[k] = new THREE.MeshBasicMaterial({ map: t, toneMapped: false, side: THREE.DoubleSide });
+      }
+      return st.current.cachePlacas[k];
+    };
 
     const lotes = {}; const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), eu = new THREE.Euler(), vp = new THREE.Vector3(), vs = new THREE.Vector3();
     const branco = new THREE.Color(1, 1, 1);
@@ -1272,11 +1659,31 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     T.concreto.repeat.set(p.W / 8, p.P / 8); T.rug.repeat.set(p.W / 5, p.P / 5);
     const piso = new THREE.Mesh(descartar(new THREE.PlaneGeometry(p.W, p.P)), mat.piso);
     piso.rotation.x = -Math.PI / 2; piso.position.set(p.cx, 0, p.cz); piso.receiveShadow = true; conteudo.add(piso);
-    T.parede.repeat.set(Math.max(p.W, p.P) / 9, 1);
     const invis = descartar(new THREE.MeshBasicMaterial({ visible: false }));
-    // paredes por dentro (BackSide): a parede do lado da câmera some sozinha
-    const paredes = new THREE.Mesh(descartar(new THREE.BoxGeometry(p.W, H, p.P)), [mat.parede, mat.parede, invis, invis, mat.parede, mat.parede]);
-    paredes.position.set(p.cx, H / 2 - 0.005, p.cz); paredes.receiveShadow = true; conteudo.add(paredes);
+    // paredes: planos virados para dentro — a parede do lado da câmera some sozinha (vista em corte).
+    // A parede da doca ganha um vão de verdade para o portão de descarga.
+    const dk = pontoDoca(L, cfg); const dw = cfg.docaLargura, dh = 4.6;
+    const centroP = new THREE.Vector3(p.cx, H / 2, p.cz);
+    const quad = (ax, az, bx, bz, y0, y1, u0) => {
+      const len = Math.hypot(bx - ax, bz - az); if (len < 0.01 || y1 - y0 < 0.01) return;
+      let A = [ax, az], B = [bx, bz], uA = u0 / 9, uB = (u0 + len) / 9;
+      const n = new THREE.Vector3(bx - ax, 0, bz - az).cross(new THREE.Vector3(0, 1, 0));
+      if (n.dot(new THREE.Vector3(p.cx - ax, 0, p.cz - az)) < 0) { [A, B] = [B, A]; [uA, uB] = [uB, uA]; }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.Float32BufferAttribute([A[0], y0, A[1], B[0], y0, B[1], B[0], y1, B[1], A[0], y1, A[1]], 3));
+      g.setAttribute("uv", new THREE.Float32BufferAttribute([uA, 1 - y0 / H, uB, 1 - y0 / H, uB, 1 - y1 / H, uA, 1 - y1 / H].map((v, k) => k % 2 ? 1 - v : v), 2));
+      g.setIndex([0, 1, 2, 0, 2, 3]); g.computeVertexNormals();
+      const m = new THREE.Mesh(descartar(g), mat.parede); m.receiveShadow = true; conteudo.add(m);
+    };
+    const paredesDef = { fundo: [p.minX, p.minZ, p.maxX, p.minZ], frente: [p.minX, p.maxZ, p.maxX, p.maxZ], esquerda: [p.minX, p.minZ, p.minX, p.maxZ], direita: [p.maxX, p.minZ, p.maxX, p.maxZ] };
+    Object.entries(paredesDef).forEach(([nome, [ax, az, bx, bz]]) => {
+      if (nome !== (cfg.docaParede || "fundo")) { quad(ax, az, bx, bz, 0, H, 0); return; }
+      const len = Math.hypot(bx - ax, bz - az), dirx = (bx - ax) / len, dirz = (bz - az) / len;
+      const t = (dk.x - ax) * dirx + (dk.z - az) * dirz, t0 = t - dw / 2, t1 = t + dw / 2;
+      quad(ax, az, ax + dirx * t0, az + dirz * t0, 0, H, 0);
+      quad(ax + dirx * t1, az + dirz * t1, bx, bz, 0, H, t1);
+      quad(ax + dirx * t0, az + dirz * t0, ax + dirx * t1, az + dirz * t1, dh, H, t0);
+    });
     // telhado metálico (visto de baixo), tesouras, terças e luminárias suspensas
     T.telha.repeat.set(p.W / 6, p.P / 6);
     const forro = new THREE.Mesh(descartar(new THREE.PlaneGeometry(p.W, p.P)), mat.telha); forro.rotation.x = -Math.PI / 2; forro.position.set(p.cx, H + 1.2, p.cz); telhado.add(forro);
@@ -1287,7 +1694,10 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       por("estr", geo.cubo, mat.estrutura, [p.cx, H + 1.0, z], [p.W, 0.12, 0.12], null, null, null, telhado);
       const nMont = Math.round(p.W / 2.5);
       for (let j = 0; j < nMont; j++) { const x = p.minX + (p.W / nMont) * (j + 0.5); por("estrFina", geo.cubo, mat.estrutura, [x, H + 0.5, z], [0.05, 1.15, 0.05], [0, 0, j % 2 ? 0.55 : -0.55], null, null, telhado); }
-      [p.minX + 0.2, p.maxX - 0.2].forEach(x => por("pilar", geo.cubo, mat.estrutura, [x, H / 2, z], [0.32, H, 0.32]));   // pilares nas paredes
+      [p.minX + 0.2, p.maxX - 0.2].forEach(x => {   // pilares nas paredes (nunca na frente do portão)
+        const naDoca = Math.abs(x - dk.x) < 0.6 && Math.abs(z - dk.z) < dw / 2 + 0.7;
+        if (!naDoca) por("pilar", geo.cubo, mat.estrutura, [x, H / 2, z], [0.32, H, 0.32]);
+      });
     }
     for (let x = p.minX + 4; x < p.maxX; x += 4) por("estrFina", geo.cubo, mat.estrutura, [x, H + 1.05, p.cz], [0.08, 0.08, p.P], null, null, null, telhado);
     // luminárias industriais (campânulas LED) sobre os corredores e ruas
@@ -1298,29 +1708,226 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       por("led", geo.disco, mat.led, [x, H - 1.07, z], [0.36, 0.36, 1], [Math.PI / 2, 0, 0], null, null, telhado);
     } });
 
-    // ---- DOCA 1 (única) ----
-    const dk = pontoDoca(L, cfg); const dw = cfg.docaLargura, dh = 4.0;
+    // ---- DOCA 1: portão de descarga (como na foto): vão grande, folha de correr de ripas escuras aberta por dentro,
+    //      canaleta de drenagem na soleira, cobertura metálica do lado de fora e o pátio com muro ----
     const docaG = new THREE.Group(); docaG.position.set(dk.x, 0, dk.z); docaG.rotation.y = dk.rot; conteudo.add(docaG);
-    const vao = new THREE.Mesh(geo.plano, mat.lado); vao.scale.set(dw, dh * 0.62, 1); vao.position.set(0, dh * 0.31, 0.015); docaG.add(vao);   // luz do dia (portão aberto)
-    const portao = new THREE.Mesh(geo.plano, mat.porta); portao.scale.set(dw, dh * 0.38, 1); portao.position.set(0, dh * 0.81, 0.02); docaG.add(portao);
-    const caixaPortao = new THREE.Mesh(geo.cubo, mat.estrutura); caixaPortao.scale.set(dw + 0.3, 0.45, 0.45); caixaPortao.position.set(0, dh + 0.22, 0.22); caixaPortao.castShadow = true; docaG.add(caixaPortao);
-    [-1, 1].forEach(s => { const bat = new THREE.Mesh(geo.cubo, mat.zebra); bat.scale.set(0.16, dh, 0.12); bat.position.set(s * (dw / 2 + 0.08), dh / 2, 0.06); docaG.add(bat);
-      const pr = new THREE.Mesh(geo.cubo, mat.borracha); pr.scale.set(0.22, 0.45, 0.16); pr.position.set(s * (dw / 2 - 0.25), 0.55, 0.1); docaG.add(pr);
-      const bal = new THREE.Mesh(geo.cil, mat.amarelo); bal.scale.set(0.09, 1.1, 0.09); bal.position.set(s * (dw / 2 + 0.55), 0.55, 0.6); bal.castShadow = true; docaG.add(bal); });
-    const niv = new THREE.Mesh(geo.cubo, mat.nivelador); niv.scale.set(dw - 0.6, 0.03, 2.2); niv.position.set(0, 0.015, 1.1); niv.receiveShadow = true; docaG.add(niv);
-    const nivZ = new THREE.Mesh(geo.cubo, mat.zebra); nivZ.scale.set(dw - 0.6, 0.032, 0.12); nivZ.position.set(0, 0.016, 2.2); docaG.add(nivZ);
-    const plDoca = placa("DOCA 1", { fundo: "#1c2129", cor: "#f2c200", altura: 0.32, fonte: "700" }); plDoca.position.set(0, dh + 0.75, 0.05); docaG.add(plDoca);
+    const concretoEsc = descartar(std({ color: "#8d8a84", roughness: 0.85 }));
+    const muroMat = descartar(std({ color: "#eceae4", roughness: 0.9 }));
+    const ripasMat = descartar(std({ map: T.ripas, roughness: 0.5, metalness: 0.6 }));
+    const telhaFora = descartar(std({ map: T.telha, roughness: 0.5, metalness: 0.6, side: THREE.DoubleSide }));
+    const verde = descartar(std({ color: "#3f6b34", roughness: 1 }));
+    [-1, 1].forEach(sx => { const j2 = new THREE.Mesh(geo.cubo, concretoEsc); j2.scale.set(0.35, dh + 0.3, 0.4); j2.position.set(sx * (dw / 2 + 0.17), (dh + 0.3) / 2, 0); j2.castShadow = true; docaG.add(j2); });   // pilares do vão
+    const verga = new THREE.Mesh(geo.cubo, concretoEsc); verga.scale.set(dw + 0.7, 0.3, 0.4); verga.position.set(0, dh + 0.15, 0); docaG.add(verga);
+    const folha = new THREE.Mesh(geo.cubo, ripasMat); folha.scale.set(dw, dh - 0.1, 0.07); folha.position.set(dw + 0.45, (dh - 0.1) / 2 + 0.03, 0.28); folha.castShadow = true; docaG.add(folha);   // folha de correr aberta
+    const trilho = new THREE.Mesh(geo.cubo, mat.estrutura); trilho.scale.set(dw * 2 + 0.8, 0.08, 0.08); trilho.position.set(dw / 2 + 0.3, dh, 0.28); docaG.add(trilho);
+    const canaleta = new THREE.Mesh(geo.cubo, mat.nivelador); canaleta.scale.set(dw, 0.02, 0.22); canaleta.position.set(0, 0.008, -0.05); docaG.add(canaleta);   // grelha de drenagem
+    for (let k = 0; k < Math.round(dw / 0.06); k++) { const b = new THREE.Mesh(geo.cubo, mat.borracha); b.scale.set(0.015, 0.025, 0.22); b.position.set(-dw / 2 + 0.03 + k * 0.06, 0.012, -0.05); docaG.add(b); }
+    const quadro = new THREE.Mesh(geo.cubo, descartar(std({ color: "#b9bcc0", roughness: 0.5, metalness: 0.4 }))); quadro.scale.set(0.7, 1.5, 0.18); quadro.position.set(-dw / 2 - 0.9, 0.85, 0.12); quadro.castShadow = true; docaG.add(quadro);   // quadro elétrico
+    const plSaida = placa("SAÍDA", { fundo: "#2f3238", cor: "#e8e8e8", altura: 0.14, fonte: "700" }); plSaida.position.set(-dw / 2 - 0.9, 2.1, 0.03); docaG.add(plSaida);
+    const plDoca = placa("DOCA 1 · DESCARGA", { fundo: "#1c2129", cor: "#f2c200", altura: 0.22, fonte: "700" }); plDoca.position.set(0, dh + 0.55, 0.22); docaG.add(plDoca);
+    // lado de fora: pátio de concreto, cobertura metálica, muro branco e o céu
+    const patio = new THREE.Mesh(geo.plano, concretoEsc); patio.rotation.x = -Math.PI / 2; patio.scale.set(dw + 10, 9, 1); patio.position.set(0, 0.002, -4.6); patio.receiveShadow = true; docaG.add(patio);
+    const cobertura = new THREE.Mesh(geo.plano, telhaFora); cobertura.scale.set(dw + 1.6, 3.9, 1); cobertura.position.set(0, dh + 0.05, -1.85); cobertura.rotation.x = Math.PI / 2 - 0.16; cobertura.castShadow = true; docaG.add(cobertura);
+    const vigaCob = new THREE.Mesh(geo.cubo, mat.estrutura); vigaCob.scale.set(dw + 1.6, 0.12, 0.12); vigaCob.position.set(0, dh - 0.55, -3.7); docaG.add(vigaCob);
+    const muro = new THREE.Mesh(geo.cubo, muroMat); muro.scale.set(dw + 12, 2.6, 0.22); muro.position.set(0, 1.3, -8.6); muro.castShadow = true; docaG.add(muro);
+    [-3.5, -1, 1.8, 4.2].forEach((x, k) => { const arv = new THREE.Mesh(new THREE.SphereGeometry(1, 10, 8), verde); arv.scale.set(1.3, 1.1 + (k % 2) * 0.4, 1.1); arv.position.set(x, 3.3 + (k % 2) * 0.3, -9.4); docaG.add(arv); });
+    // claridade do dia entrando pelo portão (véu de luz suave no vão)
+    const veu = new THREE.Mesh(geo.plano, descartar(new THREE.MeshBasicMaterial({ map: T.brilho, color: new THREE.Color(1.6, 1.6, 1.5), transparent: true, opacity: 0.55, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false })));
+    veu.scale.set(dw * 1.6, dh * 1.4, 1); veu.position.set(0, dh / 2, -0.25); docaG.add(veu);
+    const luzChao = new THREE.Mesh(geo.plano, descartar(new THREE.MeshBasicMaterial({ map: T.brilho, color: new THREE.Color(0.9, 0.9, 0.85), transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false })));
+    luzChao.rotation.x = -Math.PI / 2; luzChao.scale.set(dw * 1.5, 5, 1); luzChao.position.set(0, 0.01, 1.8); docaG.add(luzChao);
     const hitDoca = new THREE.Mesh(geo.cubo, mat.hit); hitDoca.scale.set(dw + 1, dh, 3); hitDoca.position.set(0, dh / 2, 1.2); hitDoca.userData = { doca: true }; docaG.add(hitDoca); hits.push(hitDoca);
     // área de recebimento/expedição marcada no piso em frente à doca (só pintura, sem mercadoria fictícia)
     const zona = new THREE.Group(); zona.position.copy(docaG.position); zona.rotation.y = dk.rot; conteudo.add(zona);
     const zw = dw + 3, zp = 4.2, z0 = 2.6;
     [[0, z0, zw, 0.1], [0, z0 + zp, zw, 0.1], [-zw / 2, z0 + zp / 2, 0.1, zp], [zw / 2, z0 + zp / 2, 0.1, zp], [0, z0 + zp / 2, 0.06, zp]].forEach(([x, z, sx, sz]) => {
       const f = new THREE.Mesh(geo.cubo, mat.faixa); f.scale.set(sx, 0.008, sz); f.position.set(x, 0.006, z); f.receiveShadow = true; zona.add(f); });
-    const tz1 = placa("RECEBIMENTO", { fundo: "transparent", cor: "rgba(232,184,0,0.9)", altura: 0.32, fonte: "700" }); tz1.rotation.x = -Math.PI / 2; tz1.rotation.z = Math.PI; tz1.position.set(-zw / 4, 0.012, z0 + zp - 0.45); zona.add(tz1);
+    const tz1 = placa("DESCARGA", { fundo: "transparent", cor: "rgba(232,184,0,0.9)", altura: 0.32, fonte: "700" }); tz1.rotation.x = -Math.PI / 2; tz1.rotation.z = Math.PI; tz1.position.set(-zw / 4, 0.012, z0 + zp - 0.45); zona.add(tz1);
     const tz2 = placa("EXPEDIÇÃO", { fundo: "transparent", cor: "rgba(232,184,0,0.9)", altura: 0.32, fonte: "700" }); tz2.rotation.x = -Math.PI / 2; tz2.rotation.z = Math.PI; tz2.position.set(zw / 4, 0.012, z0 + zp - 0.45); zona.add(tz2);
     // empilhadeira estacionada ao lado da doca quando não há rota
-    const estP = new THREE.Vector3(dk.dentro.x, 0, dk.dentro.z).add(new THREE.Vector3(Math.cos(dk.rot) * (zw / 2 + 1.6), 0, -Math.sin(dk.rot) * (zw / 2 + 1.6)));
+    const estP = new THREE.Vector3(dk.dentro.x, 0, dk.dentro.z).add(new THREE.Vector3(Math.cos(dk.rot) * (zw / 2 - 0.9), 0, -Math.sin(dk.rot) * (zw / 2 - 0.9)));
     st.current.estacionada = { p: estP, r: dk.rot + Math.PI };
+
+    // ---- ÁREA DE PREPARAÇÃO (bancadas de embalagem, mesa, estante leve, mezanino com escada, ventiladores) ----
+    // Só estrutura e mobiliário: nenhuma mercadoria inventada. Os móveis nunca ficam no caminho da doca.
+    const solidosExtras = [];
+    st.current.vagasSeparacao = [];
+    if (L.prep) {
+      const P = L.prep, Up = P.Up, Dp = P.Dp;
+      const gp = new THREE.Group(); gp.position.set(P.ox, 0, P.oz); gp.rotation.y = P.rot; conteudo.add(gp);
+      const add = (g, m, pos, sc, rot) => { const x = new THREE.Mesh(g, m); x.position.set(...pos); x.scale.set(...sc); if (rot) x.rotation.set(...rot); x.castShadow = true; x.receiveShadow = true; gp.add(x); return x; };
+      const solido = (u0, v0, u1, v1) => { const a = P.mundo(u0, v0), b = P.mundo(u1, v1); solidosExtras.push({ x0: Math.min(a.x, b.x), x1: Math.max(a.x, b.x), z0: Math.min(a.z, b.z), z1: Math.max(a.z, b.z), h: 2 }); };
+      const azul = descartar(std({ color: "#1f4fa8", map: T.perfil, roughness: 0.4, metalness: 0.45 }));
+      const branco = descartar(std({ color: "#ecebe6", roughness: 0.6 }));
+      const cinzaEst = descartar(std({ color: "#a3a8ae", roughness: 0.45, metalness: 0.6 }));
+      const preto = descartar(std({ color: "#17181b", roughness: 0.6, metalness: 0.3 }));
+      const concretoM = descartar(std({ color: "#a39f97", roughness: 0.9 }));
+      const corrimao = descartar(std({ color: "#34373c", roughness: 0.5, metalness: 0.6 }));
+      const vidro = descartar(std({ color: "#3d5068", roughness: 0.1, metalness: 0.6 }));
+      const portaMad = descartar(std({ color: "#7a5236", roughness: 0.7 }));
+      const telaMat = descartar(new THREE.MeshBasicMaterial({ map: T.tela3, toneMapped: false }));
+      // limite da área (faixa tracejada) e nome pintado no piso
+      for (let u = 0.5; u < Up - 0.5; u += 1.2) add(geo.cubo, mat.faixa, [u + 0.35, 0.006, 0.12], [0.7, 0.008, 0.09]);
+      const nomeArea = placa("ÁREA DE PREPARAÇÃO", { fundo: "transparent", cor: "rgba(235,238,242,0.55)", altura: 0.42, fonte: "700" });
+      nomeArea.rotation.x = -Math.PI / 2; nomeArea.position.set(Up / 2, 0.012, 3.55); gp.add(nomeArea);
+      const hitPrep = new THREE.Mesh(geo.cubo, mat.hit); hitPrep.scale.set(Up, 0.04, Dp); hitPrep.position.set(Up / 2, 0.02, Dp / 2); hitPrep.userData = { preparo: true }; gp.add(hitPrep); hits.push(hitPrep);
+      // faixa livre na frente da doca (se a doca estiver nesta parede)
+      const dkLoc = { u: (dk.x - P.ox) * Math.cos(P.rot) - (dk.z - P.oz) * Math.sin(P.rot), v: (dk.x - P.ox) * Math.sin(P.rot) + (dk.z - P.oz) * Math.cos(P.rot) };
+      const faixaDoca = Math.abs(dkLoc.v - Dp) < 0.6 ? [dkLoc.u - (dw / 2 + 2.6), dkLoc.u + (dw / 2 + 2.6)] : null;
+      let livres = [[0.8, Up - 0.8]];
+      if (faixaDoca) livres = livres.flatMap(([a, b]) => [[a, Math.min(b, faixaDoca[0])], [Math.max(a, faixaDoca[1]), b]]).filter(([a, b]) => b - a > 1);
+      // duas faixas independentes: junto à parede (escritório, estante) e no meio da área (bancadas, mesa)
+      const faixas = { parede: livres.map(x => x.slice()), centro: livres.map(x => x.slice()) };
+      const colocar = (largura, fn, faixa = "centro") => { for (const it of faixas[faixa]) { if (it[1] - it[0] >= largura) { const u0 = it[0]; it[0] += largura + 0.6; fn(u0); return true; } } return false; };
+      const vb = Math.max(3.2, Math.min(Dp * 0.4, Dp - 6.2));   // linha das bancadas
+      // ÁREA DE SEPARAÇÃO DE PALETES: vagas pintadas no chão onde a paleteira deixa o palete enquanto separam
+      faixas.paletes = livres.map(x => x.slice());
+      const vagas = []; const vS = 2.05;
+      for (let k = 0; k < 6; k++) colocar(1.5, (u0) => {
+        const us = u0 + 0.75;
+        [[0, -0.66, 1.5, 0.07], [0, 0.66, 1.5, 0.07], [-0.75, 0, 0.07, 1.39], [0.75, 0, 0.07, 1.39]].forEach(([du, dv, su, svv]) => add(geo.cubo, mat.faixaBranca, [us + du, 0.007, vS + dv], [su, 0.008, svv]));
+        const nv = placa("S" + (k + 1), { fundo: "transparent", cor: "rgba(235,238,242,0.7)", altura: 0.3, fonte: "700" }); nv.rotation.x = -Math.PI / 2; nv.position.set(us, 0.012, vS - 0.45); gp.add(nv);
+        const w = P.mundo(us, vS), a = P.mundo(us, vS - 1.73);
+        vagas.push({ x: w.x, z: w.z, ang: P.rot, A: a });
+      }, "paletes");
+      if (vagas.length) { const nomeSep = placa("ÁREA DE SEPARAÇÃO DE PALETES", { fundo: "transparent", cor: "rgba(232,184,0,0.8)", altura: 0.26, fonte: "700" }); nomeSep.rotation.x = -Math.PI / 2;
+        gp.add(nomeSep);
+        const uMed = vagas.reduce((a2, v2) => a2 + ((v2.x - P.ox) * Math.cos(P.rot) - (v2.z - P.oz) * Math.sin(P.rot)), 0) / vagas.length; nomeSep.position.set(uMed, 0.012, vS + 1.05); }
+      st.current.vagasSeparacao = vagas;
+
+      // barra/tubo entre dois pontos (corrimãos)
+      const barra = (a, b, r, m) => { const va = new THREE.Vector3(...a), vb2 = new THREE.Vector3(...b); const d = vb2.clone().sub(va); const x = new THREE.Mesh(geo.cil, m);
+        x.scale.set(r, d.length(), r); x.position.copy(va.clone().add(vb2).multiplyScalar(0.5)); x.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), d.normalize()); x.castShadow = true; gp.add(x); return x; };
+      const cinzaEsc = descartar(std({ color: "#4a4d52", roughness: 0.8 }));
+      const laranjaPrat = descartar(std({ color: "#e8761e", roughness: 0.55 }));
+      const madeiraClara = descartar(std({ color: "#d9c19a", map: T.madeira, roughness: 0.75 }));
+      const compensado = descartar(std({ color: "#e2c79a", map: T.madeira, roughness: 0.7 }));
+      const bordaVerm = descartar(std({ color: "#b8452f", roughness: 0.6 }));
+      const filmePreto = descartar(std({ color: "#121316", roughness: 0.25, metalness: 0.2 }));
+      const fita = descartar(std({ color: "#f0d24a", roughness: 0.2, transparent: true, opacity: 0.85 }));
+      const azulFita = descartar(std({ color: "#2f6fd6", roughness: 0.5 }));
+
+      // 1) escritório de alvenaria em dois níveis + escada maciça encostada na parede (como na foto)
+      if (cfg.prepMezanino && Dp >= 7) colocar(9.0, (u0) => {
+        const hp = 3.0, bv0 = Dp - 3.2, hTotal = hp + 2.7;
+        // bloco do escritório (térreo + andar de cima), encostado na parede
+        add(geo.cubo, concretoM, [u0 + 1.8, hTotal / 2, (bv0 + Dp) / 2], [3.6, hTotal, Dp - bv0]);
+        add(geo.cubo, portaMad, [u0 + 2.6, 1.05, bv0 - 0.02], [0.9, 2.1, 0.04]);                       // porta de baixo
+        add(geo.cubo, corrimao, [u0 + 1.3, hp + 1.45, bv0 - 0.02], [1.1, 0.9, 0.03]);                   // janela de cima (moldura)
+        add(geo.cubo, vidro, [u0 + 1.3, hp + 1.45, bv0 - 0.035], [1.0, 0.8, 0.02]);
+        for (let k = 1; k < 4; k++) add(geo.cubo, corrimao, [u0 + 1.3 - 0.5 + k * 0.25, hp + 1.45, bv0 - 0.045], [0.02, 0.8, 0.01]);
+        add(geo.cubo, portaMad, [u0 + 3.62, hp + 1.05, Dp - 0.65], [0.04, 2.1, 0.9]);                  // porta de cima (dá para o patamar)
+        // patamar no alto da escada (maciço) com guarda-corpo de barras verticais
+        const uL0 = u0 + 3.6, uL1 = u0 + 4.9, vE0 = Dp - 1.25, vE1 = Dp - 0.05;
+        add(geo.cubo, cinzaEsc, [(uL0 + uL1) / 2, hp / 2, (vE0 + vE1) / 2], [uL1 - uL0, hp, vE1 - vE0]);
+        barra([uL0, hp + 1.0, vE0 - 0.03], [uL1, hp + 1.0, vE0 - 0.03], 0.025, corrimao);
+        barra([uL0, hp + 0.1, vE0 - 0.03], [uL1, hp + 0.1, vE0 - 0.03], 0.02, corrimao);
+        for (let u = uL0 + 0.1; u <= uL1; u += 0.12) barra([u, hp + 0.1, vE0 - 0.03], [u, hp + 1.0, vE0 - 0.03], 0.008, corrimao);
+        // escada: degraus maciços até o chão, subindo em direção ao patamar
+        const n = 17, run = 4.0, rise = hp / n, piso = run / n, uB = uL1 + run;
+        for (let k = 0; k < n; k++) {
+          const top = (k + 1) * rise, uc = uB - (k + 0.5) * piso;
+          add(geo.cubo, cinzaEsc, [uc, top / 2, (vE0 + vE1) / 2], [piso + 0.005, top, vE1 - vE0]);
+          add(geo.cubo, branco, [uB - (k + 1) * piso + 0.02, top - 0.01, vE0 + 0.05], [0.04, 0.012, 0.06]);   // faixinha branca de sinalização no degrau
+        }
+        // lateral fechada inclinada e corrimão de tubo por cima (lado aberto da escada)
+        const lat = new THREE.Shape(); lat.moveTo(0, 0); lat.lineTo(run, 0); lat.lineTo(run, hp + 0.12); lat.lineTo(0, rise + 0.12); lat.lineTo(0, 0);
+        const latG = descartar(new THREE.ExtrudeGeometry(lat, { depth: 0.1, bevelEnabled: false }));
+        const latM = new THREE.Mesh(latG, cinzaEsc); latM.rotation.y = Math.PI; latM.position.set(uB, 0, vE0 + 0.1); latM.castShadow = true; latM.receiveShadow = true; gp.add(latM);
+        barra([uB + 0.05, rise + 0.95, vE0 - 0.06], [uL1, hp + 0.95, vE0 - 0.06], 0.025, corrimao);
+        barra([uB + 0.05, 0.12, vE0 - 0.06], [uB + 0.05, rise + 0.95, vE0 - 0.06], 0.022, corrimao);
+        [0.33, 0.66].forEach(f => { const uu = uB - run * f, yy = rise + (hp - rise) * f; barra([uu, yy + 0.12, vE0 - 0.06], [uu, yy + 0.95, vE0 - 0.06], 0.018, corrimao); });
+        solido(u0, bv0, u0 + 3.6, Dp); solido(uL0, vE0 - 0.15, uB + 0.1, Dp);
+      }, "parede");
+
+      // 2) bancadas de embalagem: 4 bancadas em 2 pares — em cada par, uma de frente para a outra (como na foto)
+      colocar(13.4, (u0) => {
+        const Lb = 6.0;
+        [0, 1].forEach(par => {
+          const ub = u0 + 0.3 + Lb / 2 + par * (Lb + 1.2);
+          [-1, 1].forEach(sv => {
+            const vc = vb + sv * 0.42;   // as duas bancadas do par ficam costas com costas; as pessoas sentam de frente uma para a outra
+            add(geo.cubo, madeiraClara, [ub, 0.92, vc], [Lb, 0.035, 0.78]);                        // tampo
+            add(geo.cubo, laranjaPrat, [ub, 0.35, vc], [Lb, 0.03, 0.72]);                         // prateleira de baixo
+            add(geo.cubo, laranjaPrat, [ub, 1.58, vc - sv * 0.18], [Lb, 0.03, 0.36]);             // prateleira de cima
+            [-0.36, 0.36].forEach(dv => { add(geo.cubo, mat.longarina, [ub, 0.88, vc + dv], [Lb, 0.07, 0.04]); add(geo.cubo, mat.longarina, [ub, 0.33, vc + dv], [Lb, 0.06, 0.04]); });
+            for (let k = 0; k <= 3; k++) [-0.36, 0.36].forEach(dv => add(geo.cubo, azul, [ub - Lb / 2 + k * Lb / 3, dv * sv < 0 ? 0.95 : 0.47, vc + dv], [0.06, dv * sv < 0 ? 1.9 : 0.94, 0.06]));
+            for (let k = 0; k < 3; k++) {
+              const um = ub - Lb / 2 + Lb * (k + 0.5) / 3;
+              add(geo.cubo, preto, [um, 1.2, vc - sv * 0.16], [0.56, 0.35, 0.03]);
+              const tl = add(geo.plano, telaMat, [um, 1.2, vc - sv * 0.16 + sv * 0.017], [0.52, 0.31, 1], [0, sv > 0 ? 0 : Math.PI, 0]); tl.castShadow = false;
+              add(geo.cubo, preto, [um, 0.99, vc - sv * 0.16], [0.06, 0.12, 0.06]);
+              add(geo.cubo, preto, [um, 0.945, vc + sv * 0.1], [0.44, 0.02, 0.15]);
+              const banq = new THREE.Group(); banq.position.set(um, 0, vc + sv * 0.85); gp.add(banq);
+              const bq = (g, m, pos, sc) => { const x = new THREE.Mesh(g, m); x.position.set(...pos); x.scale.set(...sc); x.castShadow = true; banq.add(x); };
+              bq(geo.cil, preto, [0, 0.7, 0], [0.19, 0.07, 0.19]); bq(geo.cil, preto, [0, 0.39, 0], [0.025, 0.62, 0.025]);
+              const anelP = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.012, 6, 24), preto); anelP.rotation.x = Math.PI / 2; anelP.position.y = 0.32; banq.add(anelP);
+              [0, Math.PI / 2].forEach(r => { const pe = new THREE.Mesh(geo.cubo, preto); pe.scale.set(0.5, 0.03, 0.04); pe.rotation.y = r; pe.position.y = 0.04; banq.add(pe); });
+            }
+            add(geo.cubo, branco, [ub + Lb / 2 - 0.3, 1.05, vc], [0.26, 0.22, 0.3]);             // impressora de etiquetas
+            add(geo.cubo, mat.caixa, [ub - 1.5, 0.48, vc], [0.7, 0.24, 0.5]);                   // caixas de embalagem vazias na prateleira de baixo
+          });
+          // climatizador ao lado de cada par
+          const uc = ub + Lb / 2 + 0.45;
+          add(geo.cubo, branco, [uc, 0.6, vb - 0.6], [0.45, 1.2, 0.4]);
+          add(geo.cubo, cinzaEst, [uc, 0.75, vb - 0.81], [0.36, 0.5, 0.01]);
+        });
+        solido(u0 + 0.2, vb - 1.2, u0 + 13.4, vb + 1.2);
+      });
+
+      // 3) mesa de embalagem (como na foto): tampo de compensado com borda vermelha, estrutura de metalon preto com prateleira,
+      //    suporte branco com 2 bobinas de filme stretch preto, fita adesiva, papéis e caixinha de embalagem
+      colocar(3.2, (u0) => {
+        const um = u0 + 1.4, vm = vb + 2.6, Lm = 2.6, Pm = 1.6, hm = 0.9;
+        add(geo.cubo, compensado, [um, hm, vm], [Lm, 0.03, Pm]);
+        [-1, 1].forEach(sv => add(geo.cubo, bordaVerm, [um, hm, vm + sv * (Pm / 2)], [Lm, 0.032, 0.012]));
+        [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([a, b]) => add(geo.cubo, preto, [um + a * (Lm / 2 - 0.2), hm / 2, vm + b * (Pm / 2 - 0.2)], [0.05, hm, 0.05]));
+        [0.15, hm - 0.05].forEach(y => { [-1, 1].forEach(b => add(geo.cubo, preto, [um, y, vm + b * (Pm / 2 - 0.2)], [Lm - 0.4, 0.04, 0.04])); [-1, 1].forEach(a => add(geo.cubo, preto, [um + a * (Lm / 2 - 0.2), y, vm], [0.04, 0.04, Pm - 0.4])); });
+        [-0.3, 0.1].forEach(dv => add(geo.cil, filmePreto, [um + 0.4, 0.27, vm + dv], [0.09, 0.45, 0.09], [Math.PI / 2, 0, 0]));   // bobinas guardadas embaixo
+        // suporte de filme stretch (armação branca) com 2 bobinas pretas
+        const ux = um - 0.75, vx = vm - 0.35;
+        [[-0.32, 0], [0.32, 0]].forEach(([du]) => add(geo.cubo, branco, [ux + du, hm + 0.1, vx], [0.03, 0.18, 0.5]));
+        add(geo.cubo, branco, [ux, hm + 0.025, vx], [0.7, 0.02, 0.52]);
+        [-0.12, 0.13].forEach(dv => add(geo.cil, filmePreto, [ux, hm + 0.15 + (dv > 0 ? 0.03 : 0), vx + dv], [0.075, 0.6, 0.075], [0, 0, Math.PI / 2]));
+        const rolo = new THREE.Mesh(new THREE.TorusGeometry(0.06, 0.03, 8, 20), fita); rolo.rotation.x = Math.PI / 2; rolo.position.set(um + 0.75, hm + 0.04, vm + 0.3); gp.add(rolo);
+        add(geo.cubo, azulFita, [um + 0.55, hm + 0.03, vm - 0.45], [0.18, 0.04, 0.06]);
+        add(geo.plano, branco, [um + 0.45, hm + 0.017, vm + 0.15], [0.42, 0.3, 1], [-Math.PI / 2, 0, 0.2]);
+        add(geo.plano, branco, [um + 0.5, hm + 0.019, vm + 0.22], [0.42, 0.3, 1], [-Math.PI / 2, 0, -0.1]);
+        add(geo.cubo, mat.caixa, [um + 0.05, hm + 0.08, vm - 0.2], [0.3, 0.13, 0.22]);
+        solido(um - Lm / 2 - 0.1, vm - Pm / 2 - 0.1, um + Lm / 2 + 0.1, vm + Pm / 2 + 0.1);
+      });
+
+      // 4) estante leve de aço encostada na parede (com material de embalagem)
+      colocar(4.0, (u0) => {
+        const v0 = Dp - 0.75, v1 = Dp - 0.15, vm = (v0 + v1) / 2;
+        for (let k = 0; k <= 2; k++) [v0, v1].forEach(v => add(geo.cubo, cinzaEst, [u0 + 0.1 + k * 1.85, 1.0, v], [0.05, 2.0, 0.05]));
+        [0.12, 0.75, 1.38, 1.98].forEach(y => add(geo.cubo, cinzaEst, [u0 + 1.95, y, vm], [3.75, 0.03, v1 - v0]));
+        add(geo.cubo, mat.caixa, [u0 + 2.9, 0.12 + 0.18, vm], [1.5, 0.32, 0.5]);
+        add(geo.cubo, mat.caixa, [u0 + 1.0, 0.75 + 0.1, vm], [1.4, 0.16, 0.5]);
+        solido(u0, v0 - 0.1, u0 + 3.9, Dp);
+      }, "parede");
+
+      // ventiladores de parede
+      for (let u = 4; u < Up - 2; u += 9) {
+        if (faixaDoca && u > faixaDoca[0] - 1 && u < faixaDoca[1] + 1) continue;
+        const vf = new THREE.Group(); vf.position.set(u, 3.4, Dp - 0.35); vf.rotation.x = 0.35; gp.add(vf);
+        const aro = new THREE.Mesh(new THREE.TorusGeometry(0.33, 0.015, 6, 28), preto); vf.add(aro);
+        const motor = new THREE.Mesh(geo.cil, preto); motor.scale.set(0.09, 0.18, 0.09); motor.rotation.x = Math.PI / 2; motor.position.z = 0.1; vf.add(motor);
+        for (let k = 0; k < 3; k++) { const pa = new THREE.Mesh(geo.cubo, preto); pa.scale.set(0.28, 0.1, 0.01); pa.rotation.z = k * 2.094; pa.position.set(Math.cos(k * 2.094) * 0.14, Math.sin(k * 2.094) * 0.14, -0.02); vf.add(pa); }
+        const sup = new THREE.Mesh(geo.cubo, preto); sup.scale.set(0.05, 0.05, 0.35); sup.position.z = 0.25; vf.add(sup);
+      }
+      // luminárias também sobre a área de preparação
+      for (let u = 3; u < Up - 1; u += 6) [Dp * 0.3, Dp * 0.72].forEach(v => {
+        const w = P.mundo(u, v);
+        por("cabo", geo.cil, mat.luminaria, [w.x, H - 0.4, w.z], [0.01, 0.9, 0.01], null, null, null, telhado);
+        por("lumi", geo.cil, mat.luminaria, [w.x, H - 0.95, w.z], [0.42, 0.22, 0.42], null, null, null, telhado);
+        por("led", geo.disco, mat.led, [w.x, H - 1.07, w.z], [0.36, 0.36, 1], [Math.PI / 2, 0, 0], null, null, telhado);
+      });
+    }
+    st.current.solidosExtras = solidosExtras;
+    // vagas de estacionamento das paleteiras (perto do portão, uma atrás da outra)
+    { const ent = new THREE.Vector3(Math.sin(dk.rot), 0, Math.cos(dk.rot)), lado = new THREE.Vector3(Math.cos(dk.rot), 0, -Math.sin(dk.rot));
+      st.current.vagasParada = [0, 1, 2, 3].map(k => ({ x: dk.dentro.x + lado.x * (dw / 2 + 0.6) + ent.x * k * 2.3, z: dk.dentro.z + lado.z * (dw / 2 + 0.6) + ent.z * k * 2.3, ang: dk.rot + Math.PI })); }
 
     // ---- ruas: faixas amarelas de circulação, número do corredor pintado no piso e placas nas pontas ----
     L.corredores.forEach(f => {
@@ -1366,8 +1973,9 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       [[xa, -1], [xb, 1]].forEach(([x, s]) => {
         por("protetor", geo.cubo, mat.amarelo, [x + s * 0.14, 0.4, z], [0.08, 0.8, D + 0.25]);
         [-1, 1].forEach(sz => por("protetor", geo.cubo, mat.amarelo, [x + s * 0.07, 0.4, z + sz * (D / 2 + 0.1)], [0.2, 0.8, 0.07]));
-        const pl = placa("CORREDOR " + pad2(f), { fundo: "#1c2129", cor: "#ffffff", altura: 0.2, borda: "#e8892f", fonte: "700" });
-        pl.position.set(x + s * 0.06, Math.min(2.4, hMax - 0.2), z); pl.rotation.y = s * Math.PI / 2; conteudo.add(pl); placasCorr.push(pl);
+        const pl = new THREE.Mesh(geo.plano, placaCorredor(pad2(f))); pl.scale.set(0.95, 0.74, 1);
+        pl.position.set(x + s * 0.07, hMax + 0.5, z); pl.rotation.y = s * Math.PI / 2; conteudo.add(pl); placasCorr.push(pl);
+        por("travessa", geo.cubo, mat.montante, [x + s * 0.03, hMax + 0.18, z], [0.05, 0.36, 0.05]);
         const hitP = new THREE.Mesh(geo.cubo, mat.hit); hitP.scale.set(0.3, 1.2, D); hitP.position.set(x + s * 0.1, 2, z); hitP.userData = { corredor: Number(f) }; conteudo.add(hitP); hits.push(hitP);
       });
     });
@@ -1418,10 +2026,10 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       lt.ms.forEach((mm, i) => im.setMatrixAt(i, mm));
       if (lt.cores.some(Boolean) || lt.pps.some(x => x !== null)) { lt.cores.forEach((cc, i) => im.setColorAt(i, cc || branco)); im.instanceColor.needsUpdate = true; }
       im.castShadow = !lt.m.userData.semSombra; im.receiveShadow = !lt.m.userData.semSombra;
-      im.userData = { cores: lt.cores, pps: lt.pps };
+      im.userData = { cores: lt.cores, pps: lt.pps, mats: lt.pps.some(x => x !== null) ? lt.ms : null };
       lt.grupo.add(im); instancias.push(im); descartar(im);
     });
-    st.current.hits = hits; st.current.instancias = instancias; st.current.placasPos = placasPos; st.current.placasCorr = placasCorr;
+    st.current.hits = hits; st.current.instancias = instancias; st.current.foraAnterior = new Set(); st.current.placasPos = placasPos; st.current.placasCorr = placasCorr;
 
     const sc = sol.shadow.camera; const raio = Math.max(p.W, p.P) * 0.62;
     sol.position.set(p.cx - 10, H + 22, p.cz + 16); sol.target.position.set(p.cx, 0, p.cz);
@@ -1470,7 +2078,8 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     else st.current.focoAlvo = 0;
 
     // rotas pelo piso: saem da DOCA 1, usam só ruas e corredores (nunca atravessam estrutura ou parede)
-    st.current.pistas = []; st.current.tracosLista = [];
+    st.current.tracosLista = [];
+    // (as paleteiras automáticas agora são comandadas em tempo real pelos bipes — ver o laço de animação)
     const dentroDeFileira = (z) => L.corredores.some(f => { const zr = L.corredorZ(f) - L.A / 2 - L.D / 2; return Math.abs(z - zr) < L.D / 2 + 0.3; });
     rotas.forEach((r, ri) => {
       if (!r.paradas.length) return;
@@ -1487,6 +2096,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           ir(e, p.z); ir(e, za);
         }
         ir(s.c.x, za);
+        // parada: onde ela vira e pega o palete (frente para a estrutura, garfo na altura do nível)
         const corP = s.falta ? "#e5484d" : s.ok ? "#3fbf7f" : r.cor;
         const num = etiqueta(s.ok ? "✓" : String(i + 1), { fundo: corP, cor: "#06131a", tam: i === r.proxima ? 0.5 : 0.38 }); num.position.set(s.c.x + off * 0.5, 0.55 + ri * 0.12, za - 0.15); rotaGrupo.add(num);
         const marco = new THREE.Mesh(new THREE.RingGeometry(0.2, 0.28, 32), new THREE.MeshBasicMaterial({ color: corP, side: THREE.DoubleSide, toneMapped: false, transparent: true, opacity: 0.9 }));
@@ -1513,7 +2123,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         const luz = new THREE.Mesh(new THREE.TubeGeometry(suave, seg, 0.075, 6, false), new THREE.MeshBasicMaterial({ map: tr, color: "#ffffff", transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, opacity: 0.8 }));
         luz.scale.y = 0.25; rotaGrupo.add(luz); st.current.tracosLista.push(tr);
         const acum = [0]; for (let i = 1; i < pts.length; i++) acum.push(acum[i - 1] + pts[i].distanceTo(pts[i - 1]));
-        st.current.pistas.push({ pts, acum, total: acum[acum.length - 1] });
+
       }
     });
     // contagens acontecendo agora: crachá roxo com as iniciais de quem está contando
@@ -1545,7 +2155,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         voar(centro, r, ids.length === 1 ? 1.2 : 0.95, 1300, ids.length === 1 ? 0.25 : 0.5);
       }
     }
-  }, [pronto, versao, destaques, rotas, achados, verDiverg, layout, selPP, selCorredor, pedidoId, busca, principal, cfg, aoVivo, temDestaqueModo, ultimaContagem]);
+  }, [pronto, versao, destaques, rotas, rotasAuto, achados, verDiverg, layout, selPP, selCorredor, pedidoId, busca, principal, cfg, aoVivo, temDestaqueModo, ultimaContagem]);
 
   // ---------- vistas de câmera ----------
   function irVista(v) {
@@ -1557,7 +2167,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     if (v === "superior") s.voar(new V(pr.cx, 0, pr.cz), r * 1.05, 0.04, 1200, 0);
     else if (v === "frontal") s.voar(new V(pr.cx, 2.5, pr.cz), r * 0.9, 1.32, 1200, 0);
     else if (v === "iso") s.voar(new V(pr.cx, 0, pr.cz), r * 1.05, 0.955, 1200, Math.PI / 4);
-    else { setBusca(""); setPedidoId(""); setVerDiverg(false); setSelPP(null); setSelCorredor(null); setSelDoca(false); s.ultimaChave = "x"; s.voar(new V(pr.cx, 1, pr.cz), r, 0.98, 1200, 0.6); s.ultimaChave = "geral"; }
+    else { setBusca(""); setPedidoId(""); setVerDiverg(false); setSelPP(null); setSelCorredor(null); setSelDoca(false); setSelPrep(false); s.ultimaChave = "x"; s.voar(new V(pr.cx, 1, pr.cz), r, 0.98, 1200, 0.6); s.ultimaChave = "geral"; }
   }
   const segurar = (k, v) => { if (st.current.fp) st.current.fp.botoes[k] = v; };
 
@@ -1580,11 +2190,11 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   const btn = (ativo, cor = C.ciano) => ({ padding: estreito ? "7px 10px" : "8px 13px", borderRadius: 8, border: "1px solid " + (ativo ? cor : C.borda), background: ativo ? cor + "1f" : C.painel, color: ativo ? cor : "#c4ccd8", cursor: "pointer", fontWeight: 600, fontSize: 13, whiteSpace: "nowrap" });
   const linha = (a, b, cor) => <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "4px 0", borderTop: "1px solid #1f2733" }}><span style={{ color: C.sec }}>{a}</span><b style={{ color: cor || C.texto, textAlign: "right" }}>{b}</b></div>;
   const titulo = (t, cor) => <div style={{ fontSize: 11, letterSpacing: 0.8, fontWeight: 700, color: cor || C.ciano, marginBottom: 8, textTransform: "uppercase" }}>{t}</div>;
-  const painelAberto = rota || achados || ppSel || verDiverg || infoCorredor || selDoca || verAoVivo;
+  const painelAberto = rota || achados || ppSel || verDiverg || infoCorredor || selDoca || verAoVivo || selPrep;
   // ao tocar numa porta-palete, corredor ou doca nova, o painel volta a abrir sozinho
-  useEffect(() => { if (selPP || selCorredor !== null || selDoca) setPainelRecolhido(false); }, [selPP, selCorredor, selDoca]);
+  useEffect(() => { if (selPP || selCorredor !== null || selDoca || selPrep) setPainelRecolhido(false); }, [selPP, selCorredor, selDoca, selPrep]);
   const tituloPainel = ppSel ? enderecoPP(ppSel) : rota ? "Rota · " + rotas.map(r => r.ped.numeroPedido).join(", ") : achados ? "Busca · " + achados.linhas.length
-    : infoCorredor ? "Corredor " + pad2(infoCorredor.f) : selDoca ? "Doca 1" : verAoVivo ? "Ao vivo" : verDiverg ? "Divergências" : "Detalhes";
+    : infoCorredor ? "Corredor " + pad2(infoCorredor.f) : selPrep ? "Área de preparação" : selDoca ? "Doca 1" : verAoVivo ? "Ao vivo" : verDiverg ? "Divergências" : "Detalhes";
   const campo = (k, rotulo, passo = 0.1) => (
     <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>{rotulo}
       <input style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} type="number" step={passo} value={st.current.cfgRasc ? st.current.cfgRasc[k] : cfg[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.value }; setVersao(v => v + 1); }} />
@@ -1633,7 +2243,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         <button onClick={() => { setVerDiverg(v => !v); setBusca(""); setPedidoId(""); setSelCorredor(null); }} style={btn(verDiverg, C.vermelho)}>Divergências ({Object.keys(diverg).length})</button>
         <button onClick={() => setVerAoVivo(v => !v)} style={btn(verAoVivo, "#a78bfa")}>
           <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: 4, background: aoVivo.contando.length + aoVivo.separando.length ? "#a78bfa" : C.sec, marginRight: 6, verticalAlign: "middle" }} />
-          Ao vivo: {aoVivo.contando.length} contando · {aoVivo.separando.length} separando</button>
+          Ao vivo: {aoVivo.contando.length} contando · {aoVivo.separando.length + aoVivo.separandoPP.length} separando</button>
         <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
           {[["geral", "Visão geral"], ["superior", "Superior"], ["frontal", "Frontal"], ["iso", "Isométrica"], ["pessoa", "1ª pessoa"]].map(([k, t]) => (
             <button key={k} onClick={() => irVista(k)} style={btn(vista === k && (k !== "pessoa" || pessoa))}>{t}</button>
@@ -1693,7 +2303,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
             background: "rgba(18,23,31,0.96)", border: "1px solid " + C.borda, borderRadius: 12, boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 14, fontSize: 13, color: C.texto }}>
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 2, marginTop: -6, marginRight: -6 }}>
               <button onClick={() => setPainelRecolhido(true)} title="Recolher para o lado" aria-label="Recolher painel" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18, padding: "0 6px" }}>{estreito ? "▾" : "»"}</button>
-              <button onClick={() => { setSelPP(null); setSelCorredor(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); setVerAoVivo(false); }} title="Fechar" aria-label="Fechar painel" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18 }}>×</button>
+              <button onClick={() => { setSelPP(null); setSelCorredor(null); setSelDoca(false); setSelPrep(false); setBusca(""); setPedidoId(""); setVerDiverg(false); setVerAoVivo(false); }} title="Fechar" aria-label="Fechar painel" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18 }}>×</button>
             </div>
 
             {verAoVivo && (<div style={{ marginBottom: 12 }}>
@@ -1708,8 +2318,8 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
                     <div style={{ fontSize: 12, color: C.sec }}>{pz.itens || 0} produto(s) · {pz.pecas || 0} peça(s) bipadas{pz.desde ? " · desde " + new Date(pz.desde).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : ""}</div>
                   </div>
                 </div>); })}
-              <div style={{ fontSize: 12, color: C.sec, margin: "10px 0 6px" }}>Separações em andamento ({aoVivo.separando.length})</div>
-              {!aoVivo.separando.length && <div style={{ color: C.sec, fontSize: 12.5 }}>Ninguém separando neste momento.</div>}
+              <div style={{ fontSize: 12, color: C.sec, margin: "10px 0 6px" }}>Separações em andamento ({aoVivo.separando.length + aoVivo.separandoPP.length})</div>
+              {!aoVivo.separando.length && !aoVivo.separandoPP.length && <div style={{ color: C.sec, fontSize: 12.5 }}>Ninguém separando neste momento.</div>}
               {aoVivo.separando.map((pz, i) => { const ped = pedidos.find(p => String(p.id) === String(pz.pedidoId)); const its = ped ? (itensPorPedido[ped.id] || []) : [];
                 const tot = its.reduce((s2, x) => s2 + x.quantidade, 0), bip = its.reduce((s2, x) => s2 + Math.min(x.quantidade, x.quantidadeBipada), 0); return (
                 <div key={"s" + i} onClick={() => ped && setPedidoIds(ids => ids.includes(String(ped.id)) ? ids : [...ids, String(ped.id)])} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderTop: "1px solid #1f2733", cursor: "pointer" }}>
@@ -1718,6 +2328,14 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
                     <div><b>{nomeCurto(pz.usuario)}</b> separando <b style={{ color: C.ciano }}>{ped ? ped.numeroPedido : pz.numeroPedido}</b></div>
                     <div style={{ height: 4, background: "#222b38", borderRadius: 2, marginTop: 4 }}><div style={{ width: (tot ? bip / tot * 100 : 0) + "%", height: 4, background: C.verde, borderRadius: 2 }} /></div>
                     <div style={{ fontSize: 11.5, color: C.sec, marginTop: 2 }}>{bip} de {tot} peças · toque para ver a rota</div>
+                  </div>
+                </div>); })}
+              {aoVivo.separandoPP.map((pz, i) => { const pp = portaPaletes.find(x => String(x.id) === String(pz.ppId)); return (
+                <div key={"v" + i} onClick={() => pp && setSelPP(pp.id)} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderTop: "1px solid #1f2733", cursor: pp ? "pointer" : "default" }}>
+                  <span style={{ flex: "0 0 28px", height: 28, borderRadius: 14, background: C.ciano, color: "#06131a", fontWeight: 800, fontSize: 11.5, display: "grid", placeItems: "center" }}>{iniciais(pz.usuario)}</span>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div><b>{nomeCurto(pz.usuario)}</b> separando por porta-palete{pp ? <> em <b style={{ color: C.ciano }}>{pp.codigo}</b></> : ""}</div>
+                    <div style={{ fontSize: 11.5, color: C.sec, marginTop: 2 }}>{pz.itens || 0} produto(s) na lista</div>
                   </div>
                 </div>); })}
             </div>)}
@@ -1780,8 +2398,31 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
               {infoCorredor.produtos.slice(0, 20).map((x, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}><span style={{ color: "#c4ccd8" }}>{x.nome}</span><b>{x.qtd}</b></div>)}
             </div>)}
 
+            {selPrep && !ppSel && (() => {
+              const hoje = new Date().toDateString();
+              const saidasSep = movimentacoes.filter(m => m.tipo !== "Entrada" && m.data && new Date(m.data).toDateString() === hoje && /separa/i.test(m.destino || ""));
+              const finalizadosHoje = pedidos.filter(p => p.status === "Finalizado" && p.finishedAt && new Date(p.finishedAt).toDateString() === hoje);
+              return (<div style={{ marginBottom: 12 }}>
+                {titulo("Área de preparação", C.laranja)}
+                {linha("Separando agora", aoVivo.separando.length + " pessoa(s)", aoVivo.separando.length ? C.ciano : C.sec)}
+                {linha("Pedidos em aberto", pedidosAbertos.length)}
+                {linha("Pedidos finalizados hoje", finalizadosHoje.length, C.verde)}
+                {linha("Peças separadas hoje", saidasSep.reduce((s2, m) => s2 + m.quantidade, 0) + " un.")}
+                {aoVivo.separando.length > 0 && <div style={{ fontSize: 12, color: C.sec, margin: "10px 0 4px" }}>Quem está separando</div>}
+                {aoVivo.separando.map((pz, i) => { const ped = pedidos.find(p => String(p.id) === String(pz.pedidoId)); return (
+                  <div key={i} style={{ fontSize: 12.5, padding: "3px 0" }}><b>{nomeCurto(pz.usuario)}</b> · {ped ? ped.numeroPedido : pz.numeroPedido}</div>); })}
+                {pedidosAbertos.length > 0 && <div style={{ fontSize: 12, color: C.sec, margin: "10px 0 4px" }}>Pedidos em aberto</div>}
+                {pedidosAbertos.slice(0, 8).map(p => { const its = itensPorPedido[p.id] || []; const tot = its.reduce((a, x) => a + x.quantidade, 0), bip = its.reduce((a, x) => a + Math.min(x.quantidade, x.quantidadeBipada), 0); return (
+                  <div key={p.id} onClick={() => setPedidoIds(ids => ids.includes(String(p.id)) ? ids : [...ids, String(p.id)])} style={{ padding: "5px 0", borderTop: "1px solid #1f2733", cursor: "pointer" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5 }}><b>{p.numeroPedido}</b><span style={{ color: C.sec }}>{bip}/{tot} peças</span></div>
+                    <div style={{ height: 3, background: "#222b38", borderRadius: 2, marginTop: 3 }}><div style={{ width: (tot ? bip / tot * 100 : 0) + "%", height: 3, background: C.verde, borderRadius: 2 }} /></div>
+                  </div>); })}
+                {emSeparacaoAgora.length > 0 && <button onClick={() => setPedidoIds(emSeparacaoAgora.slice(0, 6))} style={{ ...btn(false, C.ciano), marginTop: 10, width: "100%" }}>Ver rotas dos pedidos em separação</button>}
+              </div>);
+            })()}
+
             {selDoca && !ppSel && (<div style={{ marginBottom: 12 }}>
-              {titulo("Doca 1", "#f2c200")}
+              {titulo("Doca 1 · Descarga", "#f2c200")}
               {linha("Entradas hoje", infoDoca.entradas.length + " · " + infoDoca.entradas.reduce((s, m) => s + m.quantidade, 0) + " un.", C.verde)}
               {linha("Saídas hoje", infoDoca.saidas.length + " · " + infoDoca.saidas.reduce((s, m) => s + m.quantidade, 0) + " un.", C.laranja)}
               <div style={{ fontSize: 12, color: C.sec, margin: "8px 0 4px" }}>Últimas movimentações</div>
@@ -1818,15 +2459,20 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
             <div style={{ display: "grid", gridTemplateColumns: estreito ? "1fr 1fr" : "1fr 1fr 1fr", gap: 10 }}>
               {campo("larguraBaia", "Largura do vão (m)")}{campo("profundidade", "Profundidade da estrutura (m)")}{campo("alturaNivel", "Altura entre níveis (m)")}
               {campo("larguraCorredor", "Largura do corredor (m)")}{campo("peDireito", "Pé-direito (m)", 0.5)}{campo("margem", "Espaço livre nas laterais (m)", 0.5)}
-              {campo("docaLargura", "Largura da doca (m)")}
+              {campo("docaLargura", "Largura do portão (m)")}
               <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>Parede da doca
                 <select style={{ width: "100%", minWidth: 0 }} value={(st.current.cfgRasc || cfg).docaParede} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), docaParede: e.target.value }; setVersao(v => v + 1); }}>
                   <option value="fundo">Fundo</option><option value="frente">Frente</option><option value="esquerda">Esquerda</option><option value="direita">Direita</option>
                 </select></label>
-              {campo("docaPosicao", "Posição da doca na parede (0 a 1)", 0.05)}
+              {campo("docaPosicao", "Posição do portão na parede (0 a 1)", 0.05)}
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>Área de preparação
+                <select style={{ width: "100%", minWidth: 0 }} value={(st.current.cfgRasc || cfg).prepLado || "nenhuma"} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), prepLado: e.target.value }; setVersao(v => v + 1); }}>
+                  <option value="esquerda">Esquerda</option><option value="direita">Direita</option><option value="frente">Frente</option><option value="fundo">Fundo</option><option value="nenhuma">Não mostrar</option>
+                </select></label>
+              {campo("prepProfundidade", "Profundidade da área de preparação (m)", 0.5)}
             </div>
             <div style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap", fontSize: 13 }}>
-              {[["inverterLetras", "Inverter sentido das letras"], ["inverterCorredores", "Inverter ordem dos corredores"]].map(([k, t]) => (
+              {[["inverterLetras", "Inverter sentido das letras"], ["inverterCorredores", "Inverter ordem dos corredores"], ["prepMezanino", "Mezanino com escada na área de preparação"]].map(([k, t]) => (
                 <label key={k} style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}><input type="checkbox" checked={!!(st.current.cfgRasc || cfg)[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.checked }; setVersao(v => v + 1); }} />{t}</label>
               ))}
             </div>
@@ -1943,6 +2589,7 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const [itensSeparPP, setItensSeparPP] = useState([]);
   const [sepMsgPP, setSepMsgPP] = useState(null);
   const [finalizandoSeparPP, setFinalizandoSeparPP] = useState(false);
+  const [sepPPConcluida, setSepPPConcluida] = useState(false);   // acabou de finalizar: paleteira devolve e estaciona
   const scanInputPPRef = useRef(null);
 
   // ==== SEPARAÇÃO DE PEDIDOS (módulo novo — isolado do restante do sistema) ====
@@ -2553,6 +3200,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
 
     // 1) Tenta interpretar como código de barras de uma porta-palete
     const pp = portaPaleteByCodigo(val);
+    setSepPPConcluida(false);
     if (pp) {
       const prodsNaPP = produtosDaPortaPalete(pp);
       setScanPortaPaletePP({ id: pp.id, codigo: pp.codigo, local: portaPaleteLabel(pp), produtos: prodsNaPP });
@@ -2636,6 +3284,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   }
 
   function adicionarItemSepPP(p) {
+    setSepPPConcluida(false);
     if (sepQtdModoPP === "bip") {
       adicionarSepPP(p, 1);
       setSepMsgPP({ tipo: "ok", texto: `+1 de ${p.nome}` });
@@ -2673,7 +3322,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       }
       await recarregarTudo();
       setSepMsgPP({ tipo: "ok", texto: `✓ Separação finalizada! Baixa dada em ${itensSeparPP.length} produto(s).` });
-      setItensSeparPP([]);
+      setItensSeparPP([]); setSepPPConcluida(true);
       setScanPortaPaletePP(null);
     } catch (e) {
       setSepMsgPP({ tipo: "erro", texto: "Erro ao finalizar separação: " + e.message });
@@ -3275,7 +3924,10 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
         pecas: Object.values(contItens || {}).reduce((s, q) => s + (Number(q) || 0), 0), desde: contPP.iniciadaEm || null }
     : (tela === "separacao" && pedidoSeparAtivo)
       ? { tipo: "separacao", usuario: usuarioLogado.email, pedidoId: pedidoSeparAtivo.id, numeroPedido: pedidoSeparAtivo.numeroPedido, desde: pedidoSeparAtivo.separacaoIniciadaAt || null }
-      : { tipo: null, usuario: usuarioLogado.email };
+      : (tela === "separacaoPP" && (itensSeparPP.length > 0 || (scanPortaPaletePP && !sepPPConcluida)))
+        ? { tipo: "separacaoPP", usuario: usuarioLogado.email, itens: itensSeparPP.length,
+            ppId: scanPortaPaletePP ? scanPortaPaletePP.id : ((itensSeparPP.filter(i => i.ppId).slice(-1)[0] || {}).ppId || null) }
+        : { tipo: null, usuario: usuarioLogado.email };
   const assinaturaPresenca = JSON.stringify(presencaDadosRef.current);
   function enviarPresenca() {
     const c = presencaCanalRef.current;
