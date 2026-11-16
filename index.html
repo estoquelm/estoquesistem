@@ -192,7 +192,37 @@ function Stat({ label, value, sub, tone = "default" }) {
   );
 }
 
-function Modal({ title, onClose, children, width = 480, zIndex = 1000 }) {
+function Modal({ title, onClose, children, width = 480, zIndex = 1000, lateral = false }) {
+  const [recolhido, setRecolhido] = useState(false);
+  if (lateral) {
+    // painel que entra pela direita; dá para encolher para o lado e continuar vendo a tela por trás
+    if (recolhido) return (
+      <button onClick={() => setRecolhido(false)} title="Mostrar painel" aria-label="Mostrar painel" style={{
+        position: "fixed", right: 0, top: "50%", transform: "translateY(-50%)", zIndex, width: 36, padding: "16px 0",
+        background: "#161D29", border: "1px solid #2A3445", borderRight: "none", borderRadius: "12px 0 0 12px",
+        color: "#F3EFE6", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 10, boxShadow: "-8px 0 30px rgba(0,0,0,0.4)"
+      }}>
+        <span style={{ color: "#D2A256", fontSize: 16 }}>‹</span>
+        <span style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", maxHeight: "60vh", overflow: "hidden", textOverflow: "ellipsis" }}>{title}</span>
+      </button>
+    );
+    return (
+      <div style={{
+        position: "fixed", top: 0, right: 0, bottom: 0, zIndex, width, maxWidth: "100vw",
+        background: "#161D29", borderLeft: "1px solid #2A3445", boxShadow: "-24px 0 60px rgba(0,0,0,0.5)",
+        display: "flex", flexDirection: "column"
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "16px 14px 16px 20px", borderBottom: "1px solid #2A3445" }}>
+          <div style={{ fontWeight: 700, fontSize: 15.5, color: "#F3EFE6", flex: 1, minWidth: 0 }}>{title}</div>
+          <button onClick={() => setRecolhido(true)} title="Recolher para o lado" aria-label="Recolher painel" style={{
+            background: "#1B2433", border: "1px solid #2A3445", borderRadius: 7, color: "#AEB7C7", cursor: "pointer", width: 32, height: 30, fontSize: 15
+          }}>»</button>
+          <button onClick={onClose} title="Fechar" aria-label="Fechar" style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer", padding: 4 }}><Icon name="x" size={18} /></button>
+        </div>
+        <div style={{ padding: 20, overflow: "auto", flex: 1 }}>{children}</div>
+      </div>
+    );
+  }
   return (
     <div style={{
       position: "fixed", inset: 0, background: "rgba(10,14,20,0.65)",
@@ -702,6 +732,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   const [pedidoIds, setPedidoIds] = useState([]);   // vários pedidos ao mesmo tempo, cada um com sua cor
   const setPedidoId = (v) => setPedidoIds(v ? [String(v)] : []);
   const [verAoVivo, setVerAoVivo] = useState(false);
+  const [painelRecolhido, setPainelRecolhido] = useState(false);   // painel de detalhes encolhido para o lado
   const [verDiverg, setVerDiverg] = useState(false);
   const [selPP, setSelPP] = useState(null);
   const [selCorredor, setSelCorredor] = useState(null);
@@ -1550,6 +1581,10 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   const linha = (a, b, cor) => <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "4px 0", borderTop: "1px solid #1f2733" }}><span style={{ color: C.sec }}>{a}</span><b style={{ color: cor || C.texto, textAlign: "right" }}>{b}</b></div>;
   const titulo = (t, cor) => <div style={{ fontSize: 11, letterSpacing: 0.8, fontWeight: 700, color: cor || C.ciano, marginBottom: 8, textTransform: "uppercase" }}>{t}</div>;
   const painelAberto = rota || achados || ppSel || verDiverg || infoCorredor || selDoca || verAoVivo;
+  // ao tocar numa porta-palete, corredor ou doca nova, o painel volta a abrir sozinho
+  useEffect(() => { if (selPP || selCorredor !== null || selDoca) setPainelRecolhido(false); }, [selPP, selCorredor, selDoca]);
+  const tituloPainel = ppSel ? enderecoPP(ppSel) : rota ? "Rota · " + rotas.map(r => r.ped.numeroPedido).join(", ") : achados ? "Busca · " + achados.linhas.length
+    : infoCorredor ? "Corredor " + pad2(infoCorredor.f) : selDoca ? "Doca 1" : verAoVivo ? "Ao vivo" : verDiverg ? "Divergências" : "Detalhes";
   const campo = (k, rotulo, passo = 0.1) => (
     <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>{rotulo}
       <input style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} type="number" step={passo} value={st.current.cfgRasc ? st.current.cfgRasc[k] : cfg[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.value }; setVersao(v => v + 1); }} />
@@ -1643,11 +1678,22 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           </div>
         )}
 
-        {painelAberto && (
+        {painelAberto && painelRecolhido && (
+          <button onClick={() => setPainelRecolhido(false)} title="Mostrar detalhes" aria-label="Mostrar detalhes"
+            style={estreito
+              ? { position: "absolute", left: 6, right: 6, bottom: 6, height: 40, borderRadius: 10, border: "1px solid " + C.borda, background: "rgba(18,23,31,0.96)", color: C.texto, fontSize: 13, fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 14px", cursor: "pointer" }
+              : { position: "absolute", right: 0, top: "50%", transform: "translateY(-50%)", width: 34, padding: "14px 0", borderRadius: "10px 0 0 10px", border: "1px solid " + C.borda, borderRight: "none", background: "rgba(18,23,31,0.96)", color: C.texto, cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 10 }}>
+            {estreito
+              ? <><span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{tituloPainel}</span><span style={{ color: C.ciano }}>▲ abrir</span></>
+              : <><span style={{ color: C.ciano, fontSize: 15 }}>‹</span><span style={{ writingMode: "vertical-rl", transform: "rotate(180deg)", fontSize: 12.5, fontWeight: 600, whiteSpace: "nowrap", maxHeight: 260, overflow: "hidden", textOverflow: "ellipsis" }}>{tituloPainel}</span></>}
+          </button>
+        )}
+        {painelAberto && !painelRecolhido && (
           <div style={{ position: "absolute", right: estreito ? 6 : 12, bottom: estreito ? 6 : 12, top: estreito ? "auto" : 12, width: estreito ? "calc(100% - 12px)" : 340, maxHeight: estreito ? "46%" : "calc(100% - 24px)", overflow: "auto",
             background: "rgba(18,23,31,0.96)", border: "1px solid " + C.borda, borderRadius: 12, boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 14, fontSize: 13, color: C.texto }}>
-            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: -6, marginRight: -6 }}>
-              <button onClick={() => { setSelPP(null); setSelCorredor(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); setVerAoVivo(false); }} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18 }}>×</button>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 2, marginTop: -6, marginRight: -6 }}>
+              <button onClick={() => setPainelRecolhido(true)} title="Recolher para o lado" aria-label="Recolher painel" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18, padding: "0 6px" }}>{estreito ? "▾" : "»"}</button>
+              <button onClick={() => { setSelPP(null); setSelCorredor(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); setVerAoVivo(false); }} title="Fechar" aria-label="Fechar painel" style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18 }}>×</button>
             </div>
 
             {verAoVivo && (<div style={{ marginBottom: 12 }}>
@@ -5639,7 +5685,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
           if (r.ppId !== pp.id && r.qtd > 0) origensTransf.push({ p, ppId: r.ppId, qtd: r.qtd });
         }));
         return (
-          <Modal title={`Produtos em ${pp.codigo} · ${portaPaleteLabel(pp)}`} onClose={() => setModalVerProdutosPP(null)} width={560}>
+          <Modal title={`Produtos em ${pp.codigo} · ${portaPaleteLabel(pp)}`} onClose={() => setModalVerProdutosPP(null)} width={560} lateral>
             {produtosNaPP.length === 0 && (
               <div style={{ color: "#5C6678", fontSize: 13.5, padding: "10px 0 18px" }}>Nenhum produto cadastrado nesta porta-palete ainda.</div>
             )}
