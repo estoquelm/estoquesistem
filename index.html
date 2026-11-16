@@ -1814,6 +1814,16 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
     return (usuarioLogado.permissoes || [])[0] || "dashboard";
   });
   const [menuCel, setMenuCel] = useState(false); // menu lateral como gaveta no celular
+  // Barra lateral recolhível: só ícones (64 px). Lembra a escolha de cada aparelho;
+  // na primeira vez já começa recolhida em telas menores (celular deitado, tablet).
+  const [menuRecolhido, setMenuRecolhido] = useState(() => {
+    try { const v = localStorage.getItem("sc_menu_recolhido"); if (v !== null) return v === "1"; } catch (e) {}
+    return typeof window !== "undefined" && window.innerWidth < 1200;
+  });
+  const [telaCel, setTelaCel] = useState(typeof window !== "undefined" && window.innerWidth <= 760);
+  useEffect(() => { const f = () => setTelaCel(window.innerWidth <= 760); window.addEventListener("resize", f); return () => window.removeEventListener("resize", f); }, []);
+  function alternarMenu() { setMenuRecolhido(v => { const n = !v; try { localStorage.setItem("sc_menu_recolhido", n ? "1" : "0"); } catch (e) {} return n; }); }
+  const recolher = menuRecolhido && !telaCel;   // no celular a gaveta abre sempre completa
   const [empresas, setEmpresas] = useState([]);
   const [fornecedores, setFornecedores] = useState([]);
   const [produtos, setProdutos] = useState([]);
@@ -3611,7 +3621,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         select { width: 100%; background: #1B2433; border: 1px solid #2A3445; border-radius: 8px; padding: 9px 12px; color: #F3EFE6; font-size: 14px; }
         .sc-topo-cel, .sc-fundo-menu { display: none; }
         @media (max-width: 760px) {
-          .sc-sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 900; transform: translateX(-105%); transition: transform .22s ease; box-shadow: 0 0 40px rgba(0,0,0,.55); overflow-y: auto; }
+          .sc-sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 900; width: 260px !important; transform: translateX(-105%); transition: transform .22s ease; box-shadow: 0 0 40px rgba(0,0,0,.55); overflow-y: auto; }
           .sc-sidebar.aberto { transform: none; }
           .sc-main { padding: 66px 12px 16px !important; }
           .sc-topo-cel { display: flex; align-items: center; gap: 12px; position: fixed; top: 0; left: 0; right: 0; height: 54px; padding: 0 12px; z-index: 800; background: #0B0F16; border-bottom: 1px solid #1E2738; }
@@ -3628,52 +3638,64 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
       <div className={"sc-fundo-menu" + (menuCel ? " aberto" : "")} onClick={() => setMenuCel(false)} />
 
       {/* Sidebar */}
-      <div className={"sc-sidebar" + (menuCel ? " aberto" : "")} style={{ width: 230, background: "#0B0F16", borderRight: "1px solid #1E2738", display: "flex", flexDirection: "column", flexShrink: 0 }}>
-        <div style={{ padding: "22px 20px 18px", borderBottom: "1px solid #1E2738" }}>
-          <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 16, color: "#F3EFE6" }}>STOCKCTRL</div>
-          <div style={{ fontSize: 11, color: "#5C6678", marginTop: 2 }}>Notas fiscais · Estoque</div>
+      <div className={"sc-sidebar" + (menuCel ? " aberto" : "")} style={{ width: recolher ? 64 : 230, transition: "width .2s ease", background: "#0B0F16", borderRight: "1px solid #1E2738", display: "flex", flexDirection: "column", flexShrink: 0, overflowY: "auto", overflowX: "hidden" }}>
+        <div style={{ padding: recolher ? "16px 0 12px" : "22px 14px 18px 20px", borderBottom: "1px solid #1E2738", display: "flex", alignItems: "center", justifyContent: recolher ? "center" : "space-between", flexDirection: recolher ? "column" : "row", gap: 8 }}>
+          {recolher
+            ? <div title="StockCtrl" style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 15, color: "#D2A256" }}>SC</div>
+            : <div style={{ minWidth: 0 }}>
+                <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 16, color: "#F3EFE6" }}>STOCKCTRL</div>
+                <div style={{ fontSize: 11, color: "#5C6678", marginTop: 2 }}>Notas fiscais · Estoque</div>
+              </div>}
+          {!telaCel && (
+            <button onClick={alternarMenu} aria-label={recolher ? "Expandir menu" : "Recolher menu"} title={recolher ? "Expandir menu" : "Recolher menu"}
+              style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 7, color: "#AEB7C7", width: 30, height: 28, cursor: "pointer", fontSize: 15, lineHeight: 1, flexShrink: 0 }}>
+              {recolher ? "»" : "«"}
+            </button>
+          )}
         </div>
-        <div style={{ padding: "14px 10px", flex: 1 }}>
+        <div style={{ padding: recolher ? "12px 8px" : "14px 10px", flex: 1 }}>
           {menu.map(m => (
-            <button key={m.id} onClick={() => { setTela(m.id); setMenuCel(false); }} style={{
-              width: "100%", display: "flex", alignItems: "center", gap: 10,
-              padding: "10px 12px", marginBottom: 2, borderRadius: 8, border: "none",
+            <button key={m.id} onClick={() => { setTela(m.id); setMenuCel(false); }} title={recolher ? m.label : undefined} aria-label={m.label} style={{
+              width: "100%", display: "flex", alignItems: "center", gap: 10, justifyContent: recolher ? "center" : "flex-start",
+              padding: recolher ? "11px 0" : "10px 12px", marginBottom: 2, borderRadius: 8, border: "none",
               cursor: "pointer", textAlign: "left", fontSize: 13.5, fontWeight: 600,
               background: tela === m.id ? "#1B2433" : "transparent",
               color: tela === m.id ? "#D2A256" : "#AEB7C7"
             }}>
-              <Icon name={m.icon} size={16} />
-              {m.label}
+              <Icon name={m.icon} size={recolher ? 18 : 16} />
+              {!recolher && m.label}
             </button>
           ))}
           {usuarioLogado.admin && (
-            <button onClick={() => { setTela("usuarios"); setMenuCel(false); }} style={{
-              width: "100%", display: "flex", alignItems: "center", gap: 10,
-              padding: "10px 12px", marginTop: 10, borderRadius: 8, border: "none",
+            <button onClick={() => { setTela("usuarios"); setMenuCel(false); }} title={recolher ? "Usuários e acessos" : undefined} aria-label="Usuários e acessos" style={{
+              width: "100%", display: "flex", alignItems: "center", gap: 10, justifyContent: recolher ? "center" : "flex-start",
+              padding: recolher ? "11px 0" : "10px 12px", marginTop: 10, borderRadius: 8, border: "none",
               cursor: "pointer", textAlign: "left", fontSize: 13.5, fontWeight: 600,
               background: tela === "usuarios" ? "#1B2433" : "transparent",
               color: tela === "usuarios" ? "#D2A256" : "#AEB7C7",
               borderTop: "1px solid #1E2738"
             }}>
-              <Icon name="users" size={16} />
-              Usuários e acessos
+              <Icon name="users" size={recolher ? 18 : 16} />
+              {!recolher && "Usuários e acessos"}
             </button>
           )}
         </div>
-        <div style={{ padding: 16, borderTop: "1px solid #1E2738" }}>
-          <div style={{ fontSize: 11.5, color: "#5C6678", marginBottom: 4 }}>Conectado como</div>
-          <div style={{ fontSize: 12.5, color: "#E8E4D9", fontWeight: 600, marginBottom: 10, wordBreak: "break-all" }}>{usuarioLogado.email}</div>
-          <button onClick={onLogout} style={{
-            display: "flex", alignItems: "center", gap: 8, background: "none", border: "1px solid #2A3445",
+        <div style={{ padding: recolher ? "12px 8px" : 16, borderTop: "1px solid #1E2738" }}>
+          {!recolher && <>
+            <div style={{ fontSize: 11.5, color: "#5C6678", marginBottom: 4 }}>Conectado como</div>
+            <div style={{ fontSize: 12.5, color: "#E8E4D9", fontWeight: 600, marginBottom: 10, wordBreak: "break-all" }}>{usuarioLogado.email}</div>
+          </>}
+          <button onClick={onLogout} title={recolher ? "Sair (" + usuarioLogado.email + ")" : undefined} aria-label="Sair" style={{
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: "none", border: "1px solid #2A3445",
             borderRadius: 8, padding: "7px 10px", color: "#8893A6", fontSize: 12.5, cursor: "pointer", width: "100%"
           }}>
-            <Icon name="log-out" size={14} /> Sair
+            <Icon name="log-out" size={14} />{!recolher && " Sair"}
           </button>
         </div>
       </div>
 
       {/* Main */}
-      <div className="sc-main" style={{ flex: 1, overflow: "auto", padding: "26px 32px" }}>
+      <div className="sc-main" style={{ flex: 1, minWidth: 0, overflow: "auto", padding: recolher ? "22px 22px" : "26px 32px" }}>
 
         {tela === "dashboard" && (
           <>
