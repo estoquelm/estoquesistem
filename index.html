@@ -98,17 +98,11 @@ const TELAS_DISPONIVEIS = [
   { id: "separacao", label: "Separação de Pedidos" },
   { id: "portapaletes", label: "Porta-paletes" },
   { id: "separacaoPP", label: "Separação por Porta-palete" },
+  { id: "contagem", label: "Contagem" },
+  { id: "mapa3d", label: "Mapa 3D" },
 ];
 
-const seedUsuarios = [
-  {
-    id: 1,
-    email: "johnrnjk9@gmail.com",
-    senha: "210627@@",
-    admin: true,
-    permissoes: TELAS_DISPONIVEIS.map(t => t.id),
-  },
-];
+// (removido: login de exemplo com senha escrita no código — os logins ficam só no Supabase Auth)
 
 const STATUS_COLOR = {
   Pendente: { bg: "#3A2A14", text: "#E8B458", border: "#5C4322" },
@@ -138,9 +132,15 @@ function StatusBadge({ status }) {
 
 function daysSince(dateStr) {
   if (!dateStr) return 9999;
-  const d = new Date(dateStr);
-  const today = new Date("2026-06-30");
-  return Math.floor((today - d) / (1000 * 60 * 60 * 24));
+  // Data de hoje (calculada na hora, no fuso do navegador) — compara só o dia, sem horas
+  const s = String(dateStr).slice(0, 10);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const d = m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])) : new Date(dateStr);
+  if (isNaN(d)) return 9999;
+  const agora = new Date();
+  const hoje = new Date(agora.getFullYear(), agora.getMonth(), agora.getDate());
+  d.setHours(0, 0, 0, 0);
+  return Math.max(0, Math.round((hoje - d) / (1000 * 60 * 60 * 24)));
 }
 
 // Bip sonoro usado na tela de separação (leitor de código de barras)
@@ -589,11 +589,1231 @@ function rowToLogSeparacao(r) {
   return { id: r.id, pedidoId: r.pedido_id, numeroPedido: r.numero_pedido, usuario: r.usuario, acao: r.acao, produto: r.produto, quantidade: r.quantidade, data: r.data };
 }
 
+// O Supabase devolve no máximo 1.000 linhas por consulta. Esta função busca em
+// páginas de 1.000 até trazer tudo (estoques grandes não "somem" da tela).
+async function buscarTodos(tabela, colunaOrdem = "id", ascendente = true) {
+  const PAGINA = 1000;
+  let todas = [];
+  for (let de = 0; ; de += PAGINA) {
+    let q = supabaseClient.from(tabela).select("*").order(colunaOrdem, { ascending: ascendente });
+    if (colunaOrdem !== "id") q = q.order("id", { ascending: true }); // ordem estável entre as páginas
+    const { data, error } = await q.range(de, de + PAGINA - 1);
+    if (error) throw error;
+    todas = todas.concat(data || []);
+    if (!data || data.length < PAGINA) break;
+  }
+  return todas;
+}
+
+// { [itemId]: { [ppId | "auto"]: qtd } } a partir das linhas de itens_separacao_alocacao
+function alocacoesParaMapa(linhas) {
+  const m = {};
+  (linhas || []).forEach(a => {
+    if (!m[a.item_id]) m[a.item_id] = {};
+    m[a.item_id][a.porta_palete_id ?? "auto"] = Number(a.qtd) || 0;
+  });
+  return m;
+}
+
+// ==== MAPA 3D DO GALPÃO (gêmeo digital) ====
+// Representação 3D fiel ao estoque: cada porta-palete cadastrada (corredor/fileira → letra/módulo → nível)
+// vira uma posição física; as caixas aparecem só onde há saldo real (tabela estoque_pp).
+// Medidas do galpão ficam em "config_galpao" (configuráveis; padrão = medidas típicas, sinalizadas na tela).
+// Somente leitura: o mapa NÃO altera estoque. Atualiza em tempo real com os dados que o sistema já recebe.
+let __threePromise = null;
+function carregarThree() {
+  if (window.THREE) return Promise.resolve(window.THREE);
+  if (!__threePromise) {
+    __threePromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://unpkg.com/three@0.149.0/build/three.min.js";
+      s.onload = () => window.THREE ? resolve(window.THREE) : reject(new Error("3D indisponível"));
+      s.onerror = () => { __threePromise = null; reject(new Error("Não foi possível carregar o 3D. Verifique a internet e tente de novo.")); };
+      document.head.appendChild(s);
+    });
+  }
+  return __threePromise;
+}
+
+// Medidas padrão (metros). NÃO são as medidas reais do galpão: ajuste em "Configurar galpão".
+const GALPAO_PADRAO = {
+  larguraBaia: 2.7, profundidade: 1.1, alturaNivel: 1.6, larguraCorredor: 3.2, peDireito: 9,
+  margem: 6, docaParede: "fundo", docaPosicao: 0.15, docaLargura: 3.5, inverterLetras: false, inverterCorredores: false,
+};
+const pad2 = (n) => String(n).padStart(2, "0");
+const enderecoPP = (pp) => pp ? `${pad2(pp.fileira)}-${String(pp.porta || "").trim().toUpperCase()}-${pad2(pp.nivel)}` : "";
+
+function mapa3dLayout(portaPaletes, cfg) {
+  const ok = portaPaletes.filter(pp => pp.fileira !== null && pp.fileira !== "" && !isNaN(Number(pp.fileira)) && String(pp.porta || "").trim() !== "");
+  let corredores = [...new Set(ok.map(pp => Number(pp.fileira)))].sort((a, b) => a - b);
+  let letras = [...new Set(ok.map(pp => String(pp.porta).trim().toUpperCase()))].sort((a, b) => a.localeCompare(b, "pt-BR", { numeric: true }));
+  if (cfg.inverterCorredores) corredores = corredores.slice().reverse();
+  if (cfg.inverterLetras) letras = letras.slice().reverse();
+  const BW = cfg.larguraBaia, D = cfg.profundidade, LH = cfg.alturaNivel, A = cfg.larguraCorredor;
+  const zDe = (f) => corredores.indexOf(f) * (D + A);
+  const xDe = (l) => letras.indexOf(l) * BW;
+  const celulas = {}; const baias = {}; const repetidas = {};
+  ok.forEach(pp => {
+    const f = Number(pp.fileira), l = String(pp.porta).trim().toUpperCase(), n = Math.max(1, Number(pp.nivel) || 1);
+    const chave = f + "-" + l + "-" + n;
+    repetidas[chave] = (repetidas[chave] || []).concat(pp.id);
+    const bk = f + "-" + l;
+    baias[bk] = { f, l, x: xDe(l), z: zDe(f), niveis: Math.max(n, baias[bk] ? baias[bk].niveis : 0) };
+    celulas[pp.id] = { pp, f, l, n, chave, x: xDe(l), y: (n - 1) * LH, z: zDe(f) };
+  });
+  // duas porta-paletes cadastradas na mesma posição: divide a baia para as duas aparecerem
+  Object.values(repetidas).forEach(ids => {
+    if (ids.length < 2) return;
+    ids.forEach((id, i) => { celulas[id].x += (i - (ids.length - 1) / 2) * (BW / ids.length); celulas[id].larg = BW / ids.length; });
+  });
+  const semPosicao = portaPaletes.filter(pp => !ok.includes(pp));
+  const duplicadas = Object.entries(repetidas).filter(([, ids]) => ids.length > 1).map(([k]) => k);
+  const xL = -BW / 2 - 1.1, xR = Math.max(0, letras.length - 1) * BW + BW / 2 + 1.1; // eixos das ruas transversais
+  const corredorZ = (f) => zDe(f) + D / 2 + A / 2;
+  const zMax = Math.max(0, corredores.length - 1) * (D + A);
+  const nivelMax = Math.max(1, ...Object.values(baias).map(b => b.niveis));
+  // caixas de colisão das estruturas (para câmera e rota não atravessarem)
+  const solidos = Object.values(baias).map(b => ({ x0: b.x - BW / 2 - 0.08, x1: b.x + BW / 2 + 0.08, z0: b.z - D / 2 - 0.08, z1: b.z + D / 2 + 0.08, h: b.niveis * LH + 0.2 }));
+  const m = cfg.margem;
+  const minX = xL - m, maxX = xR + m, minZ = -D / 2 - m - 1, maxZ = zMax + D / 2 + A + m;
+  return { corredores, letras, celulas, baias, semPosicao, duplicadas, xL, xR, corredorZ, zMax, nivelMax, solidos, BW, D, LH, A,
+    predio: { minX, maxX, minZ, maxZ, W: maxX - minX, P: maxZ - minZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2, H: Math.max(cfg.peDireito, nivelMax * LH + 2.5) } };
+}
+
+// ponto da doca (dentro do galpão) conforme a parede configurada
+function pontoDoca(L, cfg) {
+  const p = L.predio, t = Math.min(0.95, Math.max(0.05, Number(cfg.docaPosicao) || 0.15));
+  if (cfg.docaParede === "frente") return { x: p.minX + p.W * t, z: p.maxZ, dentro: { x: p.minX + p.W * t, z: p.maxZ - 3 }, rot: Math.PI };
+  if (cfg.docaParede === "esquerda") return { x: p.minX, z: p.minZ + p.P * t, dentro: { x: p.minX + 3, z: p.minZ + p.P * t }, rot: Math.PI / 2 };
+  if (cfg.docaParede === "direita") return { x: p.maxX, z: p.minZ + p.P * t, dentro: { x: p.maxX - 3, z: p.minZ + p.P * t }, rot: -Math.PI / 2 };
+  return { x: p.minX + p.W * t, z: p.minZ, dentro: { x: p.minX + p.W * t, z: p.minZ + 3 }, rot: 0 };
+}
+
+const CORES_ROTA = ["#2fc4ee", "#f472b6", "#a3e635", "#fb923c", "#c084fc", "#facc15"];
+const iniciais = (email) => { const n = String(email || "?").split("@")[0].split(/[._-]+/).filter(Boolean); return ((n[0] || "?")[0] + (n[1] ? n[1][0] : (n[0] || "").slice(1, 2))).toUpperCase(); };
+const nomeCurto = (email) => String(email || "—").split("@")[0];
+
+function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, contagens, fornecedorNome, movimentacoes = [], usuarioEmail, presencas = [] }) {
+  const caixaRef = useRef(null);
+  const st = useRef({});
+  const [erro, setErro] = useState("");
+  const [pronto, setPronto] = useState(false);
+  const [busca, setBusca] = useState("");
+  const [pedidoIds, setPedidoIds] = useState([]);   // vários pedidos ao mesmo tempo, cada um com sua cor
+  const setPedidoId = (v) => setPedidoIds(v ? [String(v)] : []);
+  const [verAoVivo, setVerAoVivo] = useState(false);
+  const [verDiverg, setVerDiverg] = useState(false);
+  const [selPP, setSelPP] = useState(null);
+  const [selCorredor, setSelCorredor] = useState(null);
+  const [selDoca, setSelDoca] = useState(false);
+  const [versao, setVersao] = useState(0);
+  const [vista, setVista] = useState("geral");
+  const [pessoa, setPessoa] = useState(false);
+  const [cfg, setCfg] = useState(GALPAO_PADRAO);
+  const [cfgSalva, setCfgSalva] = useState(false);
+  const [cfgAberta, setCfgAberta] = useState(false);
+  const [cfgMsg, setCfgMsg] = useState("");
+  const [itensContagem, setItensContagem] = useState({});
+  const [atualizado, setAtualizado] = useState(new Date());
+  const [estreito, setEstreito] = useState(typeof window !== "undefined" && window.innerWidth < 760);
+  useEffect(() => { const f = () => setEstreito(window.innerWidth < 760); window.addEventListener("resize", f); return () => window.removeEventListener("resize", f); }, []);
+
+  // medidas do galpão (compartilhadas por todos os usuários)
+  useEffect(() => {
+    let vivo = true;
+    supabaseClient.from("config_galpao").select("dados").eq("id", 1).limit(1).then(({ data, error }) => {
+      const linha = !error && data && data[0];
+      if (vivo && linha && linha.dados && Object.keys(linha.dados).length) { setCfg({ ...GALPAO_PADRAO, ...linha.dados }); setCfgSalva(true); }
+    }, () => {});
+    return () => { vivo = false; };
+  }, []);
+  async function salvarCfg(nova) {
+    const limpa = { ...nova };
+    ["larguraBaia", "profundidade", "alturaNivel", "larguraCorredor", "peDireito", "margem", "docaPosicao", "docaLargura"].forEach(k => { limpa[k] = Math.max(0.05, Number(limpa[k]) || GALPAO_PADRAO[k]); });
+    limpa.docaPosicao = Math.min(0.95, limpa.docaPosicao);
+    const { error } = await supabaseClient.from("config_galpao").upsert({ id: 1, dados: limpa, atualizado_em: new Date().toISOString(), atualizado_por: usuarioEmail || null }, { onConflict: "id" });
+    if (error) { setCfgMsg(/row-level|permission|policy/i.test(error.message) ? "Somente administradores podem alterar as medidas do galpão." : "Não foi possível salvar: " + error.message); return; }
+    st.current.jaEnquadrou = false;
+    setCfg(limpa); setCfgSalva(true); setCfgAberta(false); setCfgMsg("");
+  }
+
+  const layout = useMemo(() => mapa3dLayout(portaPaletes, cfg), [portaPaletes, cfg]);
+  const prodPorId = useMemo(() => { const m = {}; produtos.forEach(p => { m[String(p.id)] = p; }); return m; }, [produtos]);
+  const porPP = useMemo(() => {
+    const m = {};
+    estoquePP.forEach(e => { if (e.qtd > 0) (m[e.ppId] = m[e.ppId] || []).push({ produto: prodPorId[String(e.produtoId)], produtoId: e.produtoId, qtd: e.qtd }); });
+    Object.values(m).forEach(l => l.sort((a, b) => b.qtd - a.qtd));
+    return m;
+  }, [estoquePP, prodPorId]);
+  useEffect(() => { setAtualizado(new Date()); }, [estoquePP, portaPaletes, produtos, itensPorPedido, contagens]);
+  const principalDe = (p) => p ? portaPaletes.find(pp => Number(pp.fileira) === Number(p.fileira) &&
+    String(pp.porta || "").toUpperCase() === String(p.porta || "").toUpperCase() && Number(pp.nivel) === Number(p.nivel)) : null;
+  const situacao = (p) => (Number(p.qtd) || 0) <= 0 ? { t: "Zerado", c: "#ff6b74" } : (p.min && Number(p.qtd) < Number(p.min)) ? { t: "Abaixo do mínimo", c: "#f5a524" } : { t: "Normal", c: "#4fd18b" };
+
+  // --- busca de produto ---
+  const achados = useMemo(() => {
+    const termos = busca.toLowerCase().split(/\s+/).filter(Boolean);
+    if (!termos.length || busca.trim().length < 2) return null;
+    const prods = produtos.filter(p => { const t = [p.nome, p.sku, p.codigoBarras].join(" ").toLowerCase(); return termos.every(x => t.includes(x)); }).slice(0, 30);
+    const linhas = prods.map(p => {
+      const locais = estoquePP.filter(e => String(e.produtoId) === String(p.id) && e.qtd > 0).map(e => ({ ppId: e.ppId, qtd: e.qtd }));
+      if (!locais.length) { const pr = principalDe(p); if (pr) locais.push({ ppId: pr.id, qtd: 0 }); }
+      return { p, locais };
+    });
+    return { linhas, pps: new Set(linhas.flatMap(l => l.locais.map(x => x.ppId))) };
+  }, [busca, produtos, estoquePP, portaPaletes]);
+
+  // --- rotas dos pedidos (com progresso: o que já foi bipado aparece como feito) ---
+  const pedidosAbertos = useMemo(() => pedidos.filter(p => p.status !== "Finalizado" && p.status !== "Cancelado"), [pedidos]);
+  const rotas = useMemo(() => pedidoIds.map((pid, idx) => pedidos.find(p => String(p.id) === String(pid))).filter(Boolean).map((ped, idx) => {
+    const cor = CORES_ROTA[idx % CORES_ROTA.length];
+    const itens = itensPorPedido[ped.id] || [];
+    const porProd = {};
+    itens.forEach(it => {
+      const k = String(it.produtoId);
+      porProd[k] = porProd[k] || { total: 0, bip: 0, nome: it.descricao || it.sku };
+      porProd[k].total += it.quantidade; porProd[k].bip += Math.min(it.quantidade, it.quantidadeBipada);
+    });
+    const paradas = {}; const alertas = [];
+    Object.entries(porProd).forEach(([pid, need]) => {
+      const prod = prodPorId[pid];
+      const nome = (prod && prod.nome) || need.nome;
+      const total = prod ? Number(prod.qtd) || 0 : 0;
+      const pr = principalDe(prod);
+      const locais = estoquePP.filter(e => String(e.produtoId) === pid && e.qtd > 0)
+        .sort((a, b) => ((pr && b.ppId === pr.id) - (pr && a.ppId === pr.id)) || (b.qtd - a.qtd));
+      let resta = need.total, jaBip = need.bip;
+      locais.forEach(e => {
+        if (resta <= 0 || !layout.celulas[e.ppId]) return;
+        const pega = Math.min(e.qtd, resta); resta -= pega;
+        const feito = Math.min(pega, jaBip); jaBip -= feito;
+        (paradas[e.ppId] = paradas[e.ppId] || { ppId: e.ppId, itens: [], falta: false }).itens.push({ nome, qtd: pega, feito });
+      });
+      const faltaBipar = need.total - need.bip;
+      if (faltaBipar > 0 && total < faltaBipar) {
+        const onde = (locais[0] && locais[0].ppId) || (pr && pr.id);
+        alertas.push({ tipo: "insuficiente", ppId: onde, texto: `${nome}: faltam ${faltaBipar} para separar e o sistema tem ${total}.` });
+        if (onde && layout.celulas[onde]) (paradas[onde] = paradas[onde] || { ppId: onde, itens: [], falta: false }).falta = true;
+      } else if (resta > 0 && faltaBipar > 0) {
+        alertas.push({ tipo: "semPP", ppId: pr && pr.id, texto: `${nome}: ${resta} un. sem porta-palete definida.` });
+      }
+    });
+    const lista = Object.values(paradas).map(s => ({ ...s, c: layout.celulas[s.ppId], ok: !s.falta && s.itens.length > 0 && s.itens.every(i => i.feito >= i.qtd) })).filter(s => s.c);
+    // ordem otimizada: corredor por corredor (do mais perto da doca), entrando pela ponta mais próxima
+    const doca = pontoDoca(layout, cfg).dentro;
+    const grupos = {}; lista.forEach(s => { (grupos[s.c.f] = grupos[s.c.f] || []).push(s); });
+    const ordemCorr = Object.keys(grupos).map(Number).sort((a, b) => Math.abs(layout.corredorZ(a) - doca.z) - Math.abs(layout.corredorZ(b) - doca.z));
+    let px = doca.x; const ordenada = [];
+    ordemCorr.forEach(f => {
+      const g = grupos[f]; const minx = Math.min(...g.map(s => s.c.x)), maxx = Math.max(...g.map(s => s.c.x));
+      const entraEsq = (Math.abs(px - layout.xL) + Math.abs(layout.xL - minx) + (maxx - minx)) <= (Math.abs(px - layout.xR) + Math.abs(layout.xR - maxx) + (maxx - minx));
+      g.sort((a, b) => (entraEsq ? a.c.x - b.c.x : b.c.x - a.c.x) || a.c.n - b.c.n);
+      ordenada.push(...g); px = g[g.length - 1].c.x;
+    });
+    const tot = Object.values(porProd).reduce((s, x) => s + x.total, 0), bip = Object.values(porProd).reduce((s, x) => s + x.bip, 0);
+    return { ped, cor, idx, paradas: ordenada, alertas, total: tot, bipado: bip, proxima: ordenada.findIndex(s => !s.ok) };
+  }), [pedidoIds, pedidos, itensPorPedido, estoquePP, prodPorId, layout, cfg]);
+  const rota = rotas.length ? rotas[0] : null;   // compatibilidade: "há rota na tela"
+  const pedidoId = pedidoIds.join(",");
+
+  // --- contagens: última de cada porta-palete (divergente ou conferida) ---
+  const ultimaContagem = useMemo(() => {
+    const m = {};
+    contagens.forEach(c => { if (c.porta_palete_id && !(c.porta_palete_id in m)) m[c.porta_palete_id] = c; });
+    return m;
+  }, [contagens]);
+  const diverg = useMemo(() => { const m = {}; Object.entries(ultimaContagem).forEach(([k, c]) => { if (c.diferenca_total) m[k] = c; }); return m; }, [ultimaContagem]);
+  useEffect(() => {
+    const ids = [...new Set([...(verDiverg ? Object.values(diverg).map(c => c.id) : []), ...(selPP && ultimaContagem[selPP] ? [ultimaContagem[selPP].id] : [])])].filter(id => !(id in itensContagem));
+    if (!ids.length) return;
+    supabaseClient.from("contagem_itens").select("*").in("contagem_id", ids).then(({ data }) => {
+      const m = {}; ids.forEach(id => { m[id] = []; }); (data || []).forEach(r => { (m[r.contagem_id] = m[r.contagem_id] || []).push(r); });
+      setItensContagem(prev => ({ ...prev, ...m }));
+    });
+  }, [verDiverg, diverg, selPP, ultimaContagem]);
+
+  // --- resumo de um corredor ---
+  const infoCorredor = useMemo(() => {
+    if (selCorredor === null) return null;
+    const pps = portaPaletes.filter(pp => Number(pp.fileira) === Number(selCorredor));
+    const ocup = pps.filter(pp => (porPP[pp.id] || []).length);
+    const prods = {}; pps.forEach(pp => (porPP[pp.id] || []).forEach(it => { const k = String(it.produtoId); prods[k] = prods[k] || { nome: it.produto ? it.produto.nome : "Produto", qtd: 0 }; prods[k].qtd += it.qtd; }));
+    return { f: selCorredor, total: pps.length, ocupadas: ocup.length, livres: pps.length - ocup.length, pct: pps.length ? Math.round(ocup.length / pps.length * 100) : 0,
+      produtos: Object.values(prods).sort((a, b) => b.qtd - a.qtd), divergencias: pps.filter(pp => diverg[pp.id]).length };
+  }, [selCorredor, portaPaletes, porPP, diverg]);
+
+  // --- doca: movimentações reais de hoje ---
+  const infoDoca = useMemo(() => {
+    const hoje = new Date().toDateString();
+    const deHoje = movimentacoes.filter(m => m.data && new Date(m.data).toDateString() === hoje);
+    return { entradas: deHoje.filter(m => m.tipo === "Entrada"), saidas: deHoje.filter(m => m.tipo !== "Entrada"), ultimas: movimentacoes.slice(0, 6) };
+  }, [movimentacoes]);
+
+  // --- quem está contando / separando agora (presença em tempo real de cada aparelho) ---
+  const aoVivo = useMemo(() => {
+    const contando = presencas.filter(p => p.tipo === "contagem" && p.ppId);
+    const separando = presencas.filter(p => p.tipo === "separacao" && p.pedidoId);
+    const porPP = {}; contando.forEach(p => { (porPP[p.ppId] = porPP[p.ppId] || []).push(p); });
+    const porPedido = {}; separando.forEach(p => { (porPedido[p.pedidoId] = porPedido[p.pedidoId] || []).push(p); });
+    return { contando, separando, porPP, porPedido };
+  }, [presencas]);
+  const emSeparacaoAgora = useMemo(() => pedidosAbertos.filter(p => aoVivo.porPedido[p.id] || p.status === "Em Separação").map(p => String(p.id)), [pedidosAbertos, aoVivo]);
+
+  // destaque de cada porta-palete conforme o modo ativo (rota > busca > divergências > corredor)
+  const destaques = useMemo(() => {
+    const m = {};
+    if (rotas.length) rotas.forEach(r => r.paradas.forEach((s, i) => { if (!m[s.ppId]) m[s.ppId] = s.falta ? "#e5484d" : s.ok ? "#3fbf7f" : r.cor; }));
+    else if (achados) achados.pps.forEach(id => { m[id] = "#2fc4ee"; });
+    else if (verDiverg) Object.entries(ultimaContagem).forEach(([id, c]) => { m[id] = c.diferenca_total ? "#e5484d" : "#3fbf7f"; });
+    else if (selCorredor !== null) portaPaletes.forEach(pp => { if (Number(pp.fileira) === Number(selCorredor)) m[pp.id] = "#e8892f"; });
+    Object.keys(aoVivo.porPP).forEach(id => { if (!m[id]) m[id] = "#a78bfa"; });   // sendo contada agora
+    if (selPP && !m[selPP]) m[selPP] = "#ffffff";
+    return m;
+  }, [rotas, achados, verDiverg, ultimaContagem, selCorredor, selPP, portaPaletes, aoVivo]);
+  const principal = selPP || (rota && rota.paradas[rota.proxima >= 0 ? rota.proxima : 0] ? rota.paradas[rota.proxima >= 0 ? rota.proxima : 0].ppId : null) || (achados && [...achados.pps][0]) || null;
+  const temDestaqueModo = rotas.length > 0 || !!achados || verDiverg || selCorredor !== null;
+
+  // ---------- motor 3D (uma vez) ----------
+  useEffect(() => {
+    let vivo = true;
+    carregarThree().then(THREE => {
+      if (!vivo || !caixaRef.current) return;
+      if (THREE.ColorManagement) THREE.ColorManagement.legacyMode = false;
+      const el = caixaRef.current;
+      const celular = Math.min(window.innerWidth, window.innerHeight) < 760;
+      const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, celular ? 1.25 : 1.75));
+      renderer.setSize(el.clientWidth, el.clientHeight);
+      renderer.outputEncoding = THREE.sRGBEncoding;
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.0;
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = celular ? THREE.PCFShadowMap : THREE.PCFSoftShadowMap;
+      el.appendChild(renderer.domElement);
+      renderer.domElement.style.touchAction = "none";
+      renderer.domElement.style.outline = "none";
+      renderer.domElement.tabIndex = 0;
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color("#0c1016");
+      scene.fog = new THREE.Fog("#0c1016", 70, 180);
+      const camera = new THREE.PerspectiveCamera(45, el.clientWidth / el.clientHeight, 0.08, 500);
+
+      // iluminação de ambiente (reflexos de luminárias de galpão no piso e no aço)
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      const amb = new THREE.Scene();
+      amb.add(new THREE.Mesh(new THREE.BoxGeometry(60, 20, 60), new THREE.MeshBasicMaterial({ color: new THREE.Color(0.28, 0.29, 0.31), side: THREE.BackSide })));
+      const chaoAmb = new THREE.Mesh(new THREE.PlaneGeometry(60, 60), new THREE.MeshBasicMaterial({ color: new THREE.Color(0.12, 0.12, 0.13) })); chaoAmb.rotation.x = -Math.PI / 2; chaoAmb.position.y = -9.9; amb.add(chaoAmb);
+      for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) {
+        const lum = new THREE.Mesh(new THREE.CircleGeometry(0.9, 16), new THREE.MeshBasicMaterial({ color: new THREE.Color(9, 9, 8.5) }));
+        lum.rotation.x = Math.PI / 2; lum.position.set(i * 10, 9.5, j * 10); amb.add(lum);
+      }
+      const portaoAmb = new THREE.Mesh(new THREE.PlaneGeometry(10, 6), new THREE.MeshBasicMaterial({ color: new THREE.Color(4, 4, 3.8) })); portaoAmb.position.set(0, 0, -29.9); amb.add(portaoAmb);
+      scene.environment = pmrem.fromScene(amb, 0.04).texture;
+
+      scene.add(new THREE.HemisphereLight("#f4f7ff", "#4a4d55", 0.45));
+      const sol = new THREE.DirectionalLight("#fffaf0", 1.25);
+      sol.castShadow = true;
+      sol.shadow.mapSize.set(celular ? 1024 : 2048, celular ? 1024 : 2048);
+      sol.shadow.bias = -0.0003; sol.shadow.normalBias = 0.025; sol.shadow.radius = 3;
+      scene.add(sol); scene.add(sol.target);
+      // luz localizada para o endereço procurado (destaque elegante, sem "pintar" o galpão)
+      const foco = new THREE.SpotLight("#bfeeff", 0, 14, 0.42, 0.65, 1.2);
+      scene.add(foco); scene.add(foco.target);
+
+      const conteudo = new THREE.Group(); scene.add(conteudo);
+      const telhado = new THREE.Group(); scene.add(telhado);
+      const rotaGrupo = new THREE.Group(); scene.add(rotaGrupo);
+
+      // ---- texturas procedurais (nada baixado da internet) ----
+      const tela = (w, h, desenhar) => { const c = document.createElement("canvas"); c.width = w; c.height = h; desenhar(c.getContext("2d"), w, h); return c; };
+      const tex = (c, cor = true) => { const t = new THREE.CanvasTexture(c); t.wrapS = t.wrapT = THREE.RepeatWrapping; if (cor) t.encoding = THREE.sRGBEncoding; t.anisotropy = renderer.capabilities.getMaxAnisotropy ? Math.min(8, renderer.capabilities.getMaxAnisotropy()) : 4; return t; };
+      let semente = 11; const rnd = () => { semente = (semente * 16807) % 2147483647; return semente / 2147483647; };
+      const concreto = tela(1024, 1024, (g, w, h) => {
+        g.fillStyle = "#8f9297"; g.fillRect(0, 0, w, h);
+        for (let i = 0; i < 90; i++) { const x = rnd() * w, y = rnd() * h, r = 50 + rnd() * 260; const gr = g.createRadialGradient(x, y, 0, x, y, r);
+          gr.addColorStop(0, rnd() > 0.55 ? "rgba(255,255,255,0.06)" : "rgba(30,30,34,0.07)"); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r); }
+        for (let i = 0; i < 14000; i++) { g.fillStyle = `rgba(${rnd() > 0.5 ? "250,250,250" : "25,25,30"},${0.03 + rnd() * 0.07})`; g.fillRect(rnd() * w, rnd() * h, 1 + rnd(), 1 + rnd()); }
+        g.strokeStyle = "rgba(20,20,22,0.05)"; for (let i = 0; i < 30; i++) { g.lineWidth = 0.5 + rnd(); g.beginPath(); g.moveTo(rnd() * w, rnd() * h); g.bezierCurveTo(rnd() * w, rnd() * h, rnd() * w, rnd() * h, rnd() * w, rnd() * h); g.stroke(); }
+        g.strokeStyle = "rgba(40,42,46,0.6)"; g.lineWidth = 2; g.strokeRect(1, 1, w - 2, h - 2);   // juntas de dilatação
+      });
+      const rugosidade = tela(256, 256, (g, w, h) => { g.fillStyle = "#6e6e6e"; g.fillRect(0, 0, w, h); for (let i = 0; i < 40; i++) { const x = rnd() * w, y = rnd() * h, r = 20 + rnd() * 70; const gr = g.createRadialGradient(x, y, 0, x, y, r); gr.addColorStop(0, rnd() > 0.5 ? "rgba(40,40,40,0.5)" : "rgba(170,170,170,0.4)"); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(x - r, y - r, 2 * r, 2 * r); } });
+      const papelao = tela(256, 256, (g, w, h) => {
+        g.fillStyle = "#f1e9dc"; g.fillRect(0, 0, w, h);
+        for (let i = 0; i < 3000; i++) { g.fillStyle = `rgba(110,80,45,${rnd() * 0.06})`; g.fillRect(rnd() * w, rnd() * h, 1 + rnd() * 4, 1); }
+        g.fillStyle = "rgba(250,240,215,0.9)"; g.fillRect(0, h * 0.44, w, h * 0.12);                       // fita
+        g.fillStyle = "rgba(255,255,255,0.25)"; g.fillRect(0, h * 0.46, w, h * 0.02);
+        g.fillStyle = "#fcfcfa"; g.fillRect(w * 0.58, h * 0.64, w * 0.32, h * 0.24);                    // etiqueta de expedição
+        g.fillStyle = "#2a2a2a"; for (let i = 0; i < 18; i++) g.fillRect(w * 0.6 + i * 4, h * 0.67, rnd() > 0.4 ? 2 : 1, h * 0.09);
+        g.fillRect(w * 0.6, h * 0.79, w * 0.22, 2); g.fillRect(w * 0.6, h * 0.83, w * 0.16, 2);
+        g.strokeStyle = "rgba(85,60,30,0.3)"; g.lineWidth = 3; g.strokeRect(1.5, 1.5, w - 3, h - 3);
+      });
+      const madeira = tela(256, 64, (g, w, h) => {
+        g.fillStyle = "#b5895a"; g.fillRect(0, 0, w, h);
+        for (let i = 0; i < 50; i++) { g.strokeStyle = `rgba(85,55,28,${0.08 + rnd() * 0.18})`; g.lineWidth = 0.6 + rnd(); const y = rnd() * h; g.beginPath(); g.moveTo(0, y); g.bezierCurveTo(w * 0.3, y + rnd() * 5 - 2.5, w * 0.6, y + rnd() * 5 - 2.5, w, y); g.stroke(); }
+        for (let i = 0; i < 3; i++) { g.fillStyle = "rgba(70,45,20,0.35)"; g.beginPath(); g.ellipse(rnd() * w, rnd() * h, 3 + rnd() * 4, 2, 0, 0, 7); g.fill(); }
+      });
+      const perfil = tela(32, 256, (g, w, h) => {
+        g.fillStyle = "#ffffff"; g.fillRect(0, 0, w, h);
+        g.fillStyle = "#e9eef5"; g.fillRect(0, 0, 3, h); g.fillRect(w - 3, 0, 3, h);
+        g.fillStyle = "#2b3240"; for (let y = 4; y < h; y += 12) { g.beginPath(); g.moveTo(w * 0.38, y); g.lineTo(w * 0.62, y); g.lineTo(w * 0.62, y + 5); g.lineTo(w * 0.5, y + 7); g.lineTo(w * 0.38, y + 5); g.fill(); }
+      });
+      const parede = tela(512, 512, (g, w, h) => {
+        g.fillStyle = "#cfd3d8"; g.fillRect(0, 0, w, h * 0.82);
+        for (let x = 0; x < w; x += 32) { const gr = g.createLinearGradient(x, 0, x + 32, 0); gr.addColorStop(0, "rgba(0,0,0,0.10)"); gr.addColorStop(0.2, "rgba(255,255,255,0.10)"); gr.addColorStop(0.5, "rgba(0,0,0,0.02)"); gr.addColorStop(0.8, "rgba(255,255,255,0.06)"); gr.addColorStop(1, "rgba(0,0,0,0.12)"); g.fillStyle = gr; g.fillRect(x, 0, 32, h * 0.82); }
+        g.fillStyle = "#7d8187"; g.fillRect(0, h * 0.82, w, h * 0.18);                      // rodapé de concreto
+        for (let i = 0; i < 1500; i++) { g.fillStyle = `rgba(0,0,0,${rnd() * 0.08})`; g.fillRect(rnd() * w, h * 0.82 + rnd() * h * 0.18, 2, 2); }
+        g.fillStyle = "#595d63"; g.fillRect(0, h * 0.82, w, 3);
+      });
+      const telhaT = tela(256, 256, (g, w, h) => { g.fillStyle = "#b9bec5"; g.fillRect(0, 0, w, h); for (let x = 0; x < w; x += 16) { g.fillStyle = "rgba(0,0,0,0.12)"; g.fillRect(x, 0, 4, h); g.fillStyle = "rgba(255,255,255,0.14)"; g.fillRect(x + 6, 0, 3, h); } });
+      const porta = tela(256, 256, (g, w, h) => { for (let y = 0; y < h; y += 10) { const gr = g.createLinearGradient(0, y, 0, y + 10); gr.addColorStop(0, "#8f969e"); gr.addColorStop(0.5, "#c9ced4"); gr.addColorStop(1, "#767c84"); g.fillStyle = gr; g.fillRect(0, y, w, 9); } });
+      const zebra = tela(128, 16, (g, w, h) => { for (let x = -16; x < w; x += 16) { g.fillStyle = (Math.round(x / 16) % 2) ? "#f2c200" : "#1d1d1d"; g.beginPath(); g.moveTo(x, 0); g.lineTo(x + 16, 0); g.lineTo(x + 32, h); g.lineTo(x + 16, h); g.fill(); } });
+      const sombraT = tela(128, 128, (g, w, h) => { const gr = g.createRadialGradient(64, 64, 10, 64, 64, 64); gr.addColorStop(0, "rgba(0,0,0,0.55)"); gr.addColorStop(1, "rgba(0,0,0,0)"); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
+      const brilho = tela(128, 128, (g, w, h) => { const gr = g.createRadialGradient(64, 64, 0, 64, 64, 64); gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.3, "rgba(255,255,255,0.4)"); gr.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = gr; g.fillRect(0, 0, w, h); });
+      const tracos = tela(128, 16, (g, w, h) => { const gr = g.createLinearGradient(0, 0, w, 0); gr.addColorStop(0, "rgba(255,255,255,0)"); gr.addColorStop(0.5, "rgba(255,255,255,1)"); gr.addColorStop(1, "rgba(255,255,255,0)"); g.fillStyle = gr; g.fillRect(0, 0, w * 0.5, h); });
+      const T = { concreto: tex(concreto), rug: tex(rugosidade, false), papelao: tex(papelao), madeira: tex(madeira), perfil: tex(perfil), parede: tex(parede), telha: tex(telhaT), porta: tex(porta), zebra: tex(zebra), sombra: tex(sombraT), brilho: tex(brilho), tracos: tex(tracos) };
+      T.perfil.repeat.set(1, 8);
+
+      const std = (o) => new THREE.MeshStandardMaterial(o);
+      const mat = {
+        piso: std({ map: T.concreto, roughnessMap: T.rug, roughness: 0.55, metalness: 0.0, envMapIntensity: 0.9 }),
+        parede: std({ map: T.parede, roughness: 0.7, metalness: 0.25, side: THREE.BackSide }),
+        telha: std({ map: T.telha, roughness: 0.6, metalness: 0.5, side: THREE.BackSide }),
+        estrutura: std({ color: "#5d6670", roughness: 0.5, metalness: 0.7 }),
+        luminaria: std({ color: "#2a2e34", roughness: 0.4, metalness: 0.8 }),
+        led: new THREE.MeshBasicMaterial({ color: new THREE.Color(3.2, 3.2, 3.0), toneMapped: false }),
+        porta: std({ map: T.porta, roughness: 0.45, metalness: 0.7 }),
+        lado: new THREE.MeshBasicMaterial({ color: new THREE.Color(2.4, 2.45, 2.5), toneMapped: false }),
+        zebra: std({ map: T.zebra, roughness: 0.6 }),
+        faixa: std({ color: "#e8b800", roughness: 0.55 }),
+        faixaBranca: std({ color: "#e6e8ea", roughness: 0.6 }),
+        amarelo: std({ color: "#f2b705", roughness: 0.45, metalness: 0.2 }),
+        montante: std({ color: "#1f4fa8", map: T.perfil, roughness: 0.38, metalness: 0.45 }),
+        travessa: std({ color: "#9aa3ad", roughness: 0.35, metalness: 0.85 }),
+        longarina: std({ color: "#e86f17", roughness: 0.35, metalness: 0.4 }),
+        sapata: std({ color: "#e86f17", roughness: 0.45, metalness: 0.4 }),
+        madeira: std({ map: T.madeira, roughness: 0.92 }),
+        caixa: std({ map: T.papelao, roughness: 0.85 }),
+        filme: std({ color: "#eef5fb", transparent: true, opacity: 0.17, roughness: 0.05, metalness: 0, depthWrite: false, envMapIntensity: 1.6 }),
+        nivelador: std({ color: "#3b3f46", roughness: 0.4, metalness: 0.75 }),
+        borracha: std({ color: "#16171a", roughness: 0.9 }),
+        sombra: new THREE.MeshBasicMaterial({ map: T.sombra, transparent: true, depthWrite: false, opacity: 0.85 }),
+        hit: new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
+      };
+      mat.filme.userData.semSombra = true; mat.sombra.userData.semSombra = true; mat.led.userData.semSombra = true;
+      const geo = { cubo: new THREE.BoxGeometry(1, 1, 1), cil: new THREE.CylinderGeometry(1, 1, 1, 20), plano: new THREE.PlaneGeometry(1, 1), disco: new THREE.CircleGeometry(1, 24) };
+      const peca = (g, m, p, s, r) => { const x = new THREE.Mesh(g, m); x.position.set(...p); if (s) x.scale.set(...s); if (r) x.rotation.set(...r); x.castShadow = true; x.receiveShadow = true; return x; };
+
+      // placas de texto como objetos 3D (presas nas estruturas / pintadas no piso), não etiquetas flutuando
+      const placas = {};
+      function placa(texto, { fundo = "#1c2129", cor = "#ffffff", altura = 0.22, borda = null, fonte = "600", sub = "" } = {}) {
+        const k = [texto, sub, fundo, cor, borda, fonte].join("|");
+        if (!placas[k]) {
+          const c = document.createElement("canvas"); const g = c.getContext("2d");
+          const F = 64; g.font = `${fonte} ${F}px Inter, Segoe UI, sans-serif`; const w1 = g.measureText(texto).width;
+          g.font = `600 ${F * 0.42}px Inter, Segoe UI, sans-serif`; const w2 = sub ? g.measureText(sub).width : 0;
+          const w = Math.ceil(Math.max(w1, w2) + F * 0.7), h = sub ? Math.round(F * 1.75) : Math.round(F * 1.25);
+          c.width = w; c.height = h;
+          if (fundo !== "transparent") { g.fillStyle = fundo; g.beginPath(); (g.roundRect ? g.roundRect(0, 0, w, h, F * 0.12) : g.rect(0, 0, w, h)); g.fill(); }
+          if (borda) { g.strokeStyle = borda; g.lineWidth = F * 0.06; g.stroke(); }
+          g.fillStyle = cor; g.textAlign = "center"; g.textBaseline = "middle";
+          g.font = `${fonte} ${F}px Inter, Segoe UI, sans-serif`; g.fillText(texto, w / 2, sub ? F * 0.62 : h / 2 + F * 0.04);
+          if (sub) { g.font = `600 ${F * 0.42}px Inter, Segoe UI, sans-serif`; g.globalAlpha = 0.75; g.fillText(sub, w / 2, F * 1.35); g.globalAlpha = 1; }
+          const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8;
+          placas[k] = { t, asp: w / h, m: new THREE.MeshBasicMaterial({ map: t, transparent: fundo === "transparent", toneMapped: false, depthWrite: fundo !== "transparent" }) };
+        }
+        const P = placas[k];
+        const mesh = new THREE.Mesh(geo.plano, P.m);
+        const alt = altura * (sub ? 1.4 : 1); mesh.scale.set(alt * P.asp, alt, 1);
+        return mesh;
+      }
+      function etiqueta(texto, { fundo = "#2fc4ee", cor = "#06131a", tam = 0.4 } = {}) {   // só para números de parada e seleção
+        const k = "s|" + texto + fundo + cor;
+        if (!placas[k]) {
+          const c = document.createElement("canvas"); c.width = 96; c.height = 96; const g = c.getContext("2d");
+          g.fillStyle = fundo; g.beginPath(); g.arc(48, 48, 44, 0, 7); g.fill(); g.strokeStyle = "rgba(255,255,255,0.9)"; g.lineWidth = 5; g.stroke();
+          g.fillStyle = cor; g.font = "700 48px Inter, Segoe UI, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(texto, 48, 51);
+          const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; placas[k] = { t };
+        }
+        const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: placas[k].t, depthTest: false, transparent: true, toneMapped: false }));
+        s.scale.set(tam, tam, 1); s.renderOrder = 20; return s;
+      }
+
+      // ---- câmera: órbita suave + primeira pessoa, sem atravessar estruturas ----
+      const cam = { alvo: new THREE.Vector3(), raio: 30, teta: 0.6, fi: 0.95, anim: null };
+      const fp = { x: 0, z: 0, yaw: 0, pitch: -0.05, teclas: {}, botoes: {} };
+      const OLHO = 1.65;
+      const colide = (x, z, folga = 0.35) => {
+        const L = st.current.layoutAtual; if (!L) return false; const p = L.predio;
+        if (x < p.minX + folga || x > p.maxX - folga || z < p.minZ + folga || z > p.maxZ - folga) return true;
+        return L.solidos.some(s => x > s.x0 - folga && x < s.x1 + folga && z > s.z0 - folga && z < s.z1 + folga);
+      };
+      function posicionar() {
+        if (st.current.modoPessoa) {
+          camera.position.set(fp.x, OLHO, fp.z);
+          camera.lookAt(fp.x + Math.sin(fp.yaw) * Math.cos(fp.pitch), OLHO + Math.sin(fp.pitch), fp.z + Math.cos(fp.yaw) * Math.cos(fp.pitch));
+          return;
+        }
+        const { alvo, raio, teta, fi } = cam;
+        let x = alvo.x + raio * Math.sin(fi) * Math.sin(teta), y = alvo.y + raio * Math.cos(fi), z = alvo.z + raio * Math.sin(fi) * Math.cos(teta);
+        const L = st.current.layoutAtual;
+        if (L) L.solidos.forEach(s => { if (x > s.x0 - 0.4 && x < s.x1 + 0.4 && z > s.z0 - 0.4 && z < s.z1 + 0.4 && y < s.h + 0.6) y = s.h + 0.6; }); // não entra na estrutura
+        camera.position.set(x, Math.max(0.6, y), z);
+        camera.lookAt(alvo);
+      }
+      function voar(alvo, raio, fi, dur = 1100, teta) {
+        cam.anim = { de: { a: cam.alvo.clone(), r: cam.raio, f: cam.fi, t: cam.teta }, para: { a: alvo.clone(), r: raio, f: fi === undefined ? cam.fi : fi, t: teta === undefined ? cam.teta : teta }, t0: performance.now(), dur };
+        // gira pelo caminho mais curto
+        let d = cam.anim.para.t - cam.anim.de.t; while (d > Math.PI) d -= 2 * Math.PI; while (d < -Math.PI) d += 2 * Math.PI; cam.anim.para.t = cam.anim.de.t + d;
+      }
+      const ptrs = new Map(); let ult = null, moveu = 0, botaoDireito = false;
+      const dom = renderer.domElement;
+      const mover = (dx, dy) => {
+        const f = cam.raio * 0.0016;
+        cam.alvo.addScaledVector(new THREE.Vector3(Math.cos(cam.teta), 0, -Math.sin(cam.teta)), -dx * f).addScaledVector(new THREE.Vector3(Math.sin(cam.teta), 0, Math.cos(cam.teta)), -dy * f);
+        const p = st.current.layoutAtual && st.current.layoutAtual.predio;
+        if (p) { cam.alvo.x = Math.min(p.maxX + 5, Math.max(p.minX - 5, cam.alvo.x)); cam.alvo.z = Math.min(p.maxZ + 5, Math.max(p.minZ - 5, cam.alvo.z)); }
+      };
+      dom.addEventListener("contextmenu", e => e.preventDefault());
+      dom.addEventListener("pointerdown", e => { dom.focus(); dom.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); botaoDireito = e.button === 2 || e.shiftKey; moveu = 0; ult = null; cam.anim = null; st.current.interagiu = true; });
+      dom.addEventListener("pointermove", e => {
+        if (!ptrs.has(e.pointerId)) return;
+        const ant = ptrs.get(e.pointerId); const dx = e.clientX - ant.x, dy = e.clientY - ant.y;
+        ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY }); moveu += Math.abs(dx) + Math.abs(dy);
+        if (st.current.modoPessoa) { fp.yaw -= dx * 0.004; fp.pitch = Math.max(-1.1, Math.min(1.1, fp.pitch - dy * 0.004)); return; }
+        if (ptrs.size === 1) {
+          if (botaoDireito) mover(dx, dy);
+          else { cam.teta -= dx * 0.005; cam.fi = Math.min(1.45, Math.max(0.04, cam.fi - dy * 0.004)); }
+        } else if (ptrs.size === 2) {
+          const [a, b] = [...ptrs.values()];
+          const dist = Math.hypot(a.x - b.x, a.y - b.y), mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+          if (ult) { cam.raio = Math.min(160, Math.max(3.5, cam.raio * ult.dist / dist)); mover(mx - ult.mx, my - ult.my); }
+          ult = { dist, mx, my };
+        }
+      });
+      dom.addEventListener("pointerup", e => { const toque = ptrs.size === 1 && moveu < 8; ptrs.delete(e.pointerId); ult = null; if (toque) escolher(e); });
+      dom.addEventListener("pointercancel", e => { ptrs.delete(e.pointerId); ult = null; });
+      let alvoZoom = null;
+      dom.addEventListener("wheel", e => {
+        e.preventDefault(); st.current.interagiu = true;
+        if (st.current.modoPessoa) { andar(-Math.sign(e.deltaY) * 0.8, 0); return; }
+        cam.anim = null; alvoZoom = Math.min(160, Math.max(3.5, (alvoZoom || cam.raio) * (1 + Math.sign(e.deltaY) * 0.12)));
+      }, { passive: false });
+      dom.addEventListener("keydown", e => { fp.teclas[e.key.toLowerCase()] = true; if (st.current.modoPessoa && ["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(e.key.toLowerCase())) e.preventDefault(); });
+      dom.addEventListener("keyup", e => { fp.teclas[e.key.toLowerCase()] = false; });
+      function andar(frente, lado) {
+        const nx = fp.x + Math.sin(fp.yaw) * frente + Math.cos(fp.yaw) * lado, nz = fp.z + Math.cos(fp.yaw) * frente - Math.sin(fp.yaw) * lado;
+        if (!colide(nx, fp.z)) fp.x = nx; if (!colide(fp.x, nz)) fp.z = nz;   // desliza encostado na estrutura
+      }
+      const ray = new THREE.Raycaster();
+      function escolher(e) {
+        const r = dom.getBoundingClientRect();
+        ray.setFromCamera(new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1), camera);
+        const hit = ray.intersectObjects(st.current.hits || [])[0];
+        st.current.aoEscolher && st.current.aoEscolher(hit ? hit.object.userData : null);
+      }
+
+      // ---- empilhadeira (modelada em 3D: chassi, contrapeso, cabine, mastro, garfos, rodas) ----
+      const amarelo = std({ color: "#f2b200", roughness: 0.32, metalness: 0.25 });
+      const grafite = std({ color: "#202329", roughness: 0.5, metalness: 0.45 });
+      const aco = std({ color: "#8e959d", roughness: 0.28, metalness: 0.9 });
+      const giroflex = std({ color: "#ff8a00", emissive: "#ff6a00", emissiveIntensity: 2 });
+      const emp = new THREE.Group();
+      emp.add(peca(geo.cubo, amarelo, [0, 0.46, -0.05], [1.05, 0.44, 1.5]));
+      emp.add(peca(geo.cubo, amarelo, [0, 0.72, 0.42], [1.0, 0.12, 0.5]));
+      emp.add(peca(geo.cubo, grafite, [0, 0.66, -0.76], [1.08, 0.66, 0.34]));
+      emp.add(peca(geo.cubo, grafite, [0, 0.84, -0.22], [0.48, 0.12, 0.48]));
+      emp.add(peca(geo.cubo, grafite, [0, 1.1, -0.44], [0.48, 0.48, 0.08]));
+      emp.add(peca(geo.cil, grafite, [0, 1.15, 0.3], [0.17, 0.05, 0.17], [-0.9, 0, 0]));
+      emp.add(peca(geo.cil, aco, [0.38, 1.05, -0.85], [0.17, 0.65, 0.17], [0, 0, Math.PI / 2]));   // cilindro de gás
+      [[-0.45, -0.62], [0.45, -0.62], [-0.45, 0.38], [0.45, 0.38]].forEach(([x, z]) => emp.add(peca(geo.cil, grafite, [x, 1.35, z], [0.035, 1.38, 0.035])));
+      [-0.45, 0.45].forEach(x => emp.add(peca(geo.cubo, grafite, [x, 2.04, -0.12], [0.06, 0.06, 1.04])));
+      for (let i = 0; i < 5; i++) emp.add(peca(geo.cubo, grafite, [0, 2.04, -0.6 + i * 0.24], [0.94, 0.035, 0.045]));
+      emp.add(peca(new THREE.SphereGeometry(0.08, 12, 8), giroflex, [0, 2.12, -0.55]));
+      [-0.32, 0.32].forEach(x => emp.add(peca(geo.cubo, aco, [x, 1.3, 0.8], [0.09, 2.5, 0.12])));
+      emp.add(peca(geo.cubo, aco, [0, 2.5, 0.8], [0.72, 0.08, 0.12]));
+      const garfo = new THREE.Group();
+      garfo.add(peca(geo.cubo, grafite, [0, 0.52, 0.89], [0.82, 0.58, 0.06]));
+      [-0.24, 0.24].forEach(x => garfo.add(peca(geo.cubo, aco, [x, 0.22, 1.42], [0.11, 0.045, 1.08])));
+      emp.add(garfo);
+      [[-0.52, -0.55, 0.2], [0.52, -0.55, 0.2], [-0.52, 0.48, 0.27], [0.52, 0.48, 0.27]].forEach(([x, z, r]) => { emp.add(peca(geo.cil, mat.borracha, [x, r, z], [r, 0.2, r], [0, 0, Math.PI / 2])); emp.add(peca(geo.cil, aco, [x + Math.sign(x) * 0.01, r, z], [r * 0.5, 0.205, r * 0.5], [0, 0, Math.PI / 2])); });
+      const sombraEmp = new THREE.Mesh(geo.plano, mat.sombra); sombraEmp.rotation.x = -Math.PI / 2; sombraEmp.scale.set(2.2, 2.8, 1); sombraEmp.position.y = 0.012; emp.add(sombraEmp);
+      scene.add(emp);
+      const frota = [emp];   // uma empilhadeira por pedido na tela
+
+      const ro = new ResizeObserver(() => { const w = el.clientWidth, h = el.clientHeight; if (!w || !h) return; renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix(); });
+      ro.observe(el);
+
+      let raf = 0, antes = performance.now(), quadro = 0;
+      const qual = { n: 0, soma: 0, pr: renderer.getPixelRatio() };
+      const v3 = new THREE.Vector3();
+      const loop = (t) => {
+        raf = requestAnimationFrame(loop);
+        const dt = Math.min(0.05, (t - antes) / 1000); antes = t; quadro++;
+        if (st.current.modoPessoa) {
+          const k = fp.teclas, b = fp.botoes, vel = (k.shift ? 5 : 2.6) * dt;
+          const fr = (k.w || k.arrowup || b.frente ? 1 : 0) - (k.s || k.arrowdown || b.tras ? 1 : 0);
+          const ld = (k.d ? 1 : 0) - (k.a ? 1 : 0);
+          if (k.arrowleft || b.esq) fp.yaw += dt * 1.6; if (k.arrowright || b.dir) fp.yaw -= dt * 1.6;
+          if (fr || ld) andar(fr * vel, -ld * vel);
+        } else if (cam.anim) {
+          const k = Math.min(1, (t - cam.anim.t0) / cam.anim.dur), e = k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+          cam.alvo.lerpVectors(cam.anim.de.a, cam.anim.para.a, e);
+          cam.raio = cam.anim.de.r + (cam.anim.para.r - cam.anim.de.r) * e;
+          cam.fi = cam.anim.de.f + (cam.anim.para.f - cam.anim.de.f) * e;
+          cam.teta = cam.anim.de.t + (cam.anim.para.t - cam.anim.de.t) * e;
+          if (k >= 1) cam.anim = null;
+        } else {
+          if (alvoZoom) { cam.raio += (alvoZoom - cam.raio) * Math.min(1, dt * 10); if (Math.abs(alvoZoom - cam.raio) < 0.01) alvoZoom = null; }
+          if (!st.current.interagiu && st.current.ultimaChave === "geral") cam.teta += dt * 0.03;
+        }
+        posicionar();
+        // telhado e luminárias somem quando a câmera sobe acima do pé-direito (visão de cima limpa)
+        const L = st.current.layoutAtual;
+        if (L) telhado.visible = camera.position.y < L.predio.H - 0.3;
+        // identificação discreta: placas das posições só de perto, placas de corredor de média distância
+        if (quadro % 6 === 0) {
+          (st.current.placasPos || []).forEach(m => { m.visible = camera.position.distanceTo(m.getWorldPosition(v3)) < 13; });
+          (st.current.placasCorr || []).forEach(m => { const d = camera.position.distanceTo(m.getWorldPosition(v3)); m.visible = d > 3 && d < 60; });
+        }
+        const pulso = 0.5 + 0.5 * Math.sin(t / 420);
+        (st.current.brilhos || []).forEach(m => { m.material.opacity = m.userData.base + m.userData.amp * pulso; });
+        (st.current.tracosLista || []).forEach(tr => { tr.offset.x -= dt * 0.9; });
+        foco.intensity += ((st.current.focoAlvo || 0) - foco.intensity) * Math.min(1, dt * 4);
+        giroflex.emissiveIntensity = (Math.floor(t / 380) % 2) ? 2.5 : 0.15;
+        const pistas = st.current.pistas || [];
+        while (frota.length < pistas.length) { const nova = emp.clone(); scene.add(nova); frota.push(nova); }
+        frota.forEach((e, n) => {
+          const pista = pistas[n];
+          if (pista && pista.total > 0) {
+            const vel = 2.4, ciclo = pista.total / vel + 3;
+            const d = Math.min(pista.total, ((t / 1000 + n * 2.7) % ciclo) * vel);
+            let i = 0; while (i < pista.acum.length - 2 && pista.acum[i + 1] < d) i++;
+            const a = pista.pts[i], b = pista.pts[i + 1];
+            const seg = (pista.acum[i + 1] - pista.acum[i]) || 1, k = Math.min(1, (d - pista.acum[i]) / seg);
+            e.position.set(a.x + (b.x - a.x) * k, 0, a.z + (b.z - a.z) * k);
+            let dif = Math.atan2(b.x - a.x, b.z - a.z) - e.rotation.y; while (dif > Math.PI) dif -= 2 * Math.PI; while (dif < -Math.PI) dif += 2 * Math.PI;
+            e.rotation.y += dif * Math.min(1, dt * 7); e.visible = true;
+          } else if (n === 0 && st.current.estacionada) { e.position.copy(st.current.estacionada.p); e.rotation.y = st.current.estacionada.r; e.visible = true; }
+          else e.visible = false;
+        });
+        renderer.render(scene, camera);
+        qual.n++; qual.soma += dt;
+        if (qual.n >= 90) { const media = qual.soma / qual.n; qual.n = 0; qual.soma = 0; if (media > 0.045 && qual.pr > 0.75) { qual.pr = Math.max(0.75, qual.pr - 0.25); renderer.setPixelRatio(qual.pr); renderer.setSize(el.clientWidth, el.clientHeight); } }
+      };
+      raf = requestAnimationFrame(loop);
+
+      st.current = { ...st.current, THREE, renderer, scene, camera, conteudo, telhado, rotaGrupo, mat, geo, T, peca, placa, etiqueta, cam, fp, voar, sol, foco, colide,
+        limpar: () => { cancelAnimationFrame(raf); ro.disconnect(); renderer.dispose(); pmrem.dispose(); Object.values(T).forEach(x => x.dispose()); Object.values(placas).forEach(x => { x.t.dispose(); x.m && x.m.dispose(); }); if (dom.parentNode) dom.parentNode.removeChild(dom); } };
+      setPronto(true);
+    }).catch(e => vivo && setErro(e.message));
+    return () => { vivo = false; st.current.limpar && st.current.limpar(); st.current = {}; };
+  }, []);
+
+  st.current.aoEscolher = (u) => {
+    if (!u) { setSelPP(null); setSelCorredor(null); setSelDoca(false); return; }
+    if (u.ppId) { setSelPP(u.ppId === selPP ? null : u.ppId); setSelCorredor(null); setSelDoca(false); }
+    else if (u.corredor !== undefined) { setSelCorredor(u.corredor === selCorredor ? null : u.corredor); setSelPP(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); }
+    else if (u.doca) { setSelDoca(d => !d); setSelPP(null); setSelCorredor(null); }
+  };
+
+  // ---------- galpão: prédio, estruturas, paletes e caixas (refaz quando os dados mudam, em tempo real) ----------
+  useEffect(() => {
+    if (!pronto) return;
+    const { THREE, conteudo, telhado, mat, geo, T, placa, sol, cam } = st.current;
+    (st.current.descartar || []).forEach(x => x.dispose && x.dispose());
+    st.current.descartar = [];
+    const descartar = (x) => { st.current.descartar.push(x); return x; };
+    [conteudo, telhado].forEach(g => { while (g.children.length) g.remove(g.children[0]); });
+    const L = layout; st.current.layoutAtual = L;
+    const { BW, D, LH, A } = L; const p = L.predio; const H = p.H;
+    const placasPos = [], placasCorr = [], hits = [];
+
+    const lotes = {}; const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), eu = new THREE.Euler(), vp = new THREE.Vector3(), vs = new THREE.Vector3();
+    const branco = new THREE.Color(1, 1, 1);
+    const por = (chave, g, m, pos, s, r, cor, ppId, grupo) => {
+      const lt = lotes[chave] = lotes[chave] || { g, m, ms: [], cores: [], pps: [], grupo: grupo || conteudo };
+      eu.set(r ? r[0] : 0, r ? r[1] : 0, r ? r[2] : 0); q.setFromEuler(eu);
+      lt.ms.push(m4.compose(vp.set(pos[0], pos[1], pos[2]), q, vs.set(s[0], s[1], s[2])).clone());
+      lt.cores.push(cor ? new THREE.Color(cor) : null); lt.pps.push(ppId === undefined ? null : ppId);
+    };
+
+    // ---- prédio ----
+    T.concreto.repeat.set(p.W / 8, p.P / 8); T.rug.repeat.set(p.W / 5, p.P / 5);
+    const piso = new THREE.Mesh(descartar(new THREE.PlaneGeometry(p.W, p.P)), mat.piso);
+    piso.rotation.x = -Math.PI / 2; piso.position.set(p.cx, 0, p.cz); piso.receiveShadow = true; conteudo.add(piso);
+    T.parede.repeat.set(Math.max(p.W, p.P) / 9, 1);
+    const invis = descartar(new THREE.MeshBasicMaterial({ visible: false }));
+    // paredes por dentro (BackSide): a parede do lado da câmera some sozinha
+    const paredes = new THREE.Mesh(descartar(new THREE.BoxGeometry(p.W, H, p.P)), [mat.parede, mat.parede, invis, invis, mat.parede, mat.parede]);
+    paredes.position.set(p.cx, H / 2 - 0.005, p.cz); paredes.receiveShadow = true; conteudo.add(paredes);
+    // telhado metálico (visto de baixo), tesouras, terças e luminárias suspensas
+    T.telha.repeat.set(p.W / 6, p.P / 6);
+    const forro = new THREE.Mesh(descartar(new THREE.PlaneGeometry(p.W, p.P)), mat.telha); forro.rotation.x = -Math.PI / 2; forro.position.set(p.cx, H + 1.2, p.cz); telhado.add(forro);
+    const nTes = Math.max(2, Math.round(p.P / 7));
+    for (let i = 0; i <= nTes; i++) {
+      const z = p.minZ + (p.P / nTes) * i;
+      por("estr", geo.cubo, mat.estrutura, [p.cx, H, z], [p.W, 0.35, 0.18], null, null, null, telhado);
+      por("estr", geo.cubo, mat.estrutura, [p.cx, H + 1.0, z], [p.W, 0.12, 0.12], null, null, null, telhado);
+      const nMont = Math.round(p.W / 2.5);
+      for (let j = 0; j < nMont; j++) { const x = p.minX + (p.W / nMont) * (j + 0.5); por("estrFina", geo.cubo, mat.estrutura, [x, H + 0.5, z], [0.05, 1.15, 0.05], [0, 0, j % 2 ? 0.55 : -0.55], null, null, telhado); }
+      [p.minX + 0.2, p.maxX - 0.2].forEach(x => por("pilar", geo.cubo, mat.estrutura, [x, H / 2, z], [0.32, H, 0.32]));   // pilares nas paredes
+    }
+    for (let x = p.minX + 4; x < p.maxX; x += 4) por("estrFina", geo.cubo, mat.estrutura, [x, H + 1.05, p.cz], [0.08, 0.08, p.P], null, null, null, telhado);
+    // luminárias industriais (campânulas LED) sobre os corredores e ruas
+    const lumZ = [...L.corredores.map(f => L.corredorZ(f)), p.minZ + 3.5];
+    lumZ.forEach(z => { for (let x = p.minX + 3; x < p.maxX - 2; x += 6) {
+      por("cabo", geo.cil, mat.luminaria, [x, H - 0.4, z], [0.01, 0.9, 0.01], null, null, null, telhado);
+      por("lumi", geo.cil, mat.luminaria, [x, H - 0.95, z], [0.42, 0.22, 0.42], null, null, null, telhado);
+      por("led", geo.disco, mat.led, [x, H - 1.07, z], [0.36, 0.36, 1], [Math.PI / 2, 0, 0], null, null, telhado);
+    } });
+
+    // ---- DOCA 1 (única) ----
+    const dk = pontoDoca(L, cfg); const dw = cfg.docaLargura, dh = 4.0;
+    const docaG = new THREE.Group(); docaG.position.set(dk.x, 0, dk.z); docaG.rotation.y = dk.rot; conteudo.add(docaG);
+    const vao = new THREE.Mesh(geo.plano, mat.lado); vao.scale.set(dw, dh * 0.62, 1); vao.position.set(0, dh * 0.31, 0.015); docaG.add(vao);   // luz do dia (portão aberto)
+    const portao = new THREE.Mesh(geo.plano, mat.porta); portao.scale.set(dw, dh * 0.38, 1); portao.position.set(0, dh * 0.81, 0.02); docaG.add(portao);
+    const caixaPortao = new THREE.Mesh(geo.cubo, mat.estrutura); caixaPortao.scale.set(dw + 0.3, 0.45, 0.45); caixaPortao.position.set(0, dh + 0.22, 0.22); caixaPortao.castShadow = true; docaG.add(caixaPortao);
+    [-1, 1].forEach(s => { const bat = new THREE.Mesh(geo.cubo, mat.zebra); bat.scale.set(0.16, dh, 0.12); bat.position.set(s * (dw / 2 + 0.08), dh / 2, 0.06); docaG.add(bat);
+      const pr = new THREE.Mesh(geo.cubo, mat.borracha); pr.scale.set(0.22, 0.45, 0.16); pr.position.set(s * (dw / 2 - 0.25), 0.55, 0.1); docaG.add(pr);
+      const bal = new THREE.Mesh(geo.cil, mat.amarelo); bal.scale.set(0.09, 1.1, 0.09); bal.position.set(s * (dw / 2 + 0.55), 0.55, 0.6); bal.castShadow = true; docaG.add(bal); });
+    const niv = new THREE.Mesh(geo.cubo, mat.nivelador); niv.scale.set(dw - 0.6, 0.03, 2.2); niv.position.set(0, 0.015, 1.1); niv.receiveShadow = true; docaG.add(niv);
+    const nivZ = new THREE.Mesh(geo.cubo, mat.zebra); nivZ.scale.set(dw - 0.6, 0.032, 0.12); nivZ.position.set(0, 0.016, 2.2); docaG.add(nivZ);
+    const plDoca = placa("DOCA 1", { fundo: "#1c2129", cor: "#f2c200", altura: 0.32, fonte: "700" }); plDoca.position.set(0, dh + 0.75, 0.05); docaG.add(plDoca);
+    const hitDoca = new THREE.Mesh(geo.cubo, mat.hit); hitDoca.scale.set(dw + 1, dh, 3); hitDoca.position.set(0, dh / 2, 1.2); hitDoca.userData = { doca: true }; docaG.add(hitDoca); hits.push(hitDoca);
+    // área de recebimento/expedição marcada no piso em frente à doca (só pintura, sem mercadoria fictícia)
+    const zona = new THREE.Group(); zona.position.copy(docaG.position); zona.rotation.y = dk.rot; conteudo.add(zona);
+    const zw = dw + 3, zp = 4.2, z0 = 2.6;
+    [[0, z0, zw, 0.1], [0, z0 + zp, zw, 0.1], [-zw / 2, z0 + zp / 2, 0.1, zp], [zw / 2, z0 + zp / 2, 0.1, zp], [0, z0 + zp / 2, 0.06, zp]].forEach(([x, z, sx, sz]) => {
+      const f = new THREE.Mesh(geo.cubo, mat.faixa); f.scale.set(sx, 0.008, sz); f.position.set(x, 0.006, z); f.receiveShadow = true; zona.add(f); });
+    const tz1 = placa("RECEBIMENTO", { fundo: "transparent", cor: "rgba(232,184,0,0.9)", altura: 0.32, fonte: "700" }); tz1.rotation.x = -Math.PI / 2; tz1.rotation.z = Math.PI; tz1.position.set(-zw / 4, 0.012, z0 + zp - 0.45); zona.add(tz1);
+    const tz2 = placa("EXPEDIÇÃO", { fundo: "transparent", cor: "rgba(232,184,0,0.9)", altura: 0.32, fonte: "700" }); tz2.rotation.x = -Math.PI / 2; tz2.rotation.z = Math.PI; tz2.position.set(zw / 4, 0.012, z0 + zp - 0.45); zona.add(tz2);
+    // empilhadeira estacionada ao lado da doca quando não há rota
+    const estP = new THREE.Vector3(dk.dentro.x, 0, dk.dentro.z).add(new THREE.Vector3(Math.cos(dk.rot) * (zw / 2 + 1.6), 0, -Math.sin(dk.rot) * (zw / 2 + 1.6)));
+    st.current.estacionada = { p: estP, r: dk.rot + Math.PI };
+
+    // ---- ruas: faixas amarelas de circulação, número do corredor pintado no piso e placas nas pontas ----
+    L.corredores.forEach(f => {
+      const zc = L.corredorZ(f), comp = L.xR - L.xL + 1.6;
+      [-1, 1].forEach(s => por("faixa", geo.cubo, mat.faixa, [(L.xL + L.xR) / 2, 0.006, zc + s * (A / 2 - 0.18)], [comp, 0.008, 0.09]));
+      [L.xL - 0.4, L.xR + 0.4].forEach((x, i) => {
+        const num = placa(pad2(f), { fundo: "transparent", cor: "rgba(235,238,242,0.85)", altura: 0.75, fonte: "700" });
+        num.rotation.x = -Math.PI / 2; num.rotation.z = i ? -Math.PI / 2 : Math.PI / 2; num.position.set(x + (i ? -0.9 : 0.9), 0.012, zc); conteudo.add(num);
+        const hitC = new THREE.Mesh(geo.cubo, mat.hit); hitC.scale.set(1.8, 0.1, A - 0.4); hitC.position.set(x + (i ? -0.9 : 0.9), 0.05, zc); hitC.userData = { corredor: f }; conteudo.add(hitC); hits.push(hitC);
+      });
+      const hitRua = new THREE.Mesh(geo.cubo, mat.hit); hitRua.scale.set(L.xR - L.xL, 0.05, A - 0.6); hitRua.position.set((L.xL + L.xR) / 2, 0.03, zc); hitRua.userData = { corredor: f }; conteudo.add(hitRua); hits.push(hitRua);
+    });
+
+    // ---- estruturas porta-palete de aço ----
+    const fileiras = {}; Object.values(L.baias).forEach(b => { (fileiras[b.f] = fileiras[b.f] || []).push(b); });
+    Object.values(L.baias).forEach(b => {
+      const h = b.niveis * LH + 0.25;
+      [-1, 1].forEach(sx => {
+        const x = b.x + sx * (BW / 2 - 0.05);
+        [-1, 1].forEach(sz => {
+          const z = b.z + sz * (D / 2 - 0.045);
+          por("montante", geo.cubo, mat.montante, [x, h / 2, z], [0.09, h, 0.075]);
+          por("sapata", geo.cubo, mat.sapata, [x, 0.06, z], [0.16, 0.12, 0.14]);
+          por("chumbador", geo.cubo, mat.nivelador, [x, 0.006, z], [0.2, 0.012, 0.18]);
+        });
+        const nD = Math.max(2, Math.round(h / 1.0)), passo = (h - 0.3) / nD, comp = Math.hypot(passo, D - 0.1);
+        for (let i = 0; i < nD; i++) por("travessa", geo.cubo, mat.travessa, [x, 0.15 + passo * (i + 0.5), b.z], [0.03, comp, 0.03], [(i % 2 ? 1 : -1) * Math.atan2(D - 0.1, passo), 0, 0]);
+        [0.15, h - 0.08].forEach(y => por("travessa", geo.cubo, mat.travessa, [x, y, b.z], [0.035, 0.035, D - 0.08]));
+      });
+      for (let n = 1; n <= b.niveis; n++) {
+        const y = n * LH - 0.04;
+        [-1, 1].forEach(sz => {
+          por("longarina", geo.cubo, mat.longarina, [b.x, y, b.z + sz * (D / 2 - 0.05)], [BW - 0.12, 0.11, 0.05]);
+          [-1, 1].forEach(sx => por("conector", geo.cubo, mat.longarina, [b.x + sx * (BW / 2 - 0.1), y, b.z + sz * (D / 2 - 0.06)], [0.06, 0.2, 0.065]));
+        });
+        for (let i = 0; i < 2; i++) por("travessa", geo.cubo, mat.travessa, [b.x - BW / 4 + i * BW / 2, y + 0.04, b.z], [0.04, 0.03, D - 0.1]);   // apoios de palete
+      }
+      por("sombraRack", geo.plano, mat.sombra, [b.x, 0.004, b.z], [BW * 1.2, D * 2.2, 1], [-Math.PI / 2, 0, 0]);
+    });
+    // protetores de coluna amarelos nas pontas de cada fileira e placa discreta do corredor
+    Object.entries(fileiras).forEach(([f, bs]) => {
+      const xs = bs.map(b => b.x); const xa = Math.min(...xs) - BW / 2, xb = Math.max(...xs) + BW / 2; const z = bs[0].z; const hMax = Math.max(...bs.map(b => b.niveis)) * LH;
+      [[xa, -1], [xb, 1]].forEach(([x, s]) => {
+        por("protetor", geo.cubo, mat.amarelo, [x + s * 0.14, 0.4, z], [0.08, 0.8, D + 0.25]);
+        [-1, 1].forEach(sz => por("protetor", geo.cubo, mat.amarelo, [x + s * 0.07, 0.4, z + sz * (D / 2 + 0.1)], [0.2, 0.8, 0.07]));
+        const pl = placa("CORREDOR " + pad2(f), { fundo: "#1c2129", cor: "#ffffff", altura: 0.2, borda: "#e8892f", fonte: "700" });
+        pl.position.set(x + s * 0.06, Math.min(2.4, hMax - 0.2), z); pl.rotation.y = s * Math.PI / 2; conteudo.add(pl); placasCorr.push(pl);
+        const hitP = new THREE.Mesh(geo.cubo, mat.hit); hitP.scale.set(0.3, 1.2, D); hitP.position.set(x + s * 0.1, 2, z); hitP.userData = { corredor: Number(f) }; conteudo.add(hitP); hits.push(hitP);
+      });
+    });
+
+    // ---- paletes (madeira) + caixas de tamanhos variados + filme stretch: só onde há saldo real ----
+    const tons = ["#c8975e", "#b9874f", "#d4aa75", "#e9e8e2", "#a97b4c", "#cfa36c", "#dedbd2", "#bd8f5a"];
+    const corProd = (id) => tons[Math.abs(String(id).split("").reduce((h, ch) => (h * 31 + ch.charCodeAt(0)) | 0, 7)) % tons.length];
+    const maxQ = Math.max(1, ...Object.values(porPP).map(l => l.reduce((s, x) => s + x.qtd, 0)));
+    Object.values(L.celulas).forEach(c => {
+      const largCel = c.larg || BW; const itens = porPP[c.pp.id] || [];
+      const y0 = c.n > 1 ? c.y + 0.02 : 0;
+      const pw = Math.min(1.2, largCel - 0.3), pd = Math.min(1.0, D - 0.08);
+      const plc = placa(enderecoPP(c.pp), { fundo: "#f4f5f7", cor: "#111418", altura: 0.075, fonte: "700" });   // etiqueta de endereço na longarina
+      plc.position.set(c.x, c.n > 1 ? c.y - 0.04 : 0.09, c.z + D / 2 - 0.02); conteudo.add(plc); placasPos.push(plc);
+      const hit = new THREE.Mesh(geo.cubo, mat.hit); hit.scale.set(largCel, LH, D); hit.position.set(c.x, c.y + LH / 2, c.z); hit.userData = { ppId: c.pp.id }; conteudo.add(hit); hits.push(hit);
+      const tot = itens.reduce((s, x) => s + x.qtd, 0);
+      if (tot <= 0) return;   // posição livre: sem palete fictício
+      // palete PBR 1,2 × 1,0 m: 3 blocos-longarina, 7 tábuas de cima e 3 de baixo
+      [-0.42, 0, 0.42].forEach(oz => por("madeira", geo.cubo, mat.madeira, [c.x, y0 + 0.075, c.z + oz * pd], [pw, 0.09, 0.1], null, null, c.pp.id));
+      for (let i = 0; i < 7; i++) por("madeira", geo.cubo, mat.madeira, [c.x - pw / 2 + pw * (i + 0.5) / 7, y0 + 0.135, c.z], [pw / 7 - 0.035, 0.022, pd], null, null, c.pp.id);
+      for (let i = 0; i < 3; i++) por("madeira", geo.cubo, mat.madeira, [c.x - pw / 2 + 0.06 + (pw - 0.12) * i / 2, y0 + 0.015, c.z], [0.1, 0.02, pd], null, null, c.pp.id);
+      // quanto mais saldo, mais alta a carga; cada produto da posição com seu tom de caixa
+      const fr = Math.min(1, 0.25 + 0.75 * Math.log10(tot + 1) / Math.log10(maxQ + 1));
+      const altMax = LH - 0.45, alt = Math.max(0.3, altMax * fr);
+      let usado = 0; const base = y0 + 0.146;
+      const prods = itens.slice(0, 4);
+      prods.forEach((it, pi) => {
+        // produtos dividem a carga em fatias; cada produto tem um tamanho de caixa próprio
+        const fatia = pw / prods.length; const x0 = c.x - pw / 2 + fatia * pi;
+        const hsh = Math.abs(String(it.produtoId).split("").reduce((h, ch) => (h * 17 + ch.charCodeAt(0)) | 0, 3));
+        const bw0 = [0.3, 0.4, 0.6, 0.25][hsh % 4], bh0 = [0.28, 0.32, 0.4, 0.22][(hsh >> 2) % 4], bd0 = [0.33, 0.5, 0.25, 0.4][(hsh >> 4) % 4];
+        const nx = Math.max(1, Math.round(fatia / bw0)), nz = Math.max(1, Math.round(pd / bd0)), ny = Math.max(1, Math.round(alt / bh0));
+        const bw = fatia / nx, bd = pd / nz, bh = alt / ny;
+        const cor = corProd(it.produtoId);
+        for (let yy = 0; yy < ny; yy++) for (let xx = 0; xx < nx; xx++) for (let zz = 0; zz < nz; zz++) {
+          const j = (Math.sin(c.x * 12.9 + c.z * 78.2 + xx * 3.1 + yy * 7.7 + zz * 1.3) * 43758.5) % 1;
+          por("caixa", geo.cubo, mat.caixa, [x0 + bw * (xx + 0.5), base + bh * (yy + 0.5), c.z - pd / 2 + bd * (zz + 0.5)], [bw * 0.97, bh * 0.98, bd * (0.96 + 0.02 * j)], [0, (j - 0.5) * 0.025, 0], cor, c.pp.id);
+        }
+        usado = Math.max(usado, alt);
+      });
+      por("filme", geo.cubo, mat.filme, [c.x, base + usado / 2, c.z], [pw + 0.015, usado + 0.015, pd + 0.015], null, null, c.pp.id);
+      if (c.n === 1) por("sombraPal", geo.plano, mat.sombra, [c.x, 0.006, c.z], [pw * 1.4, pd * 1.5, 1], [-Math.PI / 2, 0, 0]);
+    });
+
+    const instancias = [];
+    Object.values(lotes).forEach(lt => {
+      const im = new THREE.InstancedMesh(lt.g, lt.m, lt.ms.length);
+      lt.ms.forEach((mm, i) => im.setMatrixAt(i, mm));
+      if (lt.cores.some(Boolean) || lt.pps.some(x => x !== null)) { lt.cores.forEach((cc, i) => im.setColorAt(i, cc || branco)); im.instanceColor.needsUpdate = true; }
+      im.castShadow = !lt.m.userData.semSombra; im.receiveShadow = !lt.m.userData.semSombra;
+      im.userData = { cores: lt.cores, pps: lt.pps };
+      lt.grupo.add(im); instancias.push(im); descartar(im);
+    });
+    st.current.hits = hits; st.current.instancias = instancias; st.current.placasPos = placasPos; st.current.placasCorr = placasCorr;
+
+    const sc = sol.shadow.camera; const raio = Math.max(p.W, p.P) * 0.62;
+    sol.position.set(p.cx - 10, H + 22, p.cz + 16); sol.target.position.set(p.cx, 0, p.cz);
+    sc.left = -raio; sc.right = raio; sc.top = raio; sc.bottom = -raio; sc.near = 2; sc.far = H + 70; sc.updateProjectionMatrix();
+
+    if (!st.current.jaEnquadrou) {
+      st.current.jaEnquadrou = true;
+      const r = Math.max(18, Math.max(p.W, p.P) * 0.95);
+      cam.alvo.set(p.cx, 0, p.cz + 4); cam.raio = r * 2.4; cam.fi = 0.3; cam.teta = -0.6;
+      st.current.voar(new THREE.Vector3(p.cx, 1, p.cz), r, 0.98, 2600, 0.6);
+      st.current.ultimaChave = "geral";
+      const d = pontoDoca(L, cfg).dentro; st.current.fp.x = d.x; st.current.fp.z = d.z; st.current.fp.yaw = Math.atan2(p.cx - d.x, p.cz - d.z);
+    }
+    setVersao(v => v + 1);
+  }, [pronto, layout, porPP, cfg]);
+
+  // ---------- destaques, rota e câmera ----------
+  useEffect(() => {
+    if (!pronto) return;
+    const { THREE, rotaGrupo, geo, T, etiqueta, voar, foco } = st.current;
+    rotaGrupo.traverse(o => { if (o.geometry && !Object.values(geo).includes(o.geometry)) o.geometry.dispose(); if (o.material && o.material.dispose) o.material.dispose(); });
+    while (rotaGrupo.children.length) rotaGrupo.remove(rotaGrupo.children[0]);
+    const L = layout; const { BW, D, LH } = L;
+    const algum = Object.keys(destaques).length > 0 && temDestaqueModo;
+    const tmp = new THREE.Color();
+    (st.current.instancias || []).forEach(im => {
+      const { cores, pps } = im.userData; if (!im.instanceColor || !pps.some(x => x !== null)) return;
+      pps.forEach((id, i) => { tmp.copy(cores[i] || new THREE.Color(1, 1, 1)); if (algum && id !== null && !destaques[id]) tmp.multiplyScalar(0.35); im.setColorAt(i, tmp); });
+      im.instanceColor.needsUpdate = true;
+    });
+    const brilhos = [];
+    Object.entries(destaques).forEach(([id, cor]) => {
+      const c = L.celulas[id]; if (!c) return;
+      const larg = (c.larg || BW) - 0.06, alt = LH - 0.1;
+      const cx = c.x, cy = c.y + LH / 2 + 0.03, cz = c.z;
+      const arestas = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(larg, alt, D + 0.06)), new THREE.LineBasicMaterial({ color: cor, transparent: true, opacity: 0.95, toneMapped: false }));
+      arestas.position.set(cx, cy, cz); rotaGrupo.add(arestas);
+      const vidro = new THREE.Mesh(geo.cubo, new THREE.MeshBasicMaterial({ color: cor, transparent: true, opacity: 0.08, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+      vidro.scale.set(larg, alt, D + 0.06); vidro.position.set(cx, cy, cz); vidro.userData = { base: 0.04, amp: 0.08 }; rotaGrupo.add(vidro); brilhos.push(vidro);
+      const chao = new THREE.Mesh(geo.plano, new THREE.MeshBasicMaterial({ map: T.brilho, color: cor, transparent: true, opacity: 0.35, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false }));
+      chao.rotation.x = -Math.PI / 2; chao.scale.set(larg * 1.1, 1.6, 1); chao.position.set(cx, 0.015, cz + D / 2 + 0.55); chao.userData = { base: 0.18, amp: 0.2 }; rotaGrupo.add(chao); brilhos.push(chao);
+    });
+    // luz localizada sobre o endereço principal
+    const pc = principal && L.celulas[principal];
+    if (pc) { foco.position.set(pc.x, pc.y + LH + 3.2, pc.z + D / 2 + 1.8); foco.target.position.set(pc.x, pc.y + LH / 2, pc.z); foco.color.set(destaques[principal] || "#bfeeff"); st.current.focoAlvo = 3.2; }
+    else st.current.focoAlvo = 0;
+
+    // rotas pelo piso: saem da DOCA 1, usam só ruas e corredores (nunca atravessam estrutura ou parede)
+    st.current.pistas = []; st.current.tracosLista = [];
+    const dentroDeFileira = (z) => L.corredores.some(f => { const zr = L.corredorZ(f) - L.A / 2 - L.D / 2; return Math.abs(z - zr) < L.D / 2 + 0.3; });
+    rotas.forEach((r, ri) => {
+      if (!r.paradas.length) return;
+      const off = (ri - (rotas.length - 1) / 2) * 0.22;   // cada rota numa "faixa" própria dentro do corredor
+      const y = 0.03 + ri * 0.004; const dk = pontoDoca(L, cfg).dentro;
+      const xL = L.xL - off, xR = L.xR + off;
+      const pts = [new THREE.Vector3(dk.x + off, y, dk.z)]; let p = pts[0];
+      const ir = (x, z) => { if (Math.abs(p.x - x) > 1e-6 || Math.abs(p.z - z) > 1e-6) { p = new THREE.Vector3(x, y, z); pts.push(p); } };
+      if (dk.x > L.xL && dk.x < L.xR && dentroDeFileira(dk.z)) ir(dk.x < (L.xL + L.xR) / 2 ? xL : xR, dk.z);
+      r.paradas.forEach((s, i) => {
+        const za = L.corredorZ(s.c.f) + off;
+        if (Math.abs(p.z - za) > 1e-6) {
+          const e = (Math.abs(p.x - xL) + Math.abs(xL - s.c.x)) <= (Math.abs(p.x - xR) + Math.abs(xR - s.c.x)) ? xL : xR;
+          ir(e, p.z); ir(e, za);
+        }
+        ir(s.c.x, za);
+        const corP = s.falta ? "#e5484d" : s.ok ? "#3fbf7f" : r.cor;
+        const num = etiqueta(s.ok ? "✓" : String(i + 1), { fundo: corP, cor: "#06131a", tam: i === r.proxima ? 0.5 : 0.38 }); num.position.set(s.c.x + off * 0.5, 0.55 + ri * 0.12, za - 0.15); rotaGrupo.add(num);
+        const marco = new THREE.Mesh(new THREE.RingGeometry(0.2, 0.28, 32), new THREE.MeshBasicMaterial({ color: corP, side: THREE.DoubleSide, toneMapped: false, transparent: true, opacity: 0.9 }));
+        marco.rotation.x = -Math.PI / 2; marco.position.set(s.c.x, 0.02 + ri * 0.003, za); rotaGrupo.add(marco);
+      });
+      // quem está separando este pedido agora: crachá com as iniciais na próxima parada
+      (aoVivo.porPedido[r.ped.id] || []).forEach((pz, k) => {
+        const alvo = r.paradas[r.proxima >= 0 ? r.proxima : r.paradas.length - 1]; if (!alvo) return;
+        const cr = etiqueta(iniciais(pz.usuario), { fundo: r.cor, cor: "#06131a", tam: 0.5 }); cr.position.set(alvo.c.x + 0.45 + k * 0.5, 1.15, L.corredorZ(alvo.c.f) + off); rotaGrupo.add(cr);
+      });
+      if (pts.length >= 2) {
+        const suave = new THREE.CurvePath();
+        for (let i = 0; i < pts.length - 1; i++) {
+          const a = pts[i], b = pts[i + 1], dab = a.distanceTo(b);
+          const ini = i === 0 ? a : a.clone().lerp(b, Math.min(0.45, 0.6 / dab));
+          const fim = i === pts.length - 2 ? b : b.clone().lerp(a, Math.min(0.45, 0.6 / dab));
+          suave.add(new THREE.LineCurve3(ini, fim));
+          if (i < pts.length - 2) { const cc = pts[i + 2]; suave.add(new THREE.QuadraticBezierCurve3(fim, b.clone(), b.clone().lerp(cc, Math.min(0.45, 0.6 / b.distanceTo(cc))))); }
+        }
+        const comp = suave.getLength(), seg = Math.max(64, Math.round(comp * 5));
+        const fita = new THREE.Mesh(new THREE.TubeGeometry(suave, seg, 0.05, 6, false), new THREE.MeshBasicMaterial({ color: r.cor, toneMapped: false, transparent: true, opacity: 0.85 }));
+        fita.scale.y = 0.25; rotaGrupo.add(fita);
+        const tr = T.tracos.clone(); tr.needsUpdate = true; tr.repeat.set(comp / 1.4, 1);
+        const luz = new THREE.Mesh(new THREE.TubeGeometry(suave, seg, 0.075, 6, false), new THREE.MeshBasicMaterial({ map: tr, color: "#ffffff", transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false, opacity: 0.8 }));
+        luz.scale.y = 0.25; rotaGrupo.add(luz); st.current.tracosLista.push(tr);
+        const acum = [0]; for (let i = 1; i < pts.length; i++) acum.push(acum[i - 1] + pts[i].distanceTo(pts[i - 1]));
+        st.current.pistas.push({ pts, acum, total: acum[acum.length - 1] });
+      }
+    });
+    // contagens acontecendo agora: crachá roxo com as iniciais de quem está contando
+    Object.entries(aoVivo.porPP).forEach(([id, lista]) => {
+      const c = L.celulas[id]; if (!c) return;
+      lista.forEach((pz, k) => {
+        const cr = etiqueta(iniciais(pz.usuario), { fundo: "#a78bfa", cor: "#120a24", tam: 0.46 });
+        cr.position.set(c.x - 0.35 + k * 0.5, c.y + LH + 0.28, c.z + D / 2 + 0.05); rotaGrupo.add(cr);
+      });
+    });
+    st.current.brilhos = brilhos;
+
+    // câmera: só voa quando o usuário muda o que está olhando (não a cada atualização em tempo real)
+    const chave = rotas.length ? "r" + pedidoId : achados ? "b" + busca.trim().toLowerCase() : selPP ? "s" + selPP : selCorredor !== null ? "c" + selCorredor : verDiverg ? "d" : "geral";
+    if (chave !== st.current.ultimaChave && !st.current.modoPessoa) {
+      st.current.ultimaChave = chave;
+      const pr = L.predio;
+      const ids = (chave === "s" + selPP ? [selPP]
+        : rotas.length ? rotas.flatMap(r => r.paradas.map(x => String(x.ppId)))
+        : achados ? [...achados.pps].map(String)
+        : verDiverg ? Object.keys(ultimaContagem)
+        : Object.keys(destaques).filter(id => !aoVivo.porPP[id] || id === String(selPP))).filter(id => L.celulas[id]);
+      if (chave === "geral") voar(new THREE.Vector3(pr.cx, 1, pr.cz), Math.max(18, Math.max(pr.W, pr.P) * 0.95), 0.98, 1300, 0.6);
+      else if (ids.length) {
+        const cs = ids.map(id => L.celulas[id]);
+        const minX = Math.min(...cs.map(c => c.x)), maxX = Math.max(...cs.map(c => c.x)), minZ = Math.min(...cs.map(c => c.z)), maxZ = Math.max(...cs.map(c => c.z));
+        const centro = new THREE.Vector3((minX + maxX) / 2, Math.min(...cs.map(c => c.y)) + LH / 2, (minZ + maxZ) / 2 + (ids.length === 1 ? 0.6 : 1.5));
+        const r = ids.length === 1 ? 7.5 : Math.max(12, Math.max(maxX - minX, maxZ - minZ) * 1.25 + 8);
+        voar(centro, r, ids.length === 1 ? 1.2 : 0.95, 1300, ids.length === 1 ? 0.25 : 0.5);
+      }
+    }
+  }, [pronto, versao, destaques, rotas, achados, verDiverg, layout, selPP, selCorredor, pedidoId, busca, principal, cfg, aoVivo, temDestaqueModo, ultimaContagem]);
+
+  // ---------- vistas de câmera ----------
+  function irVista(v) {
+    const s = st.current; if (!s.THREE || !s.layoutAtual) return;
+    const pr = s.layoutAtual.predio; const V = s.THREE.Vector3; const r = Math.max(18, Math.max(pr.W, pr.P) * 0.95);
+    s.interagiu = true;
+    if (v === "pessoa") { s.modoPessoa = true; setPessoa(true); setVista(v); s.renderer.domElement.focus(); return; }
+    s.modoPessoa = false; setPessoa(false); setVista(v);
+    if (v === "superior") s.voar(new V(pr.cx, 0, pr.cz), r * 1.05, 0.04, 1200, 0);
+    else if (v === "frontal") s.voar(new V(pr.cx, 2.5, pr.cz), r * 0.9, 1.32, 1200, 0);
+    else if (v === "iso") s.voar(new V(pr.cx, 0, pr.cz), r * 1.05, 0.955, 1200, Math.PI / 4);
+    else { setBusca(""); setPedidoId(""); setVerDiverg(false); setSelPP(null); setSelCorredor(null); setSelDoca(false); s.ultimaChave = "x"; s.voar(new V(pr.cx, 1, pr.cz), r, 0.98, 1200, 0.6); s.ultimaChave = "geral"; }
+  }
+  const segurar = (k, v) => { if (st.current.fp) st.current.fp.botoes[k] = v; };
+
+  // ---------- interface ----------
+  const totalPP = portaPaletes.length;
+  const ocupadas = portaPaletes.filter(pp => (porPP[pp.id] || []).length).length;
+  const ppSel = selPP ? portaPaletes.find(pp => pp.id === selPP) : null;
+  const contSel = ppSel ? ultimaContagem[ppSel.id] : null;
+  const C = { painel: "#141a23", borda: "#262f3d", texto: "#e7ebf2", sec: "#8a94a6", azul: "#2f6fd6", ciano: "#2fc4ee", laranja: "#e8892f", verde: "#3fbf7f", vermelho: "#e5484d" };
+  const kpi = (icone, titulo, valor, cor, barra) => (
+    <div style={{ background: C.painel, border: "1px solid " + C.borda, borderRadius: 10, padding: estreito ? "6px 9px" : "9px 13px", display: "flex", alignItems: "center", gap: 10, minWidth: estreito ? 0 : 128, flex: estreito ? "0 0 auto" : "1 1 0" }}>
+      {!estreito && <div style={{ width: 30, height: 30, borderRadius: 8, background: (cor || C.azul) + "22", display: "grid", placeItems: "center" }}><Icon name={icone} size={16} color={cor || C.azul} /></div>}
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: estreito ? 9.5 : 11, color: C.sec, whiteSpace: "nowrap" }}>{titulo}</div>
+        <div style={{ fontSize: estreito ? 14 : 18, fontWeight: 700, color: C.texto, lineHeight: 1.15 }}>{valor}</div>
+        {barra !== undefined && !estreito && <div style={{ height: 3, background: "#222b38", borderRadius: 2, marginTop: 4 }}><div style={{ width: barra + "%", height: 3, background: cor || C.azul, borderRadius: 2 }} /></div>}
+      </div>
+    </div>
+  );
+  const btn = (ativo, cor = C.ciano) => ({ padding: estreito ? "7px 10px" : "8px 13px", borderRadius: 8, border: "1px solid " + (ativo ? cor : C.borda), background: ativo ? cor + "1f" : C.painel, color: ativo ? cor : "#c4ccd8", cursor: "pointer", fontWeight: 600, fontSize: 13, whiteSpace: "nowrap" });
+  const linha = (a, b, cor) => <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "4px 0", borderTop: "1px solid #1f2733" }}><span style={{ color: C.sec }}>{a}</span><b style={{ color: cor || C.texto, textAlign: "right" }}>{b}</b></div>;
+  const titulo = (t, cor) => <div style={{ fontSize: 11, letterSpacing: 0.8, fontWeight: 700, color: cor || C.ciano, marginBottom: 8, textTransform: "uppercase" }}>{t}</div>;
+  const painelAberto = rota || achados || ppSel || verDiverg || infoCorredor || selDoca || verAoVivo;
+  const campo = (k, rotulo, passo = 0.1) => (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>{rotulo}
+      <input style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} type="number" step={passo} value={st.current.cfgRasc ? st.current.cfgRasc[k] : cfg[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.value }; setVersao(v => v + 1); }} />
+    </label>
+  );
+
+  return (
+    <div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {!estreito && <div style={{ width: 40, height: 40, borderRadius: 10, background: C.laranja + "22", display: "grid", placeItems: "center" }}><Icon name="package" size={22} color={C.laranja} /></div>}
+          <div>
+            <h1 style={{ fontSize: estreito ? 19 : 23, fontWeight: 700, lineHeight: 1.2 }}>Mapa 3D do Galpão</h1>
+            {!estreito && <div style={{ color: C.sec, fontSize: 13 }}>Visualização em tempo real do seu estoque</div>}
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 12.5, color: C.verde, background: C.verde + "18", border: "1px solid " + C.verde + "40", padding: "4px 10px", borderRadius: 20, fontWeight: 600 }}>
+            <span style={{ width: 7, height: 7, borderRadius: 4, background: C.verde }} /> Ao vivo</span>
+          <span style={{ fontSize: 12, color: C.sec }}>Atualizado {atualizado.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</span>
+          <button onClick={() => { st.current.cfgRasc = { ...cfg }; setCfgMsg(""); setCfgAberta(true); }} style={btn(false, C.laranja)}>Configurar galpão</button>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginBottom: 10, overflowX: estreito ? "auto" : "visible", flexWrap: estreito ? "nowrap" : "wrap" }}>
+        {kpi("dashboard", "Ocupação do estoque", totalPP ? Math.round(ocupadas / totalPP * 100) + "%" : "—", C.azul, totalPP ? ocupadas / totalPP * 100 : 0)}
+        {kpi("map-pin", "Porta-paletes", totalPP, C.laranja)}
+        {kpi("check-circle", "Posições ocupadas", ocupadas, C.verde)}
+        {kpi("package", "Posições livres", totalPP - ocupadas, C.sec)}
+        {kpi("clipboard-list", "Pedidos em aberto", pedidosAbertos.length, C.ciano)}
+        {kpi("barcode", "Produtos cadastrados", produtos.length, "#a78bfa")}
+      </div>
+
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div style={{ position: "relative", flex: "1 1 260px", minWidth: 0 }}>
+          <span style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", pointerEvents: "none" }}><Icon name="search" size={15} color={C.sec} /></span>
+          <input value={busca} onChange={e => { setBusca(e.target.value); if (e.target.value) { setPedidoId(""); setVerDiverg(false); setSelCorredor(null); } }}
+            placeholder="Buscar produto, SKU ou código de barras…" style={{ width: "100%", paddingLeft: 32 }} />
+        </div>
+        <select value="" onChange={e => { const v = e.target.value; if (!v) return; setPedidoIds(ids => ids.includes(v) ? ids : [...ids, v].slice(-6)); setBusca(""); setVerDiverg(false); setSelCorredor(null); }} style={{ flex: "1 1 220px" }}>
+          <option value="">{pedidoIds.length ? "+ Adicionar outro pedido à visão" : "Rota de separação: escolha pedidos abertos"}</option>
+          {pedidosAbertos.filter(p => !pedidoIds.includes(String(p.id))).map(p => <option key={p.id} value={p.id}>{p.numeroPedido} · {p.loja || ""} · {p.status}{aoVivo.porPedido[p.id] ? " · separando agora" : ""}</option>)}
+        </select>
+        <button onClick={() => { setPedidoIds(emSeparacaoAgora.slice(0, 6)); setBusca(""); setVerDiverg(false); setSelCorredor(null); }} disabled={!emSeparacaoAgora.length}
+          style={{ ...btn(false, C.ciano), opacity: emSeparacaoAgora.length ? 1 : 0.5 }}>Em separação agora ({emSeparacaoAgora.length})</button>
+        <button onClick={() => { setVerDiverg(v => !v); setBusca(""); setPedidoId(""); setSelCorredor(null); }} style={btn(verDiverg, C.vermelho)}>Divergências ({Object.keys(diverg).length})</button>
+        <button onClick={() => setVerAoVivo(v => !v)} style={btn(verAoVivo, "#a78bfa")}>
+          <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: 4, background: aoVivo.contando.length + aoVivo.separando.length ? "#a78bfa" : C.sec, marginRight: 6, verticalAlign: "middle" }} />
+          Ao vivo: {aoVivo.contando.length} contando · {aoVivo.separando.length} separando</button>
+        <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+          {[["geral", "Visão geral"], ["superior", "Superior"], ["frontal", "Frontal"], ["iso", "Isométrica"], ["pessoa", "1ª pessoa"]].map(([k, t]) => (
+            <button key={k} onClick={() => irVista(k)} style={btn(vista === k && (k !== "pessoa" || pessoa))}>{t}</button>
+          ))}
+        </div>
+      </div>
+
+      {pedidoIds.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 10 }}>
+          {rotas.map(r => (
+            <span key={r.ped.id} style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "4px 6px 4px 10px", borderRadius: 20, background: r.cor + "1c", border: "1px solid " + r.cor + "66", color: C.texto, fontSize: 12.5 }}>
+              <span style={{ width: 9, height: 9, borderRadius: 5, background: r.cor }} />
+              <b>{r.ped.numeroPedido}</b><span style={{ color: C.sec }}>{r.total ? Math.round(r.bipado / r.total * 100) : 0}%</span>
+              {(aoVivo.porPedido[r.ped.id] || []).map(pz => <span key={pz.usuario} title={pz.usuario} style={{ background: r.cor, color: "#06131a", borderRadius: 10, padding: "0 6px", fontWeight: 700, fontSize: 11 }}>{nomeCurto(pz.usuario)}</span>)}
+              <button onClick={() => setPedidoIds(ids => ids.filter(x => x !== String(r.ped.id)))} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 15, lineHeight: 1 }}>×</button>
+            </span>
+          ))}
+          <button onClick={() => setPedidoIds([])} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 12.5 }}>limpar</button>
+        </div>
+      )}
+
+      <div style={{ position: "relative", height: estreito ? "calc(100vh - 170px)" : "calc(100vh - 290px)", minHeight: estreito ? 430 : 480, borderRadius: 12, overflow: "hidden", border: "1px solid " + C.borda, background: "#0c1016" }}>
+        <div ref={caixaRef} style={{ position: "absolute", inset: 0 }} />
+        {!pronto && !erro && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: C.sec }}>Montando o galpão em 3D…</div>}
+        {erro && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "#ff8a93", padding: 20, textAlign: "center" }}>{erro}</div>}
+
+        {(!cfgSalva || layout.semPosicao.length > 0 || layout.duplicadas.length > 0) && pronto && (
+          <div style={{ position: "absolute", left: 10, top: 10, maxWidth: "min(420px, calc(100% - 20px))", background: "rgba(20,26,35,0.94)", border: "1px solid " + C.borda, borderRadius: 8, padding: "7px 10px", fontSize: 12, color: C.sec, lineHeight: 1.45 }}>
+            {!cfgSalva && <div>⚙ Medidas do galpão ainda não cadastradas — usando medidas típicas. <a onClick={() => { st.current.cfgRasc = { ...cfg }; setCfgAberta(true); }} style={{ color: C.laranja, cursor: "pointer" }}>Configurar</a></div>}
+            {layout.semPosicao.length > 0 && <div style={{ color: "#f5c06a" }}>⚠ {layout.semPosicao.length} porta-palete(s) sem corredor/letra cadastrados não aparecem no mapa.</div>}
+            {layout.duplicadas.length > 0 && <div style={{ color: "#f5c06a" }}>⚠ Posição cadastrada em duplicidade: {layout.duplicadas.join(", ")}.</div>}
+          </div>
+        )}
+
+        {pessoa && (
+          <div style={{ position: "absolute", left: 12, bottom: 12, display: "grid", gridTemplateColumns: "repeat(3, 46px)", gap: 6 }}>
+            {[[null], ["frente", "▲"], [null], ["esq", "◀"], ["tras", "▼"], ["dir", "▶"]].map(([k, t], i) => k ? (
+              <button key={i} onPointerDown={() => segurar(k, true)} onPointerUp={() => segurar(k, false)} onPointerLeave={() => segurar(k, false)}
+                style={{ height: 46, borderRadius: 10, border: "1px solid " + C.borda, background: "rgba(20,26,35,0.9)", color: C.texto, fontSize: 18, touchAction: "none" }}>{t}</button>
+            ) : <span key={i} />)}
+            {!estreito && <div style={{ gridColumn: "1 / span 3", fontSize: 11, color: C.sec, marginTop: 2 }}>W A S D ou setas · arraste para olhar · Shift corre</div>}
+          </div>
+        )}
+
+        {painelAberto && (
+          <div style={{ position: "absolute", right: estreito ? 6 : 12, bottom: estreito ? 6 : 12, top: estreito ? "auto" : 12, width: estreito ? "calc(100% - 12px)" : 340, maxHeight: estreito ? "46%" : "calc(100% - 24px)", overflow: "auto",
+            background: "rgba(18,23,31,0.96)", border: "1px solid " + C.borda, borderRadius: 12, boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 14, fontSize: 13, color: C.texto }}>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: -6, marginRight: -6 }}>
+              <button onClick={() => { setSelPP(null); setSelCorredor(null); setSelDoca(false); setBusca(""); setPedidoId(""); setVerDiverg(false); setVerAoVivo(false); }} style={{ background: "none", border: "none", color: C.sec, cursor: "pointer", fontSize: 18 }}>×</button>
+            </div>
+
+            {verAoVivo && (<div style={{ marginBottom: 12 }}>
+              {titulo("Acontecendo agora", "#a78bfa")}
+              <div style={{ fontSize: 12, color: C.sec, marginBottom: 6 }}>Contagens em andamento ({aoVivo.contando.length})</div>
+              {!aoVivo.contando.length && <div style={{ color: C.sec, fontSize: 12.5, marginBottom: 6 }}>Ninguém contando neste momento.</div>}
+              {aoVivo.contando.map((pz, i) => { const pp = portaPaletes.find(x => String(x.id) === String(pz.ppId)); return (
+                <div key={"c" + i} onClick={() => setSelPP(pp ? pp.id : null)} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderTop: "1px solid #1f2733", cursor: "pointer" }}>
+                  <span style={{ flex: "0 0 28px", height: 28, borderRadius: 14, background: "#a78bfa", color: "#120a24", fontWeight: 800, fontSize: 11.5, display: "grid", placeItems: "center" }}>{iniciais(pz.usuario)}</span>
+                  <div style={{ minWidth: 0 }}>
+                    <div><b>{nomeCurto(pz.usuario)}</b> contando <b style={{ color: "#c4b5fd" }}>{pp ? enderecoPP(pp) : pz.ppCodigo}</b></div>
+                    <div style={{ fontSize: 12, color: C.sec }}>{pz.itens || 0} produto(s) · {pz.pecas || 0} peça(s) bipadas{pz.desde ? " · desde " + new Date(pz.desde).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : ""}</div>
+                  </div>
+                </div>); })}
+              <div style={{ fontSize: 12, color: C.sec, margin: "10px 0 6px" }}>Separações em andamento ({aoVivo.separando.length})</div>
+              {!aoVivo.separando.length && <div style={{ color: C.sec, fontSize: 12.5 }}>Ninguém separando neste momento.</div>}
+              {aoVivo.separando.map((pz, i) => { const ped = pedidos.find(p => String(p.id) === String(pz.pedidoId)); const its = ped ? (itensPorPedido[ped.id] || []) : [];
+                const tot = its.reduce((s2, x) => s2 + x.quantidade, 0), bip = its.reduce((s2, x) => s2 + Math.min(x.quantidade, x.quantidadeBipada), 0); return (
+                <div key={"s" + i} onClick={() => ped && setPedidoIds(ids => ids.includes(String(ped.id)) ? ids : [...ids, String(ped.id)])} style={{ display: "flex", gap: 10, alignItems: "center", padding: "7px 0", borderTop: "1px solid #1f2733", cursor: "pointer" }}>
+                  <span style={{ flex: "0 0 28px", height: 28, borderRadius: 14, background: C.ciano, color: "#06131a", fontWeight: 800, fontSize: 11.5, display: "grid", placeItems: "center" }}>{iniciais(pz.usuario)}</span>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div><b>{nomeCurto(pz.usuario)}</b> separando <b style={{ color: C.ciano }}>{ped ? ped.numeroPedido : pz.numeroPedido}</b></div>
+                    <div style={{ height: 4, background: "#222b38", borderRadius: 2, marginTop: 4 }}><div style={{ width: (tot ? bip / tot * 100 : 0) + "%", height: 4, background: C.verde, borderRadius: 2 }} /></div>
+                    <div style={{ fontSize: 11.5, color: C.sec, marginTop: 2 }}>{bip} de {tot} peças · toque para ver a rota</div>
+                  </div>
+                </div>); })}
+            </div>)}
+
+            {rotas.map(rota => (<div key={rota.ped.id} style={{ marginBottom: 14 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                <span style={{ width: 10, height: 10, borderRadius: 5, background: rota.cor }} />
+                <div style={{ fontSize: 11, letterSpacing: 0.8, fontWeight: 700, color: rota.cor, textTransform: "uppercase" }}>Rota · {rota.ped.numeroPedido}</div>
+                {(aoVivo.porPedido[rota.ped.id] || []).map(pz => <span key={pz.usuario} style={{ fontSize: 11, background: rota.cor, color: "#06131a", borderRadius: 10, padding: "1px 7px", fontWeight: 700 }}>{nomeCurto(pz.usuario)} separando</span>)}
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.sec, marginBottom: 4 }}><span>{rota.bipado} de {rota.total} peças separadas</span><span>{rota.total ? Math.round(rota.bipado / rota.total * 100) : 0}%</span></div>
+              <div style={{ height: 5, background: "#222b38", borderRadius: 3, marginBottom: 10 }}><div style={{ width: (rota.total ? rota.bipado / rota.total * 100 : 0) + "%", height: 5, background: C.verde, borderRadius: 3, transition: "width .4s" }} /></div>
+              {rota.alertas.map((a, i) => <div key={i} style={{ borderLeft: "3px solid " + (a.tipo === "insuficiente" ? C.vermelho : "#f5a524"), background: "#1b2029", padding: "6px 8px", borderRadius: 6, marginBottom: 6, fontSize: 12.5, color: a.tipo === "insuficiente" ? "#ff9aa0" : "#f5c06a" }}>{a.tipo === "insuficiente" ? "Estoque insuficiente — " : ""}{a.texto}</div>)}
+              {rota.paradas.map((s, i) => (
+                <div key={s.ppId} onClick={() => setSelPP(s.ppId)} style={{ display: "flex", gap: 10, padding: "7px 0", borderTop: "1px solid #1f2733", cursor: "pointer", opacity: s.ok ? 0.6 : 1 }}>
+                  <span style={{ flex: "0 0 22px", height: 22, borderRadius: 11, fontSize: 12, background: s.falta ? C.vermelho : s.ok ? C.verde : rota.cor, color: "#06131a", fontWeight: 800, display: "grid", placeItems: "center" }}>{s.ok ? "✓" : i + 1}</span>
+                  <div style={{ minWidth: 0 }}>
+                    <div style={{ fontWeight: 700 }}>{enderecoPP(s.c.pp)} <span style={{ color: C.sec, fontWeight: 500 }}>{s.c.pp.codigo}</span>{i === rota.proxima && <span style={{ color: rota.cor, fontSize: 11, marginLeft: 6 }}>PRÓXIMA</span>}</div>
+                    {s.itens.map((it, j) => <div key={j} style={{ color: "#aeb7c6", fontSize: 12.5 }}>coletar <b style={{ color: "#fff" }}>{it.qtd}</b> · {it.nome}{it.feito > 0 && it.feito < it.qtd ? ` (${it.feito} já)` : ""}</div>)}
+                  </div>
+                </div>
+              ))}
+              {!rota.paradas.length && !rota.alertas.length && <div style={{ color: C.sec }}>Pedido sem itens.</div>}
+            </div>))}
+
+            {!rota && achados && (<div style={{ marginBottom: 12 }}>
+              {titulo("Produto localizado · " + achados.linhas.length)}
+              {!achados.linhas.length && <div style={{ color: C.sec }}>Nenhum produto encontrado.</div>}
+              {achados.linhas.map(({ p, locais }) => { const sit = situacao(p); return (
+                <div key={p.id} style={{ padding: "8px 0", borderTop: "1px solid #1f2733" }}>
+                  <div style={{ fontWeight: 700, marginBottom: 4 }}>{p.nome}</div>
+                  {linha("SKU", p.sku || "—")}{linha("Código de barras", p.codigoBarras || "—")}{linha("Quantidade em estoque", `${p.qtd} ${p.unidade || "un"}`)}{linha("Situação", sit.t, sit.c)}
+                  {locais.length ? locais.map(l => { const pp = portaPaletes.find(x => x.id === l.ppId); return pp && (
+                    <div key={l.ppId} onClick={() => setSelPP(l.ppId)} style={{ marginTop: 6, background: "#18202b", border: "1px solid " + C.borda, borderRadius: 8, padding: "6px 8px", cursor: "pointer" }}>
+                      <div style={{ color: C.ciano, fontWeight: 700 }}>{enderecoPP(pp)} <span style={{ color: C.sec, fontWeight: 500 }}>{pp.codigo}</span></div>
+                      <div style={{ color: C.sec, fontSize: 12 }}>Corredor {pad2(pp.fileira)} · Posição {String(pp.porta).toUpperCase()} · Nível {pad2(pp.nivel)} — {l.qtd ? l.qtd + " un." : "endereço cadastrado, sem saldo"}</div>
+                    </div>); }) : <div style={{ color: "#f5a524", marginTop: 4 }}>Sem porta-palete definida</div>}
+                </div>); })}
+            </div>)}
+
+            {!rota && !achados && verDiverg && !ppSel && (<div style={{ marginBottom: 12 }}>
+              {titulo("Divergências da última contagem", C.vermelho)}
+              {!Object.keys(diverg).length && <div style={{ color: C.verde }}>Nenhuma divergência: as últimas contagens bateram com o sistema.</div>}
+              {Object.values(diverg).map(c => (
+                <div key={c.id} onClick={() => setSelPP(c.porta_palete_id)} style={{ padding: "8px 0", borderTop: "1px solid #1f2733", cursor: "pointer" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}><b>{(() => { const pp = portaPaletes.find(x => x.id === c.porta_palete_id); return pp ? enderecoPP(pp) : c.porta_palete; })()}</b><b style={{ color: C.vermelho }}>{c.diferenca_total > 0 ? "+" : ""}{c.diferenca_total} un.</b></div>
+                  {(itensContagem[c.id] || []).filter(x => x.diferenca).map(x => <div key={x.id} style={{ fontSize: 12, color: "#aeb7c6" }}>{x.produto}: registrado {x.qtd_sistema} · contado {x.qtd_contada} · <b style={{ color: x.diferenca < 0 ? C.vermelho : "#f5a524" }}>{x.diferenca > 0 ? "+" : ""}{x.diferenca}</b></div>)}
+                  <div style={{ fontSize: 11.5, color: C.sec }}>{new Date(c.created_at).toLocaleString("pt-BR")} · {c.usuario || "—"}</div>
+                </div>
+              ))}
+              {Object.keys(ultimaContagem).length > Object.keys(diverg).length && <div style={{ fontSize: 12, color: C.verde, marginTop: 8 }}>● {Object.keys(ultimaContagem).length - Object.keys(diverg).length} posição(ões) conferida(s) sem divergência (em verde no mapa).</div>}
+            </div>)}
+
+            {infoCorredor && !ppSel && (<div style={{ marginBottom: 12 }}>
+              {titulo("Corredor " + pad2(infoCorredor.f), C.laranja)}
+              {linha("Porta-paletes", infoCorredor.total)}{linha("Posições ocupadas", infoCorredor.ocupadas, C.verde)}{linha("Posições livres", infoCorredor.livres)}
+              {linha("Ocupação", infoCorredor.pct + "%")}{linha("Divergências", infoCorredor.divergencias, infoCorredor.divergencias ? C.vermelho : C.verde)}
+              <div style={{ height: 5, background: "#222b38", borderRadius: 3, margin: "8px 0" }}><div style={{ width: infoCorredor.pct + "%", height: 5, background: C.laranja, borderRadius: 3 }} /></div>
+              <div style={{ fontSize: 12, color: C.sec, margin: "8px 0 4px" }}>Produtos armazenados ({infoCorredor.produtos.length})</div>
+              {infoCorredor.produtos.slice(0, 20).map((x, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}><span style={{ color: "#c4ccd8" }}>{x.nome}</span><b>{x.qtd}</b></div>)}
+            </div>)}
+
+            {selDoca && !ppSel && (<div style={{ marginBottom: 12 }}>
+              {titulo("Doca 1", "#f2c200")}
+              {linha("Entradas hoje", infoDoca.entradas.length + " · " + infoDoca.entradas.reduce((s, m) => s + m.quantidade, 0) + " un.", C.verde)}
+              {linha("Saídas hoje", infoDoca.saidas.length + " · " + infoDoca.saidas.reduce((s, m) => s + m.quantidade, 0) + " un.", C.laranja)}
+              <div style={{ fontSize: 12, color: C.sec, margin: "8px 0 4px" }}>Últimas movimentações</div>
+              {infoDoca.ultimas.map(m => <div key={m.tipo + m.id} style={{ fontSize: 12.5, padding: "3px 0", borderTop: "1px solid #1f2733" }}><b style={{ color: m.tipo === "Entrada" ? C.verde : C.laranja }}>{m.tipo}</b> · {(prodPorId[String(m.produtoId)] || {}).nome || "Produto"} · {m.quantidade} un. <span style={{ color: C.sec }}>{m.data ? new Date(m.data).toLocaleString("pt-BR", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) : ""}</span></div>)}
+              {!infoDoca.ultimas.length && <div style={{ color: C.sec }}>Sem movimentações registradas.</div>}
+            </div>)}
+
+            {ppSel && (<div style={{ borderTop: (rota || achados || verDiverg) ? "1px solid " + C.borda : "none", paddingTop: (rota || achados || verDiverg) ? 12 : 0 }}>
+              {titulo("Endereço", C.ciano)}
+              <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: 0.5 }}>{enderecoPP(ppSel)} <span style={{ fontSize: 13, color: C.sec, fontWeight: 500 }}>{ppSel.codigo}</span></div>
+              <div style={{ color: C.sec, fontSize: 12, margin: "2px 0 8px" }}>Corredor {pad2(ppSel.fileira)} · Posição {String(ppSel.porta || "").toUpperCase()} · Nível {pad2(ppSel.nivel)}</div>
+              {(porPP[ppSel.id] || []).length ? (porPP[ppSel.id] || []).map(it => (
+                <div key={it.produtoId} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "5px 0", borderTop: "1px solid #1f2733" }}>
+                  <span>{it.produto ? it.produto.nome : "Produto"}<div style={{ fontSize: 11.5, color: C.sec }}>{it.produto ? "SKU " + (it.produto.sku || "—") : ""}</div></span><b>{it.qtd}</b>
+                </div>
+              )) : <div style={{ color: C.sec, padding: "4px 0" }}>Posição livre</div>}
+              <div style={{ marginTop: 10, background: "#18202b", border: "1px solid " + C.borda, borderRadius: 8, padding: "8px 10px" }}>
+                {contSel ? (<>
+                  <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: C.sec, fontSize: 12 }}>Última contagem</span><b style={{ color: contSel.diferenca_total ? C.vermelho : C.verde, fontSize: 12 }}>{contSel.diferenca_total ? "Divergência " + (contSel.diferenca_total > 0 ? "+" : "") + contSel.diferenca_total : "Conferida ✓"}</b></div>
+                  <div style={{ fontSize: 12, color: "#c4ccd8" }}>{new Date(contSel.created_at).toLocaleString("pt-BR")} · {contSel.usuario || "—"}</div>
+                  {(itensContagem[contSel.id] || []).filter(x => x.diferenca).map(x => <div key={x.id} style={{ fontSize: 12, color: "#aeb7c6", marginTop: 3 }}>{x.produto}: registrado {x.qtd_sistema} · contado {x.qtd_contada} · <b style={{ color: x.diferenca < 0 ? C.vermelho : "#f5a524" }}>{x.diferenca > 0 ? "+" : ""}{x.diferenca}</b></div>)}
+                </>) : <span style={{ color: C.sec, fontSize: 12 }}>Ainda não contada</span>}
+              </div>
+            </div>)}
+          </div>
+        )}
+      </div>
+
+      {cfgAberta && (
+        <div onClick={() => setCfgAberta(false)} style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)", zIndex: 1000, display: "grid", placeItems: "center", padding: 16 }}>
+          <div onClick={e => e.stopPropagation()} style={{ background: "#141a23", border: "1px solid " + C.borda, borderRadius: 14, padding: 20, width: "min(560px, 100%)", maxHeight: "90vh", overflow: "auto", color: C.texto }}>
+            <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 4 }}>Configurar galpão</div>
+            <div style={{ fontSize: 12.5, color: C.sec, marginBottom: 14 }}>Medidas físicas em metros. Valem para todos os usuários. Corredores, letras e níveis vêm do cadastro de porta-paletes.</div>
+            <div style={{ display: "grid", gridTemplateColumns: estreito ? "1fr 1fr" : "1fr 1fr 1fr", gap: 10 }}>
+              {campo("larguraBaia", "Largura do vão (m)")}{campo("profundidade", "Profundidade da estrutura (m)")}{campo("alturaNivel", "Altura entre níveis (m)")}
+              {campo("larguraCorredor", "Largura do corredor (m)")}{campo("peDireito", "Pé-direito (m)", 0.5)}{campo("margem", "Espaço livre nas laterais (m)", 0.5)}
+              {campo("docaLargura", "Largura da doca (m)")}
+              <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>Parede da doca
+                <select style={{ width: "100%", minWidth: 0 }} value={(st.current.cfgRasc || cfg).docaParede} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), docaParede: e.target.value }; setVersao(v => v + 1); }}>
+                  <option value="fundo">Fundo</option><option value="frente">Frente</option><option value="esquerda">Esquerda</option><option value="direita">Direita</option>
+                </select></label>
+              {campo("docaPosicao", "Posição da doca na parede (0 a 1)", 0.05)}
+            </div>
+            <div style={{ display: "flex", gap: 16, marginTop: 12, flexWrap: "wrap", fontSize: 13 }}>
+              {[["inverterLetras", "Inverter sentido das letras"], ["inverterCorredores", "Inverter ordem dos corredores"]].map(([k, t]) => (
+                <label key={k} style={{ display: "flex", gap: 6, alignItems: "center", cursor: "pointer" }}><input type="checkbox" checked={!!(st.current.cfgRasc || cfg)[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.checked }; setVersao(v => v + 1); }} />{t}</label>
+              ))}
+            </div>
+            {cfgMsg && <div style={{ color: "#ff9aa0", fontSize: 12.5, marginTop: 10 }}>{cfgMsg}</div>}
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 16 }}>
+              <button onClick={() => { st.current.cfgRasc = { ...GALPAO_PADRAO }; setVersao(v => v + 1); }} style={btn(false)}>Restaurar padrão</button>
+              <button onClick={() => setCfgAberta(false)} style={btn(false)}>Cancelar</button>
+              <button onClick={() => salvarCfg(st.current.cfgRasc || cfg)} style={{ ...btn(true, C.laranja), background: C.laranja, color: "#111" }}>Salvar</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Ordem natural das porta-paletes: corredor/fileira (1, 2, 3… 10), depois letra (A, B, C…),
+// depois nível (1, 2, 3…). Maiúscula e minúscula contam igual. Sem posição vai para o fim.
+function compararPortaPaletes(a, b) {
+  const num = (v) => (v === null || v === undefined || v === "" || isNaN(Number(v))) ? Infinity : Number(v);
+  const txt = (v) => String(v || "").trim().toUpperCase() || "\uffff";
+  return (num(a.fileira) - num(b.fileira)) ||
+    txt(a.porta).localeCompare(txt(b.porta), "pt-BR", { numeric: true }) ||
+    (num(a.nivel) - num(b.nivel)) ||
+    String(a.codigo || "").localeCompare(String(b.codigo || ""), "pt-BR", { numeric: true });
+}
+
 function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const [tela, setTela] = useState(() => {
     if (usuarioLogado.admin) return "dashboard";
     return (usuarioLogado.permissoes || [])[0] || "dashboard";
   });
+  const [menuCel, setMenuCel] = useState(false); // menu lateral como gaveta no celular
   const [empresas, setEmpresas] = useState([]);
   const [fornecedores, setFornecedores] = useState([]);
   const [produtos, setProdutos] = useState([]);
@@ -604,22 +1824,21 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
 
   async function recarregarTudo() {
     try {
-      const [empRes, forRes, estRes, notRes, entRes, saiRes] = await Promise.all([
-        supabaseClient.from("empresas").select("*").order("created_at"),
-        supabaseClient.from("fornecedores").select("*").order("created_at"),
-        supabaseClient.from("estoque").select("*").order("created_at"),
-        supabaseClient.from("notas_fiscais").select("*").order("created_at"),
-        supabaseClient.from("entradas").select("*").order("data", { ascending: false }),
-        supabaseClient.from("saidas").select("*").order("data", { ascending: false }),
+      const [empRows, forRows, estRows, notRows, entRows, saiRows] = await Promise.all([
+        buscarTodos("empresas", "created_at"),
+        buscarTodos("fornecedores", "created_at"),
+        buscarTodos("estoque", "created_at"),
+        buscarTodos("notas_fiscais", "created_at"),
+        buscarTodos("entradas", "data", false),
+        buscarTodos("saidas", "data", false),
       ]);
-      [empRes, forRes, estRes, notRes, entRes, saiRes].forEach(r => { if (r.error) throw r.error; });
-      setEmpresas((empRes.data || []).map(rowToEmpresa));
-      setFornecedores((forRes.data || []).map(rowToFornecedor));
-      setProdutos((estRes.data || []).map(rowToProduto));
-      setNotas((notRes.data || []).map(rowToNota));
+      setEmpresas(empRows.map(rowToEmpresa));
+      setFornecedores(forRows.map(rowToFornecedor));
+      setProdutos(estRows.map(rowToProduto));
+      setNotas(notRows.map(rowToNota));
       const movs = [
-        ...(entRes.data || []).map(rowToEntrada),
-        ...(saiRes.data || []).map(rowToSaida),
+        ...entRows.map(rowToEntrada),
+        ...saiRows.map(rowToSaida),
       ].sort((a, b) => new Date(b.data) - new Date(a.data));
       setMovimentacoes(movs);
       setErroConexao(null);
@@ -646,7 +1865,10 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const [confirmDelete, setConfirmDelete] = useState(null);
 
   // ==== PORTA-PALETES (módulo novo — isolado do restante do sistema) ====
-  const [portaPaletes, setPortaPaletes] = useState([]);
+  const [portaPaletesBase, setPortaPaletes] = useState([]);
+  // Sempre em ordem (corredor → letra → nível), em todas as telas e listas,
+  // inclusive quando uma porta-palete nova é cadastrada.
+  const portaPaletes = useMemo(() => [...portaPaletesBase].sort(compararPortaPaletes), [portaPaletesBase]);
   const [carregandoPortaPaletes, setCarregandoPortaPaletes] = useState(true);
   const [modalPortaPalete, setModalPortaPalete] = useState(null);
   const [modalVerProdutosPP, setModalVerProdutosPP] = useState(null);
@@ -693,17 +1915,10 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
     try { return JSON.parse(localStorage.getItem("ppEscolhaSepar") || "{}"); } catch (e) { return {}; }
   });
   // Quanto foi bipado de cada porta-palete em cada item { [itemId]: { [ppId | "auto"]: qtd } }.
-  // Assim o mesmo produto pode sair de vários porta-paletes no mesmo pedido.
-  const [ppAlocSepar, setPpAlocSepar] = useState(() => {
-    try { return JSON.parse(localStorage.getItem("ppAlocSepar") || "{}"); } catch (e) { return {}; }
-  });
-  function salvarAlocSepar(fn) {
-    setPpAlocSepar(prev => {
-      const n = fn(prev);
-      try { localStorage.setItem("ppAlocSepar", JSON.stringify(n)); } catch (e) {}
-      return n;
-    });
-  }
+  // Vem do banco (tabela itens_separacao_alocacao): todos os celulares que separam o mesmo
+  // pedido enxergam o mesmo. A escolha "Retirar de" (ppEscolhaSepar) é de cada aparelho.
+  const [ppAlocSepar, setPpAlocSepar] = useState({});
+  const pedidoAbertoRef = useRef(null);
   function escolherPPItemSepar(itemId, ppId) {
     setPpEscolhaSepar(prev => {
       const n = { ...prev };
@@ -802,6 +2017,8 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
       if (codigoPortaPaleteRef.current) codigoPortaPaleteRef.current.value = codigo;
     } else if (scannerAlvo === "quickadd_portapalete") {
       if (codigoQuickAddPPRef.current) codigoQuickAddPPRef.current.value = codigo;
+    } else if (scannerAlvo === "contagem") {
+      handleScanContagem(codigo);
     } else if (scannerAlvo === "separacaoPP") {
       handleScanPP(codigo);
     }
@@ -813,7 +2030,7 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const portaPaleteById = (id) => portaPaletes.find(pp => pp.id === Number(id));
   const portaPaleteByCodigo = (codigo) => portaPaletes.find(pp => (pp.codigo || "").toUpperCase() === String(codigo).trim().toUpperCase());
   const portaPaleteLabel = (pp) => pp ? [pp.fileira, pp.porta, pp.nivel].filter(Boolean).join("-") : "—";
-  const portaPaleteDoProduto = (p) => portaPaletes.find(pp => pp.fileira === p.fileira && pp.porta === p.porta && pp.nivel === p.nivel);
+  const portaPaleteDoProduto = (p) => portaPaletes.find(pp => pp.fileira === p.fileira && String(pp.porta || "").toUpperCase() === String(p.porta || "").toUpperCase() && pp.nivel === p.nivel);
   // Quanto do produto está em cada porta-palete. O total do produto (estoque.qtd) manda:
   // - sobra (ex.: entrada por NF/PDF) vai para a porta-palete "principal" do produto;
   // - falta (ex.: baixa feita em outro lugar) é descontada, começando pela principal.
@@ -836,15 +2053,7 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const qtdNaPP = (p, ppId) => (distribuicaoDoProduto(p).find(r => r.ppId === ppId)?.qtd) || 0;
   const produtosDaPortaPalete = (pp) => !pp ? [] : produtos
     .map(p => ({ ...p, qtdPP: qtdNaPP(p, pp.id) }))
-    .filter(p => p.qtdPP > 0 || (p.qtd === 0 && p.fileira === pp.fileira && p.porta === pp.porta && p.nivel === pp.nivel));
-  // Desconta "qtd" da lista de distribuição. ppId undefined = automático (principal primeiro).
-  const descontarDist = (dist, qtd, ppId) => {
-    const nova = dist.map(r => ({ ...r }));
-    let resta = qtd;
-    const alvo = ppId === undefined ? nova : nova.filter(r => r.ppId === ppId);
-    for (const r of alvo) { const t = Math.min(r.qtd, resta); r.qtd -= t; resta -= t; if (resta <= 0) break; }
-    return nova.filter(r => r.qtd > 0);
-  };
+    .filter(p => p.qtdPP > 0 || (p.qtd === 0 && p.fileira === pp.fileira && String(p.porta || "").toUpperCase() === String(pp.porta || "").toUpperCase() && p.nivel === pp.nivel));
   // Retorna TODAS as localizações em texto de um produto (primária + extras), já que hoje
   // o sistema só guarda uma quantidade total por produto — não há quantidade por local.
   const localizacoesDoProduto = (p) => {
@@ -883,6 +2092,13 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
       const texto = [p.nome, p.sku, p.codigoBarras, p.marca, fornecedorNome(p.fornecedorId), locaisDoProduto(p).join(" ")]
         .join(" ").toLowerCase();
       return termos.every(t => texto.includes(t));
+    }).sort((a, b) => {
+      // Agrupa por fornecedor (A→Z; sem fornecedor no fim) e, dentro dele, por nome do produto.
+      const fa = fornecedorNome(a.fornecedorId), fb = fornecedorNome(b.fornecedorId);
+      const sa = fa === "—", sb = fb === "—";
+      if (sa !== sb) return sa ? 1 : -1;
+      return fa.localeCompare(fb, "pt-BR", { sensitivity: "base", numeric: true }) ||
+        String(a.nome || "").localeCompare(String(b.nome || ""), "pt-BR", { sensitivity: "base", numeric: true });
     });
   }, [produtos, buscaEstoque, filtroFornecedorEst, filtroLocalEst, apenasComEstoque, fornecedores]);
 
@@ -1023,6 +2239,10 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   async function salvarProduto(dados) {
     const row = produtoToRow(dados);
     if (dados.id) {
+      // Com várias pessoas mexendo no estoque, só regrava a quantidade se ela foi alterada
+      // neste formulário (senão uma tela antiga desfaria baixas feitas por outras pessoas).
+      if (Number(dados.qtd) === Number(modalProduto && modalProduto.qtd)) delete row.qtd;
+      delete row.ultima_saida;
       const { error } = await supabaseClient.from("estoque").update(row).eq("id", dados.id);
       if (error) { alert("Erro ao salvar produto: " + error.message); return; }
     } else {
@@ -1089,62 +2309,21 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     setConfirmDelete(null);
   }
 
-  // Grava quanto do produto está em cada porta-palete (tabela estoque_pp).
-  async function gravarDistribuicao(produtoId, lista) {
-    const validos = lista.filter(r => r.ppId && r.qtd > 0);
-    const manter = new Set(validos.map(r => r.ppId));
-    const apagar = estoquePP.filter(r => r.produtoId === produtoId && !manter.has(r.ppId)).map(r => r.id);
-    if (validos.length) {
-      const { error } = await supabaseClient.from("estoque_pp").upsert(
-        validos.map(r => ({ produto_id: produtoId, porta_palete_id: r.ppId, qtd: r.qtd })),
-        { onConflict: "produto_id,porta_palete_id" });
-      if (error) throw error;
-    }
-    if (apagar.length) {
-      const { error } = await supabaseClient.from("estoque_pp").delete().in("id", apagar);
-      if (error) throw error;
-    }
-  }
 
-  // Salva a distribuição por porta-palete + campos do produto (qtd total, última saída...) e
-  // garante que a localização em texto do produto inclua todas as porta-paletes onde ele tem estoque.
-  async function persistirEstoque(produto, dist, extra = {}) {
-    await gravarDistribuicao(produto.id, dist);
-    const primaria = [produto.fileira, produto.porta, produto.nivel].filter(Boolean).join("-");
-    const tokens = String(produto.localizacao || primaria).split("|").map(x => x.trim()).filter(Boolean);
-    dist.filter(r => r.ppId && r.qtd > 0).forEach(r => {
-      const l = portaPaleteLabel(portaPaleteById(r.ppId));
-      if (l && l !== "—" && !tokens.includes(l)) tokens.push(l);
-    });
-    const update = { ...extra };
-    const txt = tokens.join(" | ");
-    if (!("localizacao" in update) && txt !== (produto.localizacao || "")) update.localizacao = txt;
-    if (Object.keys(update).length) {
-      const { error } = await supabaseClient.from("estoque").update(update).eq("id", produto.id);
-      if (error) throw error;
-    }
-  }
 
   // Move QUANTIDADE de um produto de uma porta-palete (ou "sem porta-palete") para outra.
   // O estoque total do produto não muda.
   async function transferirParaPP(produtoId, origemPpId, destinoPpId, qtd) {
-    const produto = produtos.find(p => p.id === Number(produtoId));
+    const produto = produtos.find(p => String(p.id) === String(produtoId));  // id pode ser número ou UUID
     const dest = portaPaleteById(destinoPpId);
     if (!produto || !dest) return;
     qtd = Number(qtd);
     if (!qtd || qtd < 1) { alert("Informe quantas unidades vão ser movidas pra cá."); return; }
-    const dist = distribuicaoDoProduto(produto).map(r => ({ ...r }));
-    const origem = dist.find(r => r.ppId === origemPpId);
-    if (!origem || qtd > origem.qtd) { alert(`Só há ${origem ? origem.qtd : 0} un. no local de origem.`); return; }
-    origem.qtd -= qtd;
-    const d = dist.find(r => r.ppId === dest.id);
-    if (d) d.qtd += qtd; else dist.push({ ppId: dest.id, qtd });
-    try {
-      await persistirEstoque(produto, dist.filter(r => r.qtd > 0));
-      await recarregarTudo();
-    } catch (e) {
-      alert("Erro ao mover quantidade: " + e.message + "\n\nConfira se a tabela estoque_pp foi criada no Supabase (rode o arquivo estoque_pp.sql).");
-    }
+    const { error } = await supabaseClient.rpc("mover_qtd_pp", {
+      p_produto_id: produto.id, p_origem_pp_id: origemPpId ?? null, p_destino_pp_id: dest.id, p_qtd: qtd,
+    });
+    if (error) alert("Não foi possível mover: " + error.message);
+    await recarregarTudo();
   }
 
   // Corrige a quantidade de um produto dentro de UMA porta-palete. O estoque total é ajustado na diferença.
@@ -1155,16 +2334,11 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     const nova = parseInt(txt);
     if (isNaN(nova) || nova < 0) { alert("Quantidade inválida."); return; }
     if (nova === atual) return;
-    const dist = distribuicaoDoProduto(produto).map(r => ({ ...r }));
-    const r = dist.find(x => x.ppId === pp.id);
-    if (r) r.qtd = nova; else dist.push({ ppId: pp.id, qtd: nova });
-    const total = dist.reduce((t, x) => t + x.qtd, 0);
-    try {
-      await persistirEstoque(produto, dist.filter(x => x.qtd > 0), { qtd: total });
-      await recarregarTudo();
-    } catch (e) {
-      alert("Erro ao ajustar quantidade: " + e.message + "\n\nConfira se a tabela estoque_pp foi criada no Supabase (rode o arquivo estoque_pp.sql).");
-    }
+    const { error } = await supabaseClient.rpc("ajustar_qtd_pp", {
+      p_produto_id: produto.id, p_pp_id: pp.id, p_nova_qtd: nova, p_usuario: usuarioLogado.email,
+    });
+    if (error) alert("Erro ao ajustar quantidade: " + error.message);
+    await Promise.all([recarregarTudo(), recarregarContagens()]);
   }
 
   function abrirQuickAdd(tipo, onCreated) {
@@ -1239,7 +2413,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     if (!qtd || qtd < 1) { setEntradaErro("Informe uma quantidade maior que zero."); return; }
     setSalvandoEntrada(true);
     try {
-      let produtoId, produtoCriado = false, desfazer = null;
+      let produtoId, produtoCriado = false;
 
       if (entradaModo === "novo") {
         const sku = (d.sku || "").trim();
@@ -1268,18 +2442,16 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
         const produto = produtos.find(p => String(p.id) === String(entradaProdutoId));
         if (!produto) { setEntradaErro("Selecione um produto (ou cadastre um novo)."); return; }
         const pp = portaPaleteById(entradaPPSel);
-        const distAntes = distribuicaoDoProduto(produto).map(r => ({ ...r }));
-        const distNova = distAntes.map(r => ({ ...r }));
-        if (pp) {
-          const r = distNova.find(x => x.ppId === pp.id);
-          if (r) r.qtd += qtd; else distNova.push({ ppId: pp.id, qtd });
-          if (!(d.obs || "").trim()) d.obs = portaPaleteLabel(pp);
-        }
-        try {
-          await persistirEstoque(produto, distNova, { qtd: produto.qtd + qtd });
-        } catch (errProd) { setEntradaErro("Erro ao atualizar o estoque: " + errProd.message); return; }
-        produtoId = produto.id;
-        desfazer = { produto, distAntes };
+        // Entrada feita no banco, com trava (registrar_entrada): soma no estoque total,
+        // na porta-palete escolhida e grava a entrada — tudo de uma vez.
+        const { error: errEnt } = await supabaseClient.rpc("registrar_entrada", {
+          p_produto_id: produto.id, p_qtd: qtd, p_pp_id: pp ? pp.id : null,
+          p_numero_nf: d.numeroNf || null, p_obs: d.obs || null, p_usuario: usuarioLogado.email,
+        });
+        if (errEnt) { setEntradaErro("Erro ao registrar a entrada: " + errEnt.message); return; }
+        await recarregarTudo();
+        setModalEntrada(false);
+        return;
       }
 
       const { error: errMov } = await supabaseClient.from("entradas").insert({
@@ -1287,11 +2459,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
         numero_nf: d.numeroNf, observacoes: d.obs, usuario: usuarioLogado.email,
       });
       if (errMov) {
-        // desfaz o passo anterior para não deixar estoque sem movimentação
+        // desfaz o cadastro para não deixar produto novo sem a entrada registrada
         if (produtoCriado) await supabaseClient.from("estoque").delete().eq("id", produtoId);
-        else if (desfazer) {
-          try { await persistirEstoque(desfazer.produto, desfazer.distAntes, { qtd: desfazer.produto.qtd, localizacao: desfazer.produto.localizacao || "" }); } catch (_) {}
-        }
         setEntradaErro("Erro ao registrar a entrada: " + errMov.message); return;
       }
       await recarregarTudo();
@@ -1301,41 +2470,19 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }
   }
 
-  async function registrarEntrada(dados) {
-    const produto = produtos.find(p => p.id === dados.produtoId);
-    if (!produto) { alert("Selecione um produto válido."); return; }
-    const novaQtd = produto.qtd + Number(dados.quantidade);
-    const { error: errProd } = await supabaseClient.from("estoque").update({ qtd: novaQtd }).eq("id", produto.id);
-    if (errProd) { alert("Erro ao atualizar estoque: " + errProd.message); return; }
-    const { error: errMov } = await supabaseClient.from("entradas").insert({
-      produto_id: dados.produtoId, quantidade: Number(dados.quantidade),
-      numero_nf: dados.numeroNf, observacoes: dados.obs, usuario: usuarioLogado.email,
-    });
-    if (errMov) { alert("Erro ao registrar entrada: " + errMov.message); return; }
-    await recarregarTudo();
-    setModalEntrada(false);
-  }
 
   async function registrarSaida(dados) {
-    const produto = produtos.find(p => p.id === dados.produtoId);
+    const produto = produtos.find(p => String(p.id) === String(dados.produtoId));
     if (!produto) { alert("Selecione um produto válido."); return; }
     const qtdSaida = Number(dados.quantidade);
-    const ppId = dados.ppId ? Number(dados.ppId) : undefined;
-    if (ppId !== undefined) {
-      const disp = qtdNaPP(produto, ppId);
-      if (qtdSaida > disp) { alert(`Só há ${disp} un. de ${produto.nome} nessa porta-palete.`); return; }
-    }
-    const novaQtd = Math.max(0, produto.qtd - qtdSaida);
-    const hoje = new Date().toISOString().slice(0, 10);
-    try {
-      await persistirEstoque(produto, descontarDist(distribuicaoDoProduto(produto), qtdSaida, ppId), { qtd: novaQtd, ultima_saida: hoje });
-    } catch (errProd) { alert("Erro ao atualizar estoque: " + errProd.message); return; }
-    const labelPP = ppId !== undefined ? portaPaleteLabel(portaPaleteById(ppId)) : "";
-    const { error: errMov } = await supabaseClient.from("saidas").insert({
-      produto_id: dados.produtoId, quantidade: qtdSaida,
-      destino: dados.destino, motivo: [dados.motivo, labelPP ? `(${labelPP})` : ""].filter(Boolean).join(" "), usuario: usuarioLogado.email,
+    const ppId = dados.ppId ? Number(dados.ppId) : null;
+    // Saída feita no banco, com trava (registrar_saida): confere o estoque, baixa da
+    // porta-palete escolhida (ou automático) e grava a saída — tudo de uma vez.
+    const { error } = await supabaseClient.rpc("registrar_saida", {
+      p_produto_id: produto.id, p_qtd: qtdSaida, p_pp_id: ppId,
+      p_destino: dados.destino || null, p_motivo: dados.motivo || null, p_usuario: usuarioLogado.email,
     });
-    if (errMov) { alert("Erro ao registrar saída: " + errMov.message); return; }
+    if (error) { alert("Saída não registrada: " + error.message); await recarregarTudo(); return; }
     setSaidaPPSel("");
     await recarregarTudo();
     setModalSaida(false);
@@ -1449,7 +2596,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   // Finaliza a separação: dá baixa automática no estoque (tabela "estoque") e registra
   // cada item como uma saída (tabela "saidas"), exatamente como a saída manual já faz.
   async function finalizarSepPP() {
-    if (itensSeparPP.length === 0) return;
+    if (itensSeparPP.length === 0 || finalizandoSeparPP) return;
     const erros = itensSeparPP.filter(i => i.qtd > i.estoqueAtual);
     if (erros.length > 0) {
       setSepMsgPP({ tipo: "erro", texto: `Estoque insuficiente: ${erros.map(e => e.nome).join(", ")}` });
@@ -1457,28 +2604,16 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }
     setFinalizandoSeparPP(true);
     try {
-      const hoje = new Date().toISOString().slice(0, 10);
-      // Agrupa por produto (o mesmo produto pode sair de mais de um porta-palete na mesma separação)
-      const porProduto = new Map();
-      for (const item of itensSeparPP) {
-        const produto = produtos.find(p => p.id === item.produtoId);
-        if (!produto) continue;
-        const reg = porProduto.get(produto.id) || { produto, dist: distribuicaoDoProduto(produto), total: 0 };
-        reg.dist = descontarDist(reg.dist, item.qtd, item.ppId || undefined);
-        reg.total += item.qtd;
-        porProduto.set(produto.id, reg);
-      }
-      for (const { produto, dist, total } of porProduto.values()) {
-        await persistirEstoque(produto, dist, { qtd: Math.max(0, produto.qtd - total), ultima_saida: hoje });
-      }
-      for (const item of itensSeparPP) {
-        if (!porProduto.has(item.produtoId)) continue;
-        const { error: errMov } = await supabaseClient.from("saidas").insert({
-          produto_id: item.produtoId, quantidade: item.qtd,
-          destino: "Separação por porta-palete", motivo: `Separação de pedido${item.ppLabel ? ` · ${item.ppLabel}` : ""}`,
-          usuario: usuarioLogado.email,
-        });
-        if (errMov) throw errMov;
+      // A baixa (estoque total + porta-palete + saídas) é feita de uma vez no banco, com trava:
+      // se dois celulares baixarem o mesmo produto ao mesmo tempo, nenhuma baixa se perde.
+      const { error } = await supabaseClient.rpc("baixar_separacao_pp", {
+        p_itens: itensSeparPP.map(i => ({ produto_id: i.produtoId, pp_id: i.ppId || null, qtd: i.qtd })),
+        p_usuario: usuarioLogado.email,
+      });
+      if (error) {
+        setSepMsgPP({ tipo: "erro", texto: "Nada foi baixado: " + error.message });
+        await recarregarTudo();
+        return;
       }
       await recarregarTudo();
       setSepMsgPP({ tipo: "ok", texto: `✓ Separação finalizada! Baixa dada em ${itensSeparPP.length} produto(s).` });
@@ -1785,32 +2920,14 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     const hoje = new Date().toISOString().slice(0, 10);
 
     try {
-      for (const item of itensValidos) {
-        const qtd = Number(item.quantidade);
-        const existente = produtos.find(p => (p.sku || "").toLowerCase() === String(item.codigo).toLowerCase());
-        let produtoId;
-        if (existente) {
-          const { error } = await supabaseClient.from("estoque").update({ qtd: existente.qtd + qtd }).eq("id", existente.id);
-          if (error) throw error;
-          produtoId = existente.id;
-        } else {
-          const { data, error } = await supabaseClient.from("estoque").insert({
-            sku: item.codigo, produto: item.descricao || `Produto ${item.codigo}`,
-            fornecedor_id: fornecedorIdAtual, empresa_id: empresaIdAtual,
-            unidade: item.unidade || "UN", fileira: 1, porta: "A", nivel: 1,
-            localizacao: "1-A-1", qtd, qtd_min: 0, qtd_max: 0, status: "Ativo",
-          }).select().single();
-          if (error) throw error;
-          produtoId = data.id;
-        }
-        const { error: errMov } = await supabaseClient.from("entradas").insert({
-          produto_id: produtoId, quantidade: qtd,
-          numero_nf: pdfPreview.numero || modalNota?.numero || "",
-          observacoes: existente ? "Importado automaticamente via PDF da NF (item já existente)" : "Produto novo cadastrado automaticamente via PDF da NF",
-          usuario: usuarioLogado.email,
-        });
-        if (errMov) throw errMov;
-      }
+      // Importação feita no banco, numa única operação (importar_itens_nf): soma nos produtos
+      // existentes (pelo SKU), cadastra os novos e grava as entradas. Se der erro, nada é gravado.
+      const { error } = await supabaseClient.rpc("importar_itens_nf", {
+        p_itens: itensValidos.map(it => ({ codigo: String(it.codigo), descricao: it.descricao || "", unidade: it.unidade || "UN", quantidade: Number(it.quantidade) })),
+        p_empresa_id: empresaIdAtual || null, p_fornecedor_id: fornecedorIdAtual || null,
+        p_numero_nf: pdfPreview.numero || modalNota?.numero || "", p_usuario: usuarioLogado.email,
+      });
+      if (error) throw error;
       await recarregarTudo();
       setPdfPreview(null);
       setPdfErro(null);
@@ -1824,20 +2941,27 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   // ==== SEPARAÇÃO DE PEDIDOS: carregamento (isolado do recarregarTudo original) ====
   async function recarregarSeparacao() {
     try {
-      const [pedRes, itRes, logRes] = await Promise.all([
-        supabaseClient.from("pedidos_separacao").select("*").order("created_at", { ascending: false }),
-        supabaseClient.from("itens_pedidos_separacao").select("*"),
+      const [pedRows, itRows, alocRows, logRes] = await Promise.all([
+        buscarTodos("pedidos_separacao", "created_at", false),
+        buscarTodos("itens_pedidos_separacao", "id"),
+        buscarTodos("itens_separacao_alocacao", "id"),
         supabaseClient.from("logs_separacao").select("*").order("data", { ascending: false }).limit(500),
       ]);
-      [pedRes, itRes, logRes].forEach(r => { if (r.error) throw r.error; });
-      setPedidosSeparacao((pedRes.data || []).map(rowToPedidoSeparacao));
+      if (logRes.error) throw logRes.error;
+      setPedidosSeparacao(pedRows.map(rowToPedidoSeparacao));
       const agrupado = {};
-      (itRes.data || []).map(rowToItemSeparacao).forEach(it => {
+      itRows.map(rowToItemSeparacao).forEach(it => {
         if (!agrupado[it.pedidoId]) agrupado[it.pedidoId] = [];
         agrupado[it.pedidoId].push(it);
       });
       setItensSeparacaoPorPedido(agrupado);
-      setLogsSeparacao((logRes.data || []).map(rowToLogSeparacao));
+      setPpAlocSepar(alocacoesParaMapa(alocRows));
+      const novosLogs = (logRes.data || []).map(rowToLogSeparacao);
+      // mantém o histórico completo do pedido aberto (carregado à parte)
+      setLogsSeparacao(prev => {
+        const ids = new Set(novosLogs.map(l => l.id));
+        return [...novosLogs, ...prev.filter(l => !ids.has(l.id) && pedidoAbertoRef.current && l.pedidoId === pedidoAbertoRef.current)];
+      });
     } catch (e) {
       console.error("Erro ao carregar dados de separação de pedidos:", e);
     } finally {
@@ -1845,14 +2969,287 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }
   }
 
+  // Histórico completo de um pedido (o carregamento geral traz só os 500 registros mais recentes)
+  async function carregarHistoricoPedido(pedidoId) {
+    const { data, error } = await supabaseClient.from("logs_separacao").select("*").eq("pedido_id", pedidoId).order("data", { ascending: false }).limit(2000);
+    if (error) return;
+    const doPedido = (data || []).map(rowToLogSeparacao);
+    setLogsSeparacao(prev => {
+      const ids = new Set(doPedido.map(l => l.id));
+      return [...prev.filter(l => !ids.has(l.id)), ...doPedido].sort((a, b) => new Date(b.data) - new Date(a.data));
+    });
+  }
+
   useEffect(() => { recarregarSeparacao(); }, []);
+
+  // Pedido aberto: guarda o id e carrega o histórico completo dele
+  useEffect(() => {
+    pedidoAbertoRef.current = pedidoSeparAtivo ? pedidoSeparAtivo.id : null;
+    if (pedidoSeparAtivo) carregarHistoricoPedido(pedidoSeparAtivo.id);
+  }, [pedidoSeparAtivo && pedidoSeparAtivo.id]);
+
+  // ==== CONTAGEM DE ESTOQUE (por porta-palete) ====
+  // Cada pessoa conta uma porta-palete: bipa a etiqueta, bipa os produtos e finaliza.
+  // A contagem é aplicada no banco (aplicar_contagem_pp), com trava e histórico de quem contou.
+  const chaveRascunhoCont = "contagemRascunho:" + (usuarioLogado.email || "");
+  const rascunhoCont = (() => { try { return JSON.parse(localStorage.getItem(chaveRascunhoCont) || "null"); } catch (e) { return null; } })();
+  const [contPP, setContPP] = useState(rascunhoCont ? rascunhoCont.pp : null);  // { id, codigo, label, ultimaContagemId, iniciadaEm }
+  const [contItens, setContItens] = useState(rascunhoCont ? rascunhoCont.itens : {}); // { [produtoId]: qtd contada }
+  const [contOrdem, setContOrdem] = useState(rascunhoCont ? rascunhoCont.ordem : []); // último bipado primeiro
+  const [contScan, setContScan] = useState("");
+  const [contModo, setContModo] = useState("bip"); // 'bip' | 'digitar'
+  const [contMsg, setContMsg] = useState(rascunhoCont && rascunhoCont.pp ? { tipo: "info", texto: `Contagem de ${rascunhoCont.pp.codigo} recuperada — continue de onde parou.` } : null);
+  const [contZerar, setContZerar] = useState(true);
+  const [contConfirmar, setContConfirmar] = useState(false);
+  const [contAplicando, setContAplicando] = useState(false);
+  const [contagens, setContagens] = useState([]);
+  const [contagemAberta, setContagemAberta] = useState(null); // { contagem, itens }
+  const contScanRef = useRef(null);
+
+  // rascunho salvo no aparelho: se a bateria acabar ou a página fechar, a contagem não se perde
+  useEffect(() => {
+    try {
+      if (contPP) localStorage.setItem(chaveRascunhoCont, JSON.stringify({ pp: contPP, itens: contItens, ordem: contOrdem }));
+      else localStorage.removeItem(chaveRascunhoCont);
+    } catch (e) {}
+  }, [contPP, contItens, contOrdem]);
+
+  useEffect(() => {
+    if (tela === "contagem" && contScanRef.current && !contConfirmar) contScanRef.current.focus();
+  }, [tela, contPP, contMsg, contConfirmar]);
+
+  async function recarregarContagens() {
+    const { data, error } = await supabaseClient.from("contagens").select("*").order("id", { ascending: false }).limit(50);
+    if (!error) setContagens(data || []);
+  }
+  useEffect(() => { recarregarContagens(); }, []);
+
+  async function abrirContagemHistorico(c) {
+    const { data, error } = await supabaseClient.from("contagem_itens").select("*").eq("contagem_id", c.id).order("id");
+    if (error) { alert("Erro ao abrir contagem: " + error.message); return; }
+    setContagemAberta({ contagem: c, itens: data || [] });
+  }
+
+  async function iniciarContagem(pp) {
+    // guarda qual era a última contagem desta porta-palete: se outra pessoa aplicar uma
+    // contagem nela enquanto você conta, o sistema avisa em vez de sobrescrever.
+    const { data, error } = await supabaseClient.from("contagens").select("id")
+      .eq("porta_palete_id", pp.id).eq("origem", "Contagem").order("id", { ascending: false }).limit(1);
+    if (error) { setContMsg({ tipo: "erro", texto: "Erro ao iniciar contagem: " + error.message }); return; }
+    setContPP({ id: pp.id, codigo: pp.codigo, label: portaPaleteLabel(pp), ultimaContagemId: data && data[0] ? data[0].id : 0, iniciadaEm: new Date().toISOString() });
+    setContItens({}); setContOrdem([]); setContConfirmar(false);
+    tocarSom("ok");
+    setContMsg({ tipo: "info", texto: `Contando ${pp.codigo} (${portaPaleteLabel(pp)}). Agora bipe cada produto desta porta-palete.` });
+  }
+
+  function cancelarContagem() {
+    if (contPP && Object.keys(contItens).length > 0 && !confirm(`Descartar a contagem de ${contPP.codigo}? Nada foi aplicado ainda.`)) return;
+    setContPP(null); setContItens({}); setContOrdem([]); setContConfirmar(false); setContMsg(null);
+  }
+
+  function somarNaContagem(prod, qtd) {
+    setContItens(prev => ({ ...prev, [prod.id]: (Number(prev[prod.id]) || 0) + qtd }));
+    setContOrdem(prev => [prod.id, ...prev.filter(x => x !== prod.id)]);
+  }
+  function definirNaContagem(prodId, valor) {
+    setContItens(prev => ({ ...prev, [prodId]: valor === "" ? "" : Math.max(0, parseInt(valor) || 0) }));
+    setContOrdem(prev => prev.includes(prodId) ? prev : [prodId, ...prev]);
+  }
+  function tirarDaContagem(prodId) {
+    setContItens(prev => { const n = { ...prev }; delete n[prodId]; return n; });
+    setContOrdem(prev => prev.filter(x => x !== prodId));
+  }
+
+  const contEsperados = contPP ? produtosDaPortaPalete(portaPaleteById(contPP.id)) : [];
+  const contLinhas = (() => {
+    if (!contPP) return [];
+    const esperadoPorId = new Map(contEsperados.map(p => [p.id, p]));
+    const ids = [...contOrdem.filter(id => contItens[id] !== undefined), ...contEsperados.map(p => p.id).filter(id => contItens[id] === undefined)];
+    return [...new Set(ids)].map(id => {
+      const prod = produtos.find(p => p.id === id) || esperadoPorId.get(id);
+      if (!prod) return null;
+      const sistema = esperadoPorId.has(id) ? esperadoPorId.get(id).qtdPP : 0;
+      const contadoBruto = contItens[id];
+      const contado = contadoBruto === undefined || contadoBruto === "" ? null : Number(contadoBruto);
+      const dif = contado !== null ? contado - sistema : (contZerar ? -sistema : null);
+      return { prod, sistema, contado, dif, esperado: esperadoPorId.has(id) };
+    }).filter(Boolean);
+  })();
+
+  function handleScanContagem(raw) {
+    const val = (raw || "").trim();
+    setContScan("");
+    if (!val) return;
+    const pp = portaPaleteByCodigo(val);
+    if (pp) {
+      if (contPP && contPP.id === pp.id) { setContMsg({ tipo: "info", texto: `Você já está contando ${pp.codigo}.` }); return; }
+      if (contPP && Object.keys(contItens).length > 0 && !confirm(`Você está no meio da contagem de ${contPP.codigo}. Descartar e começar ${pp.codigo}?`)) return;
+      iniciarContagem(pp);
+      return;
+    }
+    if (!contPP) {
+      tocarSom("erro");
+      setContMsg({ tipo: "erro", texto: `Bipe primeiro a etiqueta da porta-palete. "${val}" não é uma porta-palete cadastrada.` });
+      return;
+    }
+    const prod = produtos.find(p =>
+      (p.codigoBarras && String(p.codigoBarras).toUpperCase() === val.toUpperCase()) ||
+      (p.sku && String(p.sku).toUpperCase() === val.toUpperCase()));
+    if (!prod) {
+      tocarSom("erro");
+      setContMsg({ tipo: "erro", texto: `Código "${val}" não encontrado no cadastro de produtos.` });
+      return;
+    }
+    let qtd = 1;
+    if (contModo === "digitar") {
+      const n = parseInt(window.prompt(`Quantidade de "${prod.nome}" (soma ao que já foi contado):`));
+      if (!(n > 0)) return;
+      qtd = n;
+    }
+    somarNaContagem(prod, qtd);
+    const esperado = contEsperados.some(p => p.id === prod.id);
+    tocarSom("ok");
+    setContMsg({ tipo: esperado ? "ok" : "info", texto: `+${qtd} ${prod.nome} — contado: ${(Number(contItens[prod.id]) || 0) + qtd}${esperado ? "" : " · este produto não estava cadastrado nesta porta-palete (será incluído nela)"}` });
+  }
+
+  async function aplicarContagem() {
+    if (!contPP || contAplicando) return;
+    setContAplicando(true);
+    try {
+      const itens = Object.entries(contItens)
+        .filter(([, q]) => q !== "" && q !== undefined && q !== null)
+        .map(([pid, q]) => ({ produto_id: /^\d+$/.test(pid) ? Number(pid) : pid, qtd: Number(q) || 0 }));  // id pode ser número ou UUID
+      const { data, error } = await supabaseClient.rpc("aplicar_contagem_pp", {
+        p_pp_id: contPP.id, p_itens: itens, p_usuario: usuarioLogado.email,
+        p_ultima_contagem_id: contPP.ultimaContagemId, p_iniciada_em: contPP.iniciadaEm,
+        p_zerar_nao_contados: contZerar,
+      });
+      if (error) {
+        tocarSom("erro");
+        setContConfirmar(false);
+        setContMsg({ tipo: "erro", texto: "Contagem NÃO aplicada: " + error.message });
+        return;
+      }
+      tocarSom("completo");
+      const dt = Number(data.diferenca_total) || 0;
+      setContMsg({ tipo: "ok", texto: `✓ Contagem de ${contPP.codigo} aplicada: ${data.itens} produto(s), ${data.itens_alterados} com diferença (${dt > 0 ? "+" : ""}${dt} un. no total).` });
+      setContPP(null); setContItens({}); setContOrdem([]); setContConfirmar(false);
+      await Promise.all([recarregarTudo(), recarregarContagens()]);
+    } finally {
+      setContAplicando(false);
+    }
+  }
+
+  // ==== TEMPO REAL ====
+  // Quando qualquer pessoa bipa, baixa, move ou conta, as telas de todos os aparelhos se
+  // atualizam sozinhas (Supabase Realtime). Bipadas atualizam só a linha que mudou.
+  const recarregarRef = useRef({});
+  recarregarRef.current = { recarregarTudo, recarregarPortaPaletes, recarregarSeparacao, recarregarContagens };
+  useEffect(() => {
+    const timers = {};
+    // junta várias mudanças seguidas numa recarga só (no máximo 1 a cada ~1 s por grupo)
+    const agendar = (grupo, ms = 900) => {
+      if (timers[grupo]) return;
+      timers[grupo] = setTimeout(() => {
+        delete timers[grupo];
+        const r = recarregarRef.current;
+        if (grupo === "estoque") { r.recarregarTudo(); r.recarregarPortaPaletes(); }
+        else if (grupo === "separacao") r.recarregarSeparacao();
+        else if (grupo === "contagens") r.recarregarContagens();
+      }, ms);
+    };
+    const grupoDaTabela = {
+      estoque: "estoque", estoque_pp: "estoque", porta_paletes: "estoque",
+      entradas: "estoque", saidas: "estoque", notas_fiscais: "estoque",
+      pedidos_separacao: "separacao", itens_pedidos_separacao: "separacao",
+      itens_separacao_alocacao: "separacao", logs_separacao: "separacao", contagens: "contagens",
+    };
+    let canal = null;
+    if (supabaseClient.channel) {
+      canal = supabaseClient.channel("stockctrl-modulo");
+      Object.keys(grupoDaTabela).forEach(tabela => {
+        canal.on("postgres_changes", { event: "*", schema: "public", table: tabela }, (payload) => {
+          const novo = payload && payload.new;
+          if (tabela === "itens_pedidos_separacao" && payload.eventType === "UPDATE" && novo && novo.id) {
+            const it = rowToItemSeparacao(novo);
+            setItensSeparacaoPorPedido(prev => ({
+              ...prev,
+              [it.pedidoId]: (prev[it.pedidoId] || []).map(x => x.id === it.id ? { ...x, quantidadeBipada: it.quantidadeBipada } : x),
+            }));
+            return;
+          }
+          if (tabela === "itens_separacao_alocacao" && novo && novo.item_id) {
+            setPpAlocSepar(prev => ({ ...prev, [novo.item_id]: { ...(prev[novo.item_id] || {}), [novo.porta_palete_id ?? "auto"]: Number(novo.qtd) || 0 } }));
+            return;
+          }
+          if (tabela === "logs_separacao" && payload.eventType === "INSERT" && novo && novo.id) {
+            const l = rowToLogSeparacao(novo);
+            setLogsSeparacao(prev => prev.some(x => x.id === l.id) ? prev : [l, ...prev]);
+            return;
+          }
+          agendar(grupoDaTabela[tabela]);
+        });
+      });
+      canal.subscribe();
+    }
+    // aparelho que ficou com a tela apagada ou sem internet: ao voltar, recarrega tudo
+    const aoVoltar = () => {
+      if (document.visibilityState === "visible") { agendar("estoque", 50); agendar("separacao", 50); agendar("contagens", 50); }
+    };
+    document.addEventListener("visibilitychange", aoVoltar);
+    window.addEventListener("online", aoVoltar);
+    return () => {
+      if (canal && supabaseClient.removeChannel) supabaseClient.removeChannel(canal);
+      document.removeEventListener("visibilitychange", aoVoltar);
+      window.removeEventListener("online", aoVoltar);
+      Object.values(timers).forEach(clearTimeout);
+    };
+  }, []);
+
+
+  // ==== AO VIVO: quem está contando / separando agora ====
+  // Cada aparelho avisa os outros (Supabase Realtime Presence) o que está fazendo. Não grava nada
+  // no banco: quando a pessoa fecha a tela ou perde a conexão, some sozinho do mapa.
+  const [presencas, setPresencas] = useState([]);
+  const presencaCanalRef = useRef(null);
+  const presencaDadosRef = useRef(null);
+  presencaDadosRef.current = contPP
+    ? { tipo: "contagem", usuario: usuarioLogado.email, ppId: contPP.id, ppCodigo: contPP.codigo,
+        itens: Object.values(contItens || {}).filter(q => Number(q) > 0).length,
+        pecas: Object.values(contItens || {}).reduce((s, q) => s + (Number(q) || 0), 0), desde: contPP.iniciadaEm || null }
+    : (tela === "separacao" && pedidoSeparAtivo)
+      ? { tipo: "separacao", usuario: usuarioLogado.email, pedidoId: pedidoSeparAtivo.id, numeroPedido: pedidoSeparAtivo.numeroPedido, desde: pedidoSeparAtivo.separacaoIniciadaAt || null }
+      : { tipo: null, usuario: usuarioLogado.email };
+  const assinaturaPresenca = JSON.stringify(presencaDadosRef.current);
+  function enviarPresenca() {
+    const c = presencaCanalRef.current;
+    if (!c || !c.track) return;
+    try { const r = c.track({ ...presencaDadosRef.current, t: Date.now() }); if (r && r.catch) r.catch(() => {}); } catch (e) {}
+  }
+  useEffect(() => {
+    if (!supabaseClient.channel) return;
+    const chave = (usuarioLogado.email || "anon") + ":" + Math.random().toString(36).slice(2, 8);
+    const canal = supabaseClient.channel("stockctrl-presenca", { config: { presence: { key: chave } } });
+    canal.on("presence", { event: "sync" }, () => {
+      const estado = canal.presenceState ? canal.presenceState() : {};
+      const lista = [];
+      Object.values(estado).forEach(arr => (arr || []).forEach(p => { if (p && p.tipo) lista.push(p); }));
+      setPresencas(lista);
+    });
+    canal.subscribe((status) => { if (status === "SUBSCRIBED") { presencaCanalRef.current = canal; enviarPresenca(); } });
+    return () => {
+      presencaCanalRef.current = null;
+      try { canal.untrack && canal.untrack(); } catch (e) {}
+      if (supabaseClient.removeChannel) supabaseClient.removeChannel(canal);
+    };
+  }, []);
+  useEffect(() => { enviarPresenca(); }, [assinaturaPresenca]);
 
   // ==== PORTA-PALETES: carregamento (isolado do recarregarTudo original) ====
   async function recarregarPortaPaletes() {
     try {
-      const { data, error } = await supabaseClient.from("porta_paletes").select("*").order("created_at");
-      if (error) throw error;
-      setPortaPaletes((data || []).map(rowToPortaPalete));
+      const linhas = await buscarTodos("porta_paletes", "created_at");
+      setPortaPaletes(linhas.map(rowToPortaPalete));
     } catch (e) {
       console.error("Erro ao carregar porta-paletes:", e);
     } finally {
@@ -1864,9 +3261,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
 
   async function recarregarEstoquePP() {
     try {
-      const { data, error } = await supabaseClient.from("estoque_pp").select("*");
-      if (error) throw error;
-      setEstoquePP((data || []).map(r => ({ id: r.id, produtoId: r.produto_id, ppId: r.porta_palete_id, qtd: Number(r.qtd) || 0 })));
+      const linhas = await buscarTodos("estoque_pp", "id");
+      setEstoquePP(linhas.map(r => ({ id: r.id, produtoId: r.produto_id, ppId: r.porta_palete_id, qtd: Number(r.qtd) || 0 })));
     } catch (e) {
       console.error("Erro ao carregar quantidades por porta-palete (a tabela estoque_pp existe?):", e);
     }
@@ -2065,122 +3461,70 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       setScanMsgSepar({ tipo: "erro", texto: `Produto "${codigo}" não pertence a este pedido.` });
       return;
     }
+    // Conferência rápida com o que está na tela (o banco confere de novo, com os números atuais)
     if (item.quantidadeBipada >= item.quantidade) {
       tocarSom("erro");
       setScanMsgSepar({ tipo: "excesso", texto: `Quantidade excedida para: ${item.descricao}` });
       return;
     }
-    const novaQtd = item.quantidadeBipada + qtdAdicional;
-    if (novaQtd > item.quantidade) {
+    if (item.quantidadeBipada + qtdAdicional > item.quantidade) {
       tocarSom("erro");
       setScanMsgSepar({ tipo: "excesso", texto: `Quantidade excedida para: ${item.descricao} — restam apenas ${item.quantidade - item.quantidadeBipada}, você tentou adicionar ${qtdAdicional}.` });
       return;
     }
-    // Porta-palete escolhido para este item: não deixa bipar mais do que existe nele
     const ppEsc = ppEscolhaSepar[item.id];
-    const prodItem = produtos.find(p => p.id === item.produtoId);
     const ppEscLabel = ppEsc ? portaPaleteLabel(portaPaleteById(ppEsc)) : "";
-    if (ppEsc && prodItem) {
-      const dispPP = qtdNaPP(prodItem, ppEsc);
-      // soma o que já foi bipado deste produto nesse porta-palete (em qualquer item do pedido)
-      const jaDoPP = getItensDoPedidoSepar(pedidoSeparAtivo.id)
-        .filter(it => it.produtoId === item.produtoId)
-        .reduce((t, it) => t + ((ppAlocSepar[it.id] || {})[ppEsc] || 0), 0);
-      if (jaDoPP + qtdAdicional > dispPP) {
-        tocarSom("erro");
-        setScanMsgSepar({ tipo: "erro", texto: `${item.descricao}: só há ${dispPP} un. em ${ppEscLabel}${jaDoPP ? ` (já bipou ${jaDoPP})` : ""}. Escolha outro porta-palete em "Retirar de" para continuar.` });
-        return;
-      }
+    setScanQtdSepar(1);
+    // A bipada é SOMADA no banco (bipar_item_separacao): várias pessoas podem bipar o mesmo
+    // pedido ao mesmo tempo sem uma apagar a contagem da outra.
+    const { data, error } = await supabaseClient.rpc("bipar_item_separacao", {
+      p_item_id: item.id, p_qtd: qtdAdicional, p_pp_id: ppEsc ? Number(ppEsc) : null, p_usuario: usuarioLogado.email,
+    });
+    if (error) {
+      tocarSom("erro");
+      setScanMsgSepar({ tipo: /Quantidade excedida/i.test(error.message) ? "excesso" : "erro", texto: error.message });
+      recarregarSeparacao();
+      return;
     }
-    const chaveAloc = ppEsc ? String(ppEsc) : "auto";
-    salvarAlocSepar(prev => ({ ...prev, [item.id]: { ...(prev[item.id] || {}), [chaveAloc]: ((prev[item.id] || {})[chaveAloc] || 0) + qtdAdicional } }));
+    const novaQtd = Number(data.quantidade_bipada);
     setItensSeparacaoPorPedido(prev => ({
       ...prev,
-      [pedidoSeparAtivo.id]: (prev[pedidoSeparAtivo.id] || []).map(it => it.id === item.id ? { ...it, quantidadeBipada: novaQtd } : it),
+      [item.pedidoId]: (prev[item.pedidoId] || []).map(it => it.id === item.id ? { ...it, quantidadeBipada: Math.max(it.quantidadeBipada, novaQtd) } : it),
     }));
+    // atualiza "Bipado: ..." deste item com o que está no banco
+    supabaseClient.from("itens_separacao_alocacao").select("*").eq("item_id", item.id).then(({ data: linhas }) => {
+      if (!linhas) return;
+      const m = alocacoesParaMapa(linhas);
+      setPpAlocSepar(prev => ({ ...prev, [item.id]: m[item.id] || {} }));
+    });
     const completo = novaQtd >= item.quantidade;
     tocarSom(completo ? "completo" : "ok");
     setScanMsgSepar({ tipo: "ok", texto: `✓ ${item.descricao} +${qtdAdicional}${completo ? " — COMPLETO!" : ` (${novaQtd}/${item.quantidade})`}${ppEscLabel ? ` · de ${ppEscLabel}` : ""}` });
-    setScanQtdSepar(1);
-    const { error } = await supabaseClient.from("itens_pedidos_separacao").update({ quantidade_bipada: novaQtd }).eq("id", item.id);
-    if (error) {
-      // reverte otimisticamente se a gravação falhar
-      setItensSeparacaoPorPedido(prev => ({
-        ...prev,
-        [pedidoSeparAtivo.id]: (prev[pedidoSeparAtivo.id] || []).map(it => it.id === item.id ? { ...it, quantidadeBipada: item.quantidadeBipada } : it),
-      }));
-      tocarSom("erro");
-      setScanMsgSepar({ tipo: "erro", texto: "Erro ao registrar leitura: " + error.message });
-      return;
-    }
-    await supabaseClient.from("logs_separacao").insert({
-      pedido_id: pedidoSeparAtivo.id, numero_pedido: pedidoSeparAtivo.numeroPedido,
-      usuario: usuarioLogado.email, acao: "Produto bipado", produto: item.descricao + (ppEscLabel ? ` (${ppEscLabel})` : ""), quantidade: qtdAdicional,
-    });
   }
 
   async function finalizarSeparacaoPedido() {
-    if (!pedidoSeparAtivo) return;
+    if (!pedidoSeparAtivo || finalizandoSepar) return;
     setFinalizandoSepar(true);
     try {
-      // Monta como ficará a distribuição por porta-palete depois da baixa
       const itensFin = getItensDoPedidoSepar(pedidoSeparAtivo.id);
-      const planos = [];
-      // por item: o que foi bipado em cada porta-palete + o que sobrou sem porta-palete (automático)
-      const retiradas = (it) => {
-        const aloc = ppAlocSepar[it.id] || {};
-        const especificas = Object.entries(aloc).filter(([k, q]) => k !== "auto" && q > 0).map(([k, q]) => ({ ppId: Number(k), qtd: q }));
-        const somaEsp = especificas.reduce((t, r) => t + r.qtd, 0);
-        return { especificas, auto: Math.max(0, it.quantidadeBipada - somaEsp) };
-      };
-      const idsProdutos = [...new Set(itensFin.filter(it => retiradas(it).especificas.length > 0).map(it => it.produtoId))];
-      for (const pid of idsProdutos) {
-        const produto = produtos.find(p => p.id === pid);
-        if (!produto) continue;
-        const original = distribuicaoDoProduto(produto);
-        let nova = original.map(r => ({ ...r }));
-        const doProduto = itensFin.filter(it => it.produtoId === pid);
-        // primeiro o que tem porta-palete definido, depois o automático
-        for (const it of doProduto) {
-          for (const r of retiradas(it).especificas) {
-            const disp = nova.find(x => x.ppId === r.ppId)?.qtd || 0;
-            if (r.qtd > disp) {
-              alert(`⛔ Operação cancelada — nenhuma baixa foi aplicada:\n\n${it.descricao}: só há ${disp} un. em ${portaPaleteLabel(portaPaleteById(r.ppId))}, mas foram bipadas ${r.qtd}.`);
-              return;
-            }
-            nova = descontarDist(nova, r.qtd, r.ppId);
-          }
-        }
-        for (const it of doProduto) {
-          const a = retiradas(it).auto;
-          if (a > 0) nova = descontarDist(nova, a, undefined);
-        }
-        planos.push({ produto, original, nova });
-      }
-      const aplicados = [];
-      const desfazer = async () => {
-        for (const pl of aplicados) { try { await gravarDistribuicao(pl.produto.id, pl.original); } catch (_) {} }
-      };
-      try {
-        for (const pl of planos) { await gravarDistribuicao(pl.produto.id, pl.nova); aplicados.push(pl); }
-      } catch (e) { await desfazer(); throw e; }
-
-      const { data, error } = await supabaseClient.rpc("finalizar_separacao", {
+      // Tudo é feito no banco, numa única operação com trava (finalizar_separacao): baixa de
+      // cada porta-palete de onde foi bipado, baixa do total, saídas e status do pedido.
+      // Se faltar estoque, nada é gravado.
+      const { error } = await supabaseClient.rpc("finalizar_separacao", {
         p_pedido_id: pedidoSeparAtivo.id, p_usuario: usuarioLogado.email,
       });
       if (error) {
-        await desfazer();
         alert("⛔ Operação cancelada — nenhuma baixa foi aplicada:\n\n" + error.message);
+        await Promise.all([recarregarSeparacao(), recarregarTudo()]);
         return;
       }
-      // limpa as escolhas de porta-palete deste pedido
+      // limpa as escolhas "Retirar de" deste pedido (salvas neste aparelho)
       setPpEscolhaSepar(prev => {
         const n = { ...prev };
         itensFin.forEach(it => { delete n[it.id]; });
         try { localStorage.setItem("ppEscolhaSepar", JSON.stringify(n)); } catch (e) {}
         return n;
       });
-      salvarAlocSepar(prev => { const n = { ...prev }; itensFin.forEach(it => { delete n[it.id]; }); return n; });
       await Promise.all([recarregarSeparacao(), recarregarTudo()]);
       alert(`✅ Pedido ${pedidoSeparAtivo.numeroPedido} finalizado! Estoque atualizado com sucesso.`);
       setTelaSepar("lista");
@@ -2236,6 +3580,8 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
     { id: "empresas", label: "Empresas", icon: "building" },
     { id: "separacao", label: "Separação de Pedidos", icon: "clipboard-list" },
     { id: "separacaoPP", label: "Separação por Porta-palete", icon: "scan" },
+    { id: "contagem", label: "Contagem", icon: "check-circle" },
+    { id: "mapa3d", label: "Mapa 3D", icon: "map-pin" },
   ];
   const menu = usuarioLogado.admin
     ? menuCompleto
@@ -2263,17 +3609,33 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         td { padding: 12px 14px; border-bottom: 1px solid #1E2738; font-size: 13.5px; }
         tr:hover td { background: #161D29; }
         select { width: 100%; background: #1B2433; border: 1px solid #2A3445; border-radius: 8px; padding: 9px 12px; color: #F3EFE6; font-size: 14px; }
+        .sc-topo-cel, .sc-fundo-menu { display: none; }
+        @media (max-width: 760px) {
+          .sc-sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 900; transform: translateX(-105%); transition: transform .22s ease; box-shadow: 0 0 40px rgba(0,0,0,.55); overflow-y: auto; }
+          .sc-sidebar.aberto { transform: none; }
+          .sc-main { padding: 66px 12px 16px !important; }
+          .sc-topo-cel { display: flex; align-items: center; gap: 12px; position: fixed; top: 0; left: 0; right: 0; height: 54px; padding: 0 12px; z-index: 800; background: #0B0F16; border-bottom: 1px solid #1E2738; }
+          .sc-fundo-menu.aberto { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.5); z-index: 850; }
+        }
       `}</style>
 
+      {/* Barra do celular: botão que abre o menu */}
+      <div className="sc-topo-cel">
+        <button onClick={() => setMenuCel(true)} aria-label="Abrir menu" style={{ background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, color: "#F3EFE6", width: 40, height: 38, fontSize: 20, cursor: "pointer" }}>☰</button>
+        <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 15, color: "#F3EFE6" }}>STOCKCTRL</div>
+        <div style={{ marginLeft: "auto", fontSize: 12.5, color: "#D2A256", fontWeight: 600 }}>{(menu.find(m => m.id === tela) || { label: tela === "usuarios" ? "Usuários" : "" }).label}</div>
+      </div>
+      <div className={"sc-fundo-menu" + (menuCel ? " aberto" : "")} onClick={() => setMenuCel(false)} />
+
       {/* Sidebar */}
-      <div style={{ width: 230, background: "#0B0F16", borderRight: "1px solid #1E2738", display: "flex", flexDirection: "column", flexShrink: 0 }}>
+      <div className={"sc-sidebar" + (menuCel ? " aberto" : "")} style={{ width: 230, background: "#0B0F16", borderRight: "1px solid #1E2738", display: "flex", flexDirection: "column", flexShrink: 0 }}>
         <div style={{ padding: "22px 20px 18px", borderBottom: "1px solid #1E2738" }}>
           <div style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 800, fontSize: 16, color: "#F3EFE6" }}>STOCKCTRL</div>
           <div style={{ fontSize: 11, color: "#5C6678", marginTop: 2 }}>Notas fiscais · Estoque</div>
         </div>
         <div style={{ padding: "14px 10px", flex: 1 }}>
           {menu.map(m => (
-            <button key={m.id} onClick={() => setTela(m.id)} style={{
+            <button key={m.id} onClick={() => { setTela(m.id); setMenuCel(false); }} style={{
               width: "100%", display: "flex", alignItems: "center", gap: 10,
               padding: "10px 12px", marginBottom: 2, borderRadius: 8, border: "none",
               cursor: "pointer", textAlign: "left", fontSize: 13.5, fontWeight: 600,
@@ -2285,7 +3647,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
             </button>
           ))}
           {usuarioLogado.admin && (
-            <button onClick={() => setTela("usuarios")} style={{
+            <button onClick={() => { setTela("usuarios"); setMenuCel(false); }} style={{
               width: "100%", display: "flex", alignItems: "center", gap: 10,
               padding: "10px 12px", marginTop: 10, borderRadius: 8, border: "none",
               cursor: "pointer", textAlign: "left", fontSize: 13.5, fontWeight: 600,
@@ -2311,12 +3673,12 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
       </div>
 
       {/* Main */}
-      <div style={{ flex: 1, overflow: "auto", padding: "26px 32px" }}>
+      <div className="sc-main" style={{ flex: 1, overflow: "auto", padding: "26px 32px" }}>
 
         {tela === "dashboard" && (
           <>
             <h1 style={{ fontFamily: "'Archivo', sans-serif", fontSize: 24, fontWeight: 800, marginBottom: 4 }}>Dashboard</h1>
-            <p style={{ color: "#8893A6", fontSize: 13.5, marginBottom: 22 }}>Visão geral do estoque e notas fiscais — 30 de junho de 2026</p>
+            <p style={{ color: "#8893A6", fontSize: 13.5, marginBottom: 22 }}>Visão geral do estoque e notas fiscais — {new Date().toLocaleDateString("pt-BR", { day: "numeric", month: "long", year: "numeric" })}</p>
 
             <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
               <Stat label="NOTAS PENDENTES" value={stats.pendentes} tone="warning" />
@@ -2527,10 +3889,21 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                   <tr><th>SKU</th><th>Cód. barras</th><th>Cód. fornecedor</th><th>Produto</th><th>Fornecedor</th><th>Localização</th><th>Qtd</th><th>Mín / Máx</th><th>Status</th><th></th></tr>
                 </thead>
                 <tbody>
-                  {produtosFiltrados.map(p => {
+                  {produtosFiltrados.map((p, i) => {
                     const baixo = p.qtd === 0 ? "zerado" : p.qtd < p.min ? "baixo" : "ok";
+                    const forn = fornecedorNome(p.fornecedorId);
+                    const novoGrupo = i === 0 || fornecedorNome(produtosFiltrados[i - 1].fornecedorId) !== forn;
+                    const qtdGrupo = novoGrupo ? produtosFiltrados.filter(x => fornecedorNome(x.fornecedorId) === forn).length : 0;
                     return (
-                      <tr key={p.id}>
+                      <React.Fragment key={p.id}>
+                      {novoGrupo && (
+                        <tr className="grupo-fornecedor">
+                          <td colSpan={10} style={{ background: "#1C2433", color: "#D2A256", fontWeight: 700, fontSize: 13, padding: "8px 14px" }}>
+                            {forn === "—" ? "Sem fornecedor" : forn} <span style={{ color: "#8893A6", fontWeight: 500 }}>· {qtdGrupo} produto(s)</span>
+                          </td>
+                        </tr>
+                      )}
+                      <tr>
                         <td style={{ fontFamily: "monospace", fontSize: 12.5, color: "#8893A6" }}>{p.sku}</td>
                         <td style={{ fontFamily: "monospace", fontSize: 12.5, color: "#8893A6" }}>{p.codigoBarras || "—"}</td>
                         <td style={{ fontFamily: "monospace", fontSize: 12.5, color: "#8893A6" }}>{p.marca || "—"}</td>
@@ -2568,6 +3941,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                           </div>
                         </td>
                       </tr>
+                      </React.Fragment>
                     );
                   })}
                 </tbody>
@@ -2771,8 +4145,8 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                       <td style={{ fontWeight: 600, color: "#F3D9D9" }}>{p.nome}</td>
                       <td style={{ color: "#E0A0A0" }}>{fornecedorNome(p.fornecedorId)}</td>
                       <td style={{ color: "#F3D9D9" }}>{p.qtd}</td>
-                      <td style={{ color: "#E0A0A0" }}>{p.ultimaSaida ? new Date(p.ultimaSaida).toLocaleDateString("pt-BR") : "Sem registro"}</td>
-                      <td style={{ fontWeight: 700, color: "#E07A7A" }}>{daysSince(p.ultimaSaida)} dias</td>
+                      <td style={{ color: "#E0A0A0" }}>{p.ultimaSaida ? String(p.ultimaSaida).slice(0, 10).split("-").reverse().join("/") : "Sem registro"}</td>
+                      <td style={{ fontWeight: 700, color: "#E07A7A" }}>{p.ultimaSaida ? daysSince(p.ultimaSaida) + " dias" : "Nunca saiu"}</td>
                       <td style={{ fontFamily: "monospace", fontSize: 12.5, color: "#E0A0A0" }}>{p.fileira}-{p.porta}-{p.nivel}</td>
                     </tr>
                   ))}
@@ -3268,6 +4642,148 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
           </>
         )}
 
+        {tela === "contagem" && (() => {
+          const msgColors = { ok: "#5CC98E", erro: "#E07A7A", info: "#6FB0E0" };
+          const msgBg = { ok: "#143A2A", erro: "#3A1818", info: "#15324A" };
+          const contados = contLinhas.filter(l => l.contado !== null).length;
+          const faltam = contLinhas.filter(l => l.contado === null && l.esperado).length;
+          const comDif = contLinhas.filter(l => l.dif !== null && l.dif !== 0).length;
+          const corDif = (d) => d === null ? "#5C6678" : d === 0 ? "#5CC98E" : d > 0 ? "#6FB0E0" : "#E07A7A";
+          const txtDif = (d) => d === null ? "—" : d === 0 ? "0" : (d > 0 ? "+" : "") + d;
+          const pill = (ativo) => ({
+            padding: "7px 14px", borderRadius: 20, fontSize: 13, fontWeight: 600, cursor: "pointer",
+            background: ativo ? "#D2A256" : "#1B2433", color: ativo ? "#1A1408" : "#AEB7C7",
+            border: ativo ? "1px solid #D2A256" : "1px solid #2A3445",
+          });
+          return (
+            <>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 20, flexWrap: "wrap", gap: 12 }}>
+                <div>
+                  <h1 style={{ fontFamily: "'Archivo', sans-serif", fontSize: 24, fontWeight: 800, marginBottom: 4, display: "flex", alignItems: "center", gap: 10 }}>
+                    <Icon name="check-circle" size={22} color="#D2A256" /> Contagem de estoque
+                  </h1>
+                  <p style={{ color: "#8893A6", fontSize: 13.5, maxWidth: 640 }}>Cada pessoa conta uma porta-palete: bipe a etiqueta da porta-palete, bipe os produtos e finalize. Várias pessoas podem contar porta-paletes diferentes ao mesmo tempo.</p>
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <span style={{ fontSize: 12.5, color: "#8893A6" }}>Modo quantidade:</span>
+                  <button onClick={() => setContModo("bip")} style={pill(contModo === "bip")}>Bipar (1x por bip)</button>
+                  <button onClick={() => setContModo("digitar")} style={pill(contModo === "digitar")}>Digitar quantidade</button>
+                </div>
+              </div>
+
+              <div style={{ background: "#161D29", border: "2px solid #D2A256", borderRadius: 12, padding: 20, marginBottom: 16 }}>
+                <div style={{ fontSize: 13, color: "#D2A256", fontWeight: 700, marginBottom: 10, display: "flex", alignItems: "center", gap: 8 }}>
+                  <Icon name="barcode" size={16} color="#D2A256" />
+                  {contPP ? `Bipe os produtos de ${contPP.codigo} · ${contPP.label}` : "Bipe a etiqueta da porta-palete para começar"}
+                </div>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <input ref={contScanRef} autoFocus value={contScan} onChange={e => setContScan(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") handleScanContagem(contScan); }}
+                    placeholder={contPP ? "Bipe o produto ou digite o código e pressione Enter..." : "Bipe a etiqueta da porta-palete..."}
+                    style={{ width: "100%", background: "#0F141C", border: "1px solid #3A4658", borderRadius: 8, padding: "12px 16px", color: "#F3EFE6", fontSize: 16, outline: "none", fontFamily: "monospace", boxSizing: "border-box" }} />
+                  <button onClick={() => handleScanContagem(contScan)} style={{ background: "#D2A256", border: "none", borderRadius: 8, padding: "0 20px", color: "#1A1408", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>Confirmar</button>
+                  <button title="Bipar com a câmera" onClick={() => setScannerAlvo("contagem")} style={{ background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, color: "#D2A256", cursor: "pointer", width: 44, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="camera" size={17} /></button>
+                </div>
+                {!contPP && portaPaletes.length > 0 && (
+                  <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <span style={{ fontSize: 12.5, color: "#8893A6" }}>ou escolha:</span>
+                    <select defaultValue="" onChange={e => { const pp = portaPaleteById(e.target.value); if (pp) iniciarContagem(pp); e.target.value = ""; }} style={{ ...inputStyle, width: "auto", minWidth: 220 }}>
+                      <option value="">Selecione a porta-palete</option>
+                      {portaPaletes.map(pp => <option key={pp.id} value={pp.id}>{pp.codigo} · {portaPaleteLabel(pp)}</option>)}
+                    </select>
+                  </div>
+                )}
+              </div>
+
+              {contMsg && (
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: msgBg[contMsg.tipo], color: msgColors[contMsg.tipo], borderRadius: 8, padding: "10px 16px", marginBottom: 16, fontSize: 13.5, gap: 10 }}>
+                  <span>{contMsg.texto}</span>
+                  <button onClick={() => setContMsg(null)} style={{ background: "none", border: "none", color: "inherit", cursor: "pointer" }}><Icon name="x" size={14} /></button>
+                </div>
+              )}
+
+              {contPP && (
+                <div style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, padding: 20, marginBottom: 20 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12, marginBottom: 14 }}>
+                    <div>
+                      <div style={{ fontWeight: 800, fontSize: 16, display: "flex", alignItems: "center", gap: 8 }}>
+                        <Icon name="map-pin" size={16} color="#D2A256" /> Contando {contPP.codigo} · {contPP.label}
+                      </div>
+                      <div style={{ fontSize: 12.5, color: "#8893A6", marginTop: 4 }}>
+                        <b style={{ color: "#5CC98E" }}>{contados}</b> contado(s) · <b style={{ color: faltam ? "#E0B05C" : "#8893A6" }}>{faltam}</b> falta(m) contar · <b style={{ color: comDif ? "#E07A7A" : "#8893A6" }}>{comDif}</b> com diferença
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <Btn onClick={cancelarContagem}>Cancelar contagem</Btn>
+                      <Btn variant="primary" icon="check-circle" onClick={() => setContConfirmar(true)}>Finalizar contagem</Btn>
+                    </div>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#AEB7C7", marginBottom: 12, cursor: "pointer" }}>
+                    <input type="checkbox" checked={contZerar} onChange={e => setContZerar(e.target.checked)} />
+                    Produto que o sistema diz estar nesta porta-palete e não for contado fica com <b>0</b> nela
+                  </label>
+                  <div style={{ border: "1px solid #2A3445", borderRadius: 10, overflow: "auto" }}>
+                    <table>
+                      <thead><tr><th>Produto</th><th>SKU</th><th style={{ textAlign: "center" }}>Sistema</th><th style={{ textAlign: "center" }}>Contado</th><th style={{ textAlign: "center" }}>Diferença</th><th></th></tr></thead>
+                      <tbody>
+                        {contLinhas.length === 0 && (
+                          <tr><td colSpan={6} style={{ textAlign: "center", color: "#5C6678", padding: 24 }}>Nenhum produto cadastrado nesta porta-palete. Bipe os produtos que encontrar nela.</td></tr>
+                        )}
+                        {contLinhas.map(l => (
+                          <tr key={l.prod.id} style={{ background: l.contado === null ? "transparent" : l.dif === 0 ? "#0F2018" : "transparent" }}>
+                            <td style={{ fontWeight: 600 }}>
+                              {l.prod.nome}
+                              {!l.esperado && <div style={{ fontSize: 11, color: "#6FB0E0", fontWeight: 500 }}>não estava cadastrado aqui</div>}
+                            </td>
+                            <td style={{ fontFamily: "monospace", fontSize: 12, color: "#8893A6" }}>{l.prod.sku}</td>
+                            <td style={{ textAlign: "center", fontWeight: 700 }}>{l.sistema}</td>
+                            <td style={{ textAlign: "center" }}>
+                              <input type="number" min="0" value={l.contado === null ? "" : l.contado}
+                                placeholder={contZerar ? "não contado" : "—"}
+                                onChange={e => definirNaContagem(l.prod.id, e.target.value)}
+                                style={{ ...inputStyle, width: 100, textAlign: "center", padding: "6px 8px", fontWeight: 700 }} />
+                            </td>
+                            <td style={{ textAlign: "center", fontWeight: 800, color: corDif(l.dif) }}>{txtDif(l.dif)}</td>
+                            <td>{l.contado !== null && (
+                              <button title="Desfazer contagem deste produto" onClick={() => tirarDaContagem(l.prod.id)} style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer" }}><Icon name="x" size={14} /></button>
+                            )}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              <div style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, overflow: "auto" }}>
+                <div style={{ padding: "14px 16px", fontWeight: 700, fontSize: 14, borderBottom: "1px solid #2A3445" }}>Histórico de contagens e ajustes</div>
+                <table>
+                  <thead><tr><th>Data</th><th>Porta-palete</th><th>Tipo</th><th>Quem</th><th style={{ textAlign: "center" }}>Produtos</th><th style={{ textAlign: "center" }}>Com diferença</th><th style={{ textAlign: "center" }}>Diferença</th></tr></thead>
+                  <tbody>
+                    {contagens.length === 0 && <tr><td colSpan={7} style={{ textAlign: "center", color: "#5C6678", padding: 24 }}>Nenhuma contagem ainda.</td></tr>}
+                    {contagens.map(c => (
+                      <tr key={c.id} onClick={() => abrirContagemHistorico(c)} style={{ cursor: "pointer" }}>
+                        <td style={{ fontSize: 12, color: "#8893A6", fontFamily: "monospace" }}>{new Date(c.created_at).toLocaleString("pt-BR")}</td>
+                        <td style={{ fontFamily: "monospace", fontSize: 12.5, color: "#D2A256" }}>{c.porta_palete || "—"}</td>
+                        <td>{c.origem}</td>
+                        <td style={{ color: "#8893A6", fontSize: 12.5 }}>{c.usuario || "—"}</td>
+                        <td style={{ textAlign: "center" }}>{c.itens}</td>
+                        <td style={{ textAlign: "center" }}>{c.itens_alterados}</td>
+                        <td style={{ textAlign: "center", fontWeight: 700, color: corDif(Number(c.diferenca_total)) }}>{txtDif(Number(c.diferenca_total))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          );
+        })()}
+
+        {tela === "mapa3d" && (
+          <Mapa3D portaPaletes={portaPaletes} estoquePP={estoquePP} produtos={produtos} pedidos={pedidosSeparacao}
+            itensPorPedido={itensSeparacaoPorPedido} contagens={contagens} fornecedorNome={fornecedorNome}
+            movimentacoes={movimentacoes} usuarioEmail={usuarioLogado && usuarioLogado.email} presencas={presencas} />
+        )}
         {tela === "separacaoPP" && (() => {
           const msgColors = { ok: "#5CC98E", erro: "#E07A7A", info: "#6FB0E0" };
           const msgBg = { ok: "#143A2A", erro: "#3A1818", info: "#15324A" };
@@ -4164,6 +5680,74 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         <BarcodeScannerModal onDetected={handleBarcodeDetected} onClose={() => setScannerAlvo(null)} />
       )}
 
+      {/* MODAL: Confirmar contagem */}
+      {contConfirmar && contPP && (() => {
+        const difs = contLinhas.filter(l => l.dif !== null && l.dif !== 0);
+        const naoContados = contLinhas.filter(l => l.contado === null && l.esperado && l.sistema > 0);
+        const total = difs.reduce((t, l) => t + l.dif, 0);
+        return (
+          <Modal title={`Finalizar contagem de ${contPP.codigo}`} onClose={() => setContConfirmar(false)} width={540}>
+            <div style={{ fontSize: 13.5, color: "#AEB7C7", marginBottom: 12 }}>
+              {contLinhas.filter(l => l.contado !== null).length} produto(s) contado(s) · {difs.length} com diferença · total {total > 0 ? "+" : ""}{total} un.
+            </div>
+            {naoContados.length > 0 && contZerar && (
+              <div style={{ background: "#3A2A14", border: "1px solid #5C4322", color: "#E8B458", borderRadius: 8, padding: "10px 12px", fontSize: 13, marginBottom: 12 }}>
+                ⚠ {naoContados.length} produto(s) não foram contados e vão ficar com <b>0</b> nesta porta-palete: {naoContados.map(l => l.prod.nome).join(", ")}
+              </div>
+            )}
+            {difs.length > 0 ? (
+              <div style={{ border: "1px solid #2A3445", borderRadius: 10, overflow: "auto", maxHeight: 300, marginBottom: 12 }}>
+                <table>
+                  <thead><tr><th>Produto</th><th style={{ textAlign: "center" }}>Sistema</th><th style={{ textAlign: "center" }}>Contado</th><th style={{ textAlign: "center" }}>Diferença</th></tr></thead>
+                  <tbody>
+                    {difs.map(l => (
+                      <tr key={l.prod.id}>
+                        <td style={{ fontWeight: 600 }}>{l.prod.nome}</td>
+                        <td style={{ textAlign: "center" }}>{l.sistema}</td>
+                        <td style={{ textAlign: "center" }}>{l.contado === null ? 0 : l.contado}</td>
+                        <td style={{ textAlign: "center", fontWeight: 800, color: l.dif > 0 ? "#6FB0E0" : "#E07A7A" }}>{l.dif > 0 ? "+" : ""}{l.dif}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div style={{ color: "#5CC98E", fontSize: 13.5, marginBottom: 12 }}>✓ Tudo bate com o sistema.</div>
+            )}
+            <div style={{ fontSize: 12, color: "#5C6678", marginBottom: 16 }}>Os números do "Sistema" são conferidos de novo no banco na hora de aplicar. O estoque total de cada produto é ajustado pela diferença.</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <Btn variant="primary" icon="check-circle" onClick={aplicarContagem} style={{ opacity: contAplicando ? 0.6 : 1 }}>{contAplicando ? "Aplicando..." : "Confirmar e aplicar"}</Btn>
+              <Btn onClick={() => setContConfirmar(false)}>Voltar</Btn>
+            </div>
+          </Modal>
+        );
+      })()}
+
+      {/* MODAL: Detalhe de uma contagem do histórico */}
+      {contagemAberta && (
+        <Modal title={`${contagemAberta.contagem.origem} · ${contagemAberta.contagem.porta_palete || ""}`} onClose={() => setContagemAberta(null)} width={560}>
+          <div style={{ fontSize: 12.5, color: "#8893A6", marginBottom: 12 }}>
+            {new Date(contagemAberta.contagem.created_at).toLocaleString("pt-BR")} · {contagemAberta.contagem.usuario || "—"}
+          </div>
+          <div style={{ border: "1px solid #2A3445", borderRadius: 10, overflow: "auto", maxHeight: 380 }}>
+            <table>
+              <thead><tr><th>Produto</th><th>SKU</th><th style={{ textAlign: "center" }}>Sistema</th><th style={{ textAlign: "center" }}>Contado</th><th style={{ textAlign: "center" }}>Diferença</th></tr></thead>
+              <tbody>
+                {contagemAberta.itens.map(it => (
+                  <tr key={it.id}>
+                    <td style={{ fontWeight: 600 }}>{it.produto}</td>
+                    <td style={{ fontFamily: "monospace", fontSize: 12, color: "#8893A6" }}>{it.sku}</td>
+                    <td style={{ textAlign: "center" }}>{it.qtd_sistema}</td>
+                    <td style={{ textAlign: "center" }}>{it.qtd_contada}</td>
+                    <td style={{ textAlign: "center", fontWeight: 800, color: it.diferenca === 0 ? "#5CC98E" : it.diferenca > 0 ? "#6FB0E0" : "#E07A7A" }}>{it.diferenca > 0 ? "+" : ""}{it.diferenca}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </Modal>
+      )}
+
       {/* MODAL: Confirmar exclusão */}
       {confirmDelete && (
         <Modal title="Confirmar exclusão" onClose={() => setConfirmDelete(null)} width={380}>
@@ -4287,7 +5871,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
               <div className="feed-lines" id="feed-lines"></div>
             </div>
           </div>
-          <div className="console-foot"><span>Sistema de Gestão de Estoque</span><span>02 Jul 2026</span></div>
+          <div className="console-foot"><span>Sistema de Gestão de Estoque</span><span>{new Date().toLocaleDateString("pt-BR", { day: "2-digit", month: "short", year: "numeric" }).replace(".", "")}</span></div>
         </div>
         <div className="form-panel">
           <div className="form-inner">
