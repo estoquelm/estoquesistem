@@ -3842,8 +3842,23 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   const [contLigar, setContLigar] = useState(null);   // { codigo, termo, escolhido, salvando }
   // trocar um produto cadastrado à mão pelo cadastro certo (ex.: do Tiny)
   const [contTrocar, setContTrocar] = useState(null); // { origem, termo, escolhido, salvando }
+  const [contSaidos, setContSaidos] = useState({});   // produtos tirados desta porta-palete (esconde até recarregar)
   const resultadosTrocar = contTrocar && normBusca(contTrocar.termo).length >= 2
     ? buscarProdutos(indiceBuscaProdutos, contTrocar.termo, null, 30).filter(r => r.p.id !== contTrocar.origem.id).slice(0, 25) : [];
+  async function tirarDaPortaPalete(l) {
+    if (!contPP) return;
+    const prod = l.prod;
+    const txtQtd = l.sistema > 0 ? `\n\nO sistema diz que tem ${l.sistema} un. aqui. Elas serão baixadas do estoque.` : "";
+    if (!confirm(`Tirar "${prod.nome}" da porta-palete ${contPP.codigo}?\n(Ele aparece aqui no sistema, mas não está na porta-palete.)${txtQtd}`)) return;
+    const { data, error } = await supabaseClient.rpc("tirar_da_porta_palete", { p_produto: prod.id, p_pp: contPP.id, p_usuario: usuarioLogado.email });
+    if (error) { tocarSom("erro"); setContMsg({ tipo: "erro", texto: "Não consegui tirar: " + error.message }); return; }
+    setContItens(prev => { if (prev[prod.id] === undefined) return prev; const n = { ...prev }; delete n[prod.id]; return n; });
+    setContOrdem(prev => prev.filter(id => id !== prod.id));
+    setContSaidos(prev => ({ ...prev, [contPP.id + ":" + prod.id]: true }));
+    tocarSom("ok");
+    setContMsg({ tipo: "ok", texto: `✓ "${prod.nome}" tirado da ${contPP.codigo}${data && data.baixado ? ` (${data.baixado} un. baixadas)` : ""}.` });
+    recarregarTudo();
+  }
   function abrirTrocarProduto(prod) {
     const termo = String(prod.nome || "").split(/\s+/).filter(w => w.length > 1).slice(0, 3).join(" ");
     setContLigar(null);
@@ -3963,7 +3978,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     if (!contPP) return [];
     const esperadoPorId = new Map(contEsperados.map(p => [p.id, p]));
     const ids = [...contOrdem.filter(id => contItens[id] !== undefined), ...contEsperados.map(p => p.id).filter(id => contItens[id] === undefined)];
-    return [...new Set(ids)].map(id => {
+    return [...new Set(ids)].filter(id => !contSaidos[contPP.id + ":" + id] || contItens[id] !== undefined).map(id => {
       const prod = produtos.find(p => p.id === id) || esperadoPorId.get(id);
       if (!prod) return null;
       const sistema = esperadoPorId.has(id) ? esperadoPorId.get(id).qtdPP : 0;
@@ -5832,6 +5847,12 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                                 style={{ display: "block", marginTop: 3, background: "none", border: "none", padding: 0, color: "#D2A256", fontSize: 11.5, fontWeight: 600, cursor: "pointer", textDecoration: "underline" }}>
                                 Trocar produto / SKU
                               </button>
+                              {l.esperado && (
+                                <button type="button" data-teste="tirar-pp" onClick={() => tirarDaPortaPalete(l)}
+                                  style={{ display: "block", marginTop: 3, background: "none", border: "none", padding: 0, color: "#E07A7A", fontSize: 11.5, fontWeight: 600, cursor: "pointer", textDecoration: "underline" }}>
+                                  Não está aqui — tirar desta porta-palete
+                                </button>
+                              )}
                             </td>
                             <td style={{ fontFamily: "monospace", fontSize: 12, color: "#8893A6" }}>{l.prod.sku}</td>
                             <td style={{ textAlign: "center", fontWeight: 700 }}>{l.sistema}</td>
