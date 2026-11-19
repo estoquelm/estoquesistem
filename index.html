@@ -509,6 +509,43 @@ function fornecedorToRow(f) {
   return { nome_fantasia: f.nomeFantasia, razao_social: f.razaoSocial, cnpj: f.cnpj, contato: f.contato, telefone: f.telefone, status: f.status || "Ativo" };
 }
 
+// ==== BUSCA TOLERANTE DE PRODUTOS (contagem) ====
+// Ignora maiúsculas, acentos, espaços, traços, pontos e barras: "HMF 70024-B" acha "hmf70024b".
+// Busca por código de barras (EAN), SKU, código do fornecedor (campo "marca") e nome.
+function normBusca(s) { return String(s == null ? "" : s).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]/g, ""); }
+function palavrasBusca(s) { return String(s == null ? "" : s).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/[^a-z0-9]+/).filter(Boolean); }
+const semZerosEsq = (s) => s.replace(/^0+(?=\d)/, "");
+function montarIndiceBusca(produtos) {
+  return (produtos || []).map(p => {
+    const codigos = [p.codigoBarras, p.sku, p.marca].map(normBusca).filter(c => c && !/^0+$/.test(c)); // ignora SKU "00", "000"...
+    return { p, nome: normBusca(p.nome), codigos, tudo: normBusca(p.nome) + "|" + codigos.join("|") };
+  });
+}
+function buscarProdutos(indice, consulta, preferidos, limite = 8) {
+  const q = normBusca(consulta);
+  if (!q) return [];
+  const qz = semZerosEsq(q);
+  const toks = palavrasBusca(consulta).map(normBusca).filter(Boolean);
+  const out = [];
+  for (const it of indice) {
+    let nota = 0, exato = false;
+    for (const c of it.codigos) {
+      if (c === q || (/^\d+$/.test(q) && semZerosEsq(c) === qz)) { nota = Math.max(nota, 1000); exato = true; }
+      else if (q.length >= 3 && c.startsWith(q)) nota = Math.max(nota, 600);
+      else if (q.length >= 3 && c.includes(q)) nota = Math.max(nota, 420);
+    }
+    if (!exato) {
+      if (q.length >= 2 && it.nome.includes(q)) nota = Math.max(nota, 300 + (it.nome.startsWith(q) ? 60 : 0));
+      if (toks.length && toks.every(t => it.tudo.includes(t))) nota = Math.max(nota, 220 + (it.nome.startsWith(toks[0]) ? 40 : 0));
+    }
+    if (!nota) continue;
+    if (preferidos && preferidos.has(it.p.id)) nota += 100;
+    out.push({ p: it.p, nota, exato });
+  }
+  out.sort((a, b) => b.nota - a.nota || String(a.p.nome || "").localeCompare(String(b.p.nome || ""), "pt-BR"));
+  return out.slice(0, limite);
+}
+
 function rowToProduto(r) {
   return {
     id: r.id, sku: r.sku, nome: r.produto, fornecedorId: r.fornecedor_id, empresaId: r.empresa_id,
@@ -2559,6 +2596,96 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
 
   const [modalNota, setModalNota] = useState(null);
   const [modalProduto, setModalProduto] = useState(null);
+  // ==== IMPORTAR CADASTRO DE PRODUTOS (planilha do Tiny) — só cadastro, nunca quantidade ====
+  const [modalImport, setModalImport] = useState(false);
+  const [impLeitura, setImpLeitura] = useState(null);   // { itens, linhas, kits, inativos, duplicados, comEan, arquivo }
+  const [impStatus, setImpStatus] = useState(null);
+  const [impResultado, setImpResultado] = useState(null);
+  const [impErro, setImpErro] = useState(null);
+  function carregarScriptGlobal(src, nomeGlobal) {
+    return new Promise((ok, falha) => {
+      if (window[nomeGlobal]) return ok();
+      const sc = document.createElement("script"); sc.src = src;
+      sc.onload = () => ok(); sc.onerror = () => falha(new Error("não consegui baixar o leitor de planilhas (verifique a internet)"));
+      document.head.appendChild(sc);
+    });
+  }
+  async function lerPlanilhaCadastro(file) {
+    setImpErro(null); setImpResultado(null); setImpLeitura(null);
+    try {
+      setImpStatus("Lendo a planilha...");
+      await carregarScriptGlobal("https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js", "XLSX");
+      const wb = window.XLSX.read(await file.arrayBuffer(), { type: "array" });
+      let abas = wb.SheetNames.filter(n => normBusca(n) === "todasascontas");
+      if (!abas.length) abas = wb.SheetNames.filter(n => normBusca(n) !== "resumo");
+      const COL = {
+        sku: ["sku", "codigo", "codigosku", "codigoproduto"], nome: ["nome", "descricao", "produto", "nomedoproduto"],
+        ean: ["gtinean", "gtin", "ean", "codigodebarras", "gtinean13"], un: ["unidade", "un", "und"],
+        empresa: ["empresa"], kit: ["ekit", "kit"], situacao: ["situacao", "status"], conta: ["conta"],
+        forn: ["codigodofornecedor", "codfornecedor", "codigofornecedor", "codigopelofornecedor", "codfornec"],
+      };
+      const EMPRESAS_TINY = { CS: "Cesario", MD: "Mundi" };
+      let linhas = 0, kits = 0, inativos = 0, duplicados = 0, semSku = 0;
+      const porSku = new Map();
+      for (const aba of abas) {
+        const rows = window.XLSX.utils.sheet_to_json(wb.Sheets[aba], { defval: null, raw: false });
+        for (const row of rows) {
+          const v = {};
+          for (const k of Object.keys(row)) { const nk = normBusca(k); for (const [campo, nomes] of Object.entries(COL)) if (v[campo] === undefined && nomes.includes(nk)) v[campo] = row[k]; }
+          if (v.sku === undefined && v.nome === undefined) continue;
+          linhas++;
+          const sku = String(v.sku == null ? "" : v.sku).trim(), nome = String(v.nome == null ? "" : v.nome).replace(/\s+/g, " ").trim();
+          if (/^s/i.test(String(v.kit || "").trim())) { kits++; continue; }
+          if (/^inativ/i.test(String(v.situacao || "").trim())) { inativos++; continue; }
+          if (!sku || !nome) { semSku++; continue; }
+          const chave = sku.toLowerCase();
+          const ean = String(v.ean == null ? "" : v.ean).replace(/\D/g, "");
+          const emp = String(v.empresa || "").trim();
+          const item = { sku, nome, ean: ean.length >= 8 && !/^0+$/.test(ean) ? ean : "", un: String(v.un || "").trim().toUpperCase(),
+                         empresa: EMPRESAS_TINY[emp.toUpperCase()] || emp || "", forn: String(v.forn || "").trim() };
+          if (porSku.has(chave)) {
+            duplicados++;
+            const a = porSku.get(chave);
+            if (!a.ean && item.ean) a.ean = item.ean; if (!a.un && item.un) a.un = item.un;
+            if (!a.empresa && item.empresa) a.empresa = item.empresa; if (!a.forn && item.forn) a.forn = item.forn;
+            continue;
+          }
+          porSku.set(chave, item);
+        }
+      }
+      const itens = [...porSku.values()].map(i => ({ ...i, un: ({ UNID: "UN", UND: "UN", UNIDADE: "UN", PECAS: "PC", PECA: "PC" })[i.un] || i.un || "UN" }));
+      if (!itens.length) throw new Error("não encontrei colunas de SKU e Nome nesta planilha.");
+      const existentes = new Set(produtos.map(p => String(p.sku || "").trim().toLowerCase()).filter(x => x && !/^0+$/.test(x)));
+      const eansExist = new Set(produtos.map(p => String(p.codigoBarras || "").replace(/\D/g, "")).filter(Boolean));
+      const jaTem = itens.filter(i => existentes.has(i.sku.toLowerCase()) || (i.ean && eansExist.has(i.ean))).length;
+      setImpLeitura({ itens, linhas, kits, inativos, duplicados, semSku, comEan: itens.filter(i => i.ean).length, jaTem, arquivo: file.name });
+      setImpStatus(null);
+    } catch (e) {
+      setImpStatus(null); setImpErro("Erro ao ler a planilha: " + e.message);
+    }
+  }
+  async function confirmarImportCadastro() {
+    if (!impLeitura) return;
+    setImpErro(null);
+    const tot = { novos: 0, atualizados: 0, sem_mudanca: 0 };
+    const LOTE = 300, itens = impLeitura.itens, inicio = new Date().toISOString();
+    try {
+      for (let i = 0; i < itens.length; i += LOTE) {
+        setImpStatus(`Importando ${Math.min(i + LOTE, itens.length)} de ${itens.length}...`);
+        const { data, error } = await supabaseClient.rpc("importar_cadastro_produtos", { p_itens: itens.slice(i, i + LOTE), p_inicio: inicio });
+        if (error) throw new Error(error.message);
+        tot.novos += data.novos || 0; tot.atualizados += data.atualizados || 0; tot.sem_mudanca += data.sem_mudanca || 0;
+        await new Promise(r => setTimeout(r, 400)); // dá respiro para os outros aparelhos
+      }
+      setImpResultado(tot); setImpLeitura(null); setImpStatus(null);
+      await recarregarTudo();
+    } catch (e) {
+      setImpStatus(null);
+      setImpErro(`Parou com erro: ${e.message}. O que já foi importado continua salvo (${tot.novos} novos, ${tot.atualizados} atualizados). Pode importar a mesma planilha de novo: o que já existe não duplica.`);
+      setImpResultado(tot.novos + tot.atualizados ? tot : null);
+      await recarregarTudo();
+    }
+  }
   const [modalFornecedor, setModalFornecedor] = useState(null);
   const [modalEmpresa, setModalEmpresa] = useState(null);
   const [quickAdd, setQuickAdd] = useState(null); // { tipo: 'empresa'|'fornecedor', onCreated: fn }
@@ -3710,6 +3837,31 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   const [contagens, setContagens] = useState([]);
   const [contagemAberta, setContagemAberta] = useState(null); // { contagem, itens }
   const contScanRef = useRef(null);
+  const indiceBuscaProdutos = useMemo(() => montarIndiceBusca(produtos), [produtos]);
+  // código bipado que não existe: buscar o produto e ligar o código a ele
+  const [contLigar, setContLigar] = useState(null);   // { codigo, termo, escolhido, salvando }
+  const resultadosLigar = contLigar && normBusca(contLigar.termo).length >= 2
+    ? buscarProdutos(indiceBuscaProdutos, contLigar.termo, null, 25)
+        .sort((a, b) => (a.p.codigoBarras ? 1 : 0) - (b.p.codigoBarras ? 1 : 0) || b.nota - a.nota) : [];
+  async function ligarCodigoAoProduto() {
+    if (!contLigar || !contLigar.escolhido || contLigar.salvando) return;
+    const prod = contLigar.escolhido, codigo = contLigar.codigo;
+    if (prod.codigoBarras && String(prod.codigoBarras).trim() !== codigo &&
+        !confirm(`"${prod.nome}" já tem o código ${prod.codigoBarras}. Trocar por ${codigo}?`)) return;
+    setContLigar(c => ({ ...c, salvando: true }));
+    const { error } = await supabaseClient.from("estoque").update({ codigo_barras: codigo }).eq("id", prod.id);
+    if (error) {
+      tocarSom("erro");
+      setContLigar(c => ({ ...c, salvando: false }));
+      setContMsg({ tipo: "erro", texto: "Não consegui ligar o código: " + error.message });
+      return;
+    }
+    const atualizado = { ...prod, codigoBarras: codigo };
+    setProdutos(prev => prev.map(p => p.id === prod.id ? { ...p, codigoBarras: codigo } : p));
+    setContLigar(null);
+    adicionarNaContagemProduto(atualizado);
+    setContMsg({ tipo: "ok", texto: `✓ Código ${codigo} ligado a "${prod.nome}" e +1 contado. Da próxima vez é só bipar.` });
+  }
 
   // rascunho salvo no aparelho: se a bateria acabar ou a página fechar, a contagem não se perde
   useEffect(() => {
@@ -3720,8 +3872,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   }, [contPP, contItens, contOrdem]);
 
   useEffect(() => {
-    if (tela === "contagem" && contScanRef.current && !contConfirmar) contScanRef.current.focus();
-  }, [tela, contPP, contMsg, contConfirmar]);
+    if (tela === "contagem" && contScanRef.current && !contConfirmar && !contLigar) contScanRef.current.focus();
+  }, [tela, contPP, contMsg, contConfirmar, !!contLigar]);
 
   async function recarregarContagens() {
     const { data, error } = await supabaseClient.from("contagens").select("*").order("id", { ascending: false }).limit(50);
@@ -3766,6 +3918,9 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   }
 
   const contEsperados = contPP ? produtosDaPortaPalete(portaPaleteById(contPP.id)) : [];
+  const idsEsperadosCont = new Set(contEsperados.map(p => p.id));
+  const sugestoesCont = (contPP && normBusca(contScan).length >= 2 && !portaPaleteByCodigo(contScan.trim()))
+    ? buscarProdutos(indiceBuscaProdutos, contScan, idsEsperadosCont, 8) : [];
   const contLinhas = (() => {
     if (!contPP) return [];
     const esperadoPorId = new Map(contEsperados.map(p => [p.id, p]));
@@ -3781,40 +3936,66 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }).filter(Boolean);
   })();
 
-  function handleScanContagem(raw) {
-    const val = (raw || "").trim();
-    setContScan("");
-    if (!val) return;
-    const pp = portaPaleteByCodigo(val);
-    if (pp) {
-      if (contPP && contPP.id === pp.id) { setContMsg({ tipo: "info", texto: `Você já está contando ${pp.codigo}.` }); return; }
-      if (contPP && Object.keys(contItens).length > 0 && !confirm(`Você está no meio da contagem de ${contPP.codigo}. Descartar e começar ${pp.codigo}?`)) return;
-      iniciarContagem(pp);
-      return;
-    }
-    if (!contPP) {
-      tocarSom("erro");
-      setContMsg({ tipo: "erro", texto: `Bipe primeiro a etiqueta da porta-palete. "${val}" não é uma porta-palete cadastrada.` });
-      return;
-    }
-    const prod = produtos.find(p =>
-      (p.codigoBarras && String(p.codigoBarras).toUpperCase() === val.toUpperCase()) ||
-      (p.sku && String(p.sku).toUpperCase() === val.toUpperCase()));
-    if (!prod) {
-      tocarSom("erro");
-      setContMsg({ tipo: "erro", texto: `Código "${val}" não encontrado no cadastro de produtos.` });
-      return;
-    }
+  function adicionarNaContagemProduto(prod) {
     let qtd = 1;
     if (contModo === "digitar") {
       const n = parseInt(window.prompt(`Quantidade de "${prod.nome}" (soma ao que já foi contado):`));
       if (!(n > 0)) return;
       qtd = n;
     }
+    setContScan("");
     somarNaContagem(prod, qtd);
     const esperado = contEsperados.some(p => p.id === prod.id);
     tocarSom("ok");
     setContMsg({ tipo: esperado ? "ok" : "info", texto: `+${qtd} ${prod.nome} — contado: ${(Number(contItens[prod.id]) || 0) + qtd}${esperado ? "" : " · este produto não estava cadastrado nesta porta-palete (será incluído nela)"}` });
+    if (contScanRef.current) contScanRef.current.focus();
+  }
+
+  function handleScanContagem(raw) {
+    const val = (raw || "").trim();
+    if (!val) { setContScan(""); return; }
+    const pp = portaPaleteByCodigo(val);
+    if (pp) {
+      setContScan("");
+      if (contPP && contPP.id === pp.id) { setContMsg({ tipo: "info", texto: `Você já está contando ${pp.codigo}.` }); return; }
+      if (contPP && Object.keys(contItens).length > 0 && !confirm(`Você está no meio da contagem de ${contPP.codigo}. Descartar e começar ${pp.codigo}?`)) return;
+      iniciarContagem(pp);
+      return;
+    }
+    if (!contPP) {
+      setContScan("");
+      tocarSom("erro");
+      setContMsg({ tipo: "erro", texto: `Bipe primeiro a etiqueta da porta-palete. "${val}" não é uma porta-palete cadastrada.` });
+      return;
+    }
+    const res = buscarProdutos(indiceBuscaProdutos, val, idsEsperadosCont, 8);
+    const exatos = res.filter(r => r.exato);
+    let prod = null;
+    if (exatos.length === 1) prod = exatos[0].p;
+    else if (exatos.length > 1) {
+      tocarSom("erro");
+      setContMsg({ tipo: "info", texto: `O código "${val}" está em ${exatos.length} produtos. Toque no produto certo na lista abaixo.` });
+      setContScan(val);
+      return;
+    } else if (res.length === 1 && normBusca(val).length >= 3) prod = res[0].p;
+    else if (res.length > 1) {
+      setContMsg({ tipo: "info", texto: `Encontrei ${res.length}${res.length === 8 ? "+" : ""} produtos para "${val}". Toque no certo na lista abaixo.` });
+      setContScan(val);
+      return;
+    }
+    if (!prod) {
+      setContScan("");
+      tocarSom("erro");
+      const pareceCodigo = /^\d{8,14}$/.test(val.replace(/\s/g, ""));
+      if (pareceCodigo) {
+        setContLigar({ codigo: val.replace(/\s/g, ""), termo: "", escolhido: null, salvando: false });
+        setContMsg(null);
+        return;
+      }
+      setContMsg({ tipo: "erro", texto: `"${val}" não encontrado. Tente pelo nome (ex.: "torneira preta") ou pelo código do fornecedor.` });
+      return;
+    }
+    adicionarNaContagemProduto(prod);
   }
 
   async function aplicarContagem() {
@@ -3929,26 +4110,74 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
             ppId: scanPortaPaletePP ? scanPortaPaletePP.id : ((itensSeparPP.filter(i => i.ppId).slice(-1)[0] || {}).ppId || null) }
         : { tipo: null, usuario: usuarioLogado.email };
   const assinaturaPresenca = JSON.stringify(presencaDadosRef.current);
-  function enviarPresenca() {
+  // Limite do Supabase: ~5 atualizações de presença a cada 30 s por aparelho. Usamos no máximo 4 por 30 s
+  // (com pelo menos 1,5 s entre elas): as primeiras saem na hora e, durante bipes seguidos, o último estado
+  // é enviado assim que liberar.
+  const presencaEnviosRef = useRef([]);
+  const presencaTimerRef = useRef(null);
+  const PRESENCA_JANELA = 31000, PRESENCA_MAX = 4, PRESENCA_GAP = 1500;
+  function enviarPresencaAgora() {
     const c = presencaCanalRef.current;
     if (!c || !c.track) return;
+    presencaEnviosRef.current.push(Date.now());
     try { const r = c.track({ ...presencaDadosRef.current, t: Date.now() }); if (r && r.catch) r.catch(() => {}); } catch (e) {}
+  }
+  function enviarPresenca() {
+    if (presencaTimerRef.current) return; // já tem envio agendado: ele leva os dados mais novos
+    const agora = Date.now();
+    const envios = presencaEnviosRef.current = presencaEnviosRef.current.filter(t => agora - t < PRESENCA_JANELA);
+    let espera = 0;
+    if (envios.length >= PRESENCA_MAX) espera = envios[envios.length - PRESENCA_MAX] + PRESENCA_JANELA - agora;
+    if (envios.length) espera = Math.max(espera, envios[envios.length - 1] + PRESENCA_GAP - agora);
+    if (espera <= 0) { enviarPresencaAgora(); return; }
+    presencaTimerRef.current = setTimeout(() => { presencaTimerRef.current = null; enviarPresencaAgora(); }, espera + 50);
   }
   useEffect(() => {
     if (!supabaseClient.channel) return;
-    const chave = (usuarioLogado.email || "anon") + ":" + Math.random().toString(36).slice(2, 8);
-    const canal = supabaseClient.channel("stockctrl-presenca", { config: { presence: { key: chave } } });
-    canal.on("presence", { event: "sync" }, () => {
-      const estado = canal.presenceState ? canal.presenceState() : {};
-      const lista = [];
-      Object.values(estado).forEach(arr => (arr || []).forEach(p => { if (p && p.tipo) lista.push(p); }));
-      setPresencas(lista);
-    });
-    canal.subscribe((status) => { if (status === "SUBSCRIBED") { presencaCanalRef.current = canal; enviarPresenca(); } });
+    let ativo = true, canal = null, tentativas = 0, timerReconectar = null;
+    const conectar = () => {
+      if (!ativo) return;
+      if (canal) { const velho = canal; canal = null; presencaCanalRef.current = null; try { supabaseClient.removeChannel && supabaseClient.removeChannel(velho); } catch (e) {} }
+      const chave = (usuarioLogado.email || "anon") + ":" + Math.random().toString(36).slice(2, 8);
+      const c = supabaseClient.channel("stockctrl-presenca", { config: { presence: { key: chave } } });
+      canal = c;
+      c.on("presence", { event: "sync" }, () => {
+        const estado = c.presenceState ? c.presenceState() : {};
+        const lista = [];
+        Object.values(estado).forEach(arr => (arr || []).forEach(p => { if (p && p.tipo) lista.push(p); }));
+        setPresencas(lista);
+      });
+      c.subscribe((status) => {
+        if (!ativo || canal !== c) return;
+        if (status === "SUBSCRIBED") {
+          tentativas = 0;
+          presencaCanalRef.current = c;
+          enviarPresenca();
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT" || status === "CLOSED") {
+          presencaCanalRef.current = null;
+          clearTimeout(timerReconectar);
+          const atraso = Math.min(30000, 3000 * Math.pow(2, tentativas++));
+          timerReconectar = setTimeout(conectar, atraso);
+        }
+      });
+    };
+    conectar();
+    // celular voltou da tela bloqueada / outra aba: confere a conexão e reenvia o que está fazendo
+    const aoVoltar = () => {
+      if (document.visibilityState !== "visible") return;
+      if (!presencaCanalRef.current) { clearTimeout(timerReconectar); tentativas = 0; conectar(); }
+      else enviarPresenca();
+    };
+    document.addEventListener("visibilitychange", aoVoltar);
+    // reforço leve: a cada 45 s reenvia a presença (se o servidor tiver descartado, ela volta)
+    const reforco = setInterval(() => { if (document.visibilityState === "visible") enviarPresenca(); }, 45000);
     return () => {
+      ativo = false;
+      clearTimeout(timerReconectar); clearInterval(reforco);
+      clearTimeout(presencaTimerRef.current); presencaTimerRef.current = null;
+      document.removeEventListener("visibilitychange", aoVoltar);
       presencaCanalRef.current = null;
-      try { canal.untrack && canal.untrack(); } catch (e) {}
-      if (supabaseClient.removeChannel) supabaseClient.removeChannel(canal);
+      if (canal) { try { canal.untrack && canal.untrack(); } catch (e) {} if (supabaseClient.removeChannel) supabaseClient.removeChannel(canal); }
     };
   }, []);
   useEffect(() => { enviarPresenca(); }, [assinaturaPresenca]);
@@ -4571,8 +4800,12 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                 <h1 style={{ fontFamily: "'Archivo', sans-serif", fontSize: 24, fontWeight: 800, marginBottom: 4 }}>Controle de estoque</h1>
                 <p style={{ color: "#8893A6", fontSize: 13.5 }}>{produtosFiltrados.length} produtos · localização por fileira, porta-palete e nível</p>
               </div>
-              <Btn variant="primary" icon="plus" onClick={() => abrirModalProduto(null)}>Novo produto</Btn>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+                {usuarioLogado.admin && <Btn icon="download" onClick={() => { setModalImport(true); setImpLeitura(null); setImpResultado(null); setImpErro(null); setImpStatus(null); }}>Importar cadastro (Tiny)</Btn>}
+                <Btn variant="primary" icon="plus" onClick={() => abrirModalProduto(null)}>Novo produto</Btn>
+              </div>
             </div>
+
             <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
               <div style={{ position: "relative", flex: 1, minWidth: 240, maxWidth: 340 }}>
                 <Icon name="search" size={15} style={{ position: "absolute", left: 12, top: 11, color: "#5C6678" }}  />
@@ -5399,11 +5632,71 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                 <div style={{ display: "flex", gap: 10 }}>
                   <input ref={contScanRef} autoFocus value={contScan} onChange={e => setContScan(e.target.value)}
                     onKeyDown={e => { if (e.key === "Enter") handleScanContagem(contScan); }}
-                    placeholder={contPP ? "Bipe o produto ou digite o código e pressione Enter..." : "Bipe a etiqueta da porta-palete..."}
+                    placeholder={contPP ? "Bipe o produto ou digite nome, EAN, SKU ou código do fornecedor..." : "Bipe a etiqueta da porta-palete..."}
                     style={{ width: "100%", background: "#0F141C", border: "1px solid #3A4658", borderRadius: 8, padding: "12px 16px", color: "#F3EFE6", fontSize: 16, outline: "none", fontFamily: "monospace", boxSizing: "border-box" }} />
                   <button onClick={() => handleScanContagem(contScan)} style={{ background: "#D2A256", border: "none", borderRadius: 8, padding: "0 20px", color: "#1A1408", fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>Confirmar</button>
                   <button title="Bipar com a câmera" onClick={() => setScannerAlvo("contagem")} style={{ background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, color: "#D2A256", cursor: "pointer", width: 44, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="camera" size={17} /></button>
                 </div>
+                {contLigar && (
+                  <div data-teste="ligar-painel" style={{ marginTop: 12, background: "#0F141C", border: "2px solid #6FB0E0", borderRadius: 10, padding: 12 }}>
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 14, fontWeight: 700, color: "#E8E4D9" }}>Código ainda não ligado a um produto</div>
+                        <div style={{ fontSize: 12.5, color: "#8893A6" }}><span style={{ fontFamily: "monospace", color: "#6FB0E0" }}>{contLigar.codigo}</span> · busque o produto pelo nome, SKU ou código do fornecedor e ligue o código a ele</div>
+                      </div>
+                      <button type="button" onClick={() => setContLigar(null)} style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer", fontSize: 18 }}>✕</button>
+                    </div>
+                    <input autoFocus data-teste="ligar-busca" value={contLigar.termo} placeholder="Digite o nome do produto, SKU ou código do fornecedor..."
+                      onChange={e => setContLigar(c => ({ ...c, termo: e.target.value, escolhido: null }))}
+                      style={{ ...inputStyle, fontSize: 15, padding: "11px 14px" }} />
+                    {resultadosLigar.length > 0 && <div style={{ fontSize: 12, color: "#8893A6", margin: "8px 2px 4px" }}>Toque no produto certo e depois em <b style={{ color: "#6FB0E0" }}>Ligar código</b></div>}
+                    {normBusca(contLigar.termo).length >= 2 && resultadosLigar.length === 0 && <div style={{ fontSize: 12.5, color: "#FFC107", margin: "8px 2px" }}>Nenhum produto encontrado. Tente outra palavra ou cadastre o produto.</div>}
+                    <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                      {resultadosLigar.map(({ p }) => {
+                        const sel = contLigar.escolhido && contLigar.escolhido.id === p.id;
+                        return (
+                          <button key={p.id} type="button" data-teste="ligar-item" onClick={() => setContLigar(c => ({ ...c, escolhido: p }))}
+                            style={{ display: "flex", width: "100%", textAlign: "left", gap: 10, alignItems: "center", background: sel ? "#15243A" : "none", border: "none", borderBottom: "1px solid #1B2433", borderLeft: sel ? "3px solid #6FB0E0" : "3px solid transparent", padding: "9px 10px", cursor: "pointer", color: "#F3EFE6" }}>
+                            <span style={{ width: 64, flexShrink: 0, fontSize: 12, color: "#8893A6", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis" }}>{p.sku && !/^0+$/.test(String(p.sku)) ? p.sku : "—"}</span>
+                            <span style={{ flex: 1, minWidth: 0 }}>
+                              <span style={{ display: "block", fontSize: 13.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.nome}</span>
+                              <span style={{ display: "block", fontSize: 11.5, color: "#8893A6" }}>
+                                {p.empresaId ? empresaNome(p.empresaId) : ""}{p.empresaId ? "  " : ""}
+                                {p.codigoBarras ? <span style={{ fontFamily: "monospace" }}>EAN {p.codigoBarras}</span> : <span style={{ color: "#FF8A5C" }}>sem código</span>}
+                                {p.marca ? <span style={{ fontFamily: "monospace" }}> · Forn. {p.marca}</span> : null}
+                              </span>
+                            </span>
+                            {sel && <span style={{ color: "#6FB0E0", fontWeight: 700 }}>✓</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
+                    {contLigar.escolhido && (
+                      <button type="button" data-teste="ligar-botao" disabled={contLigar.salvando} onClick={ligarCodigoAoProduto}
+                        style={{ marginTop: 10, width: "100%", background: "#6FB0E0", border: "none", borderRadius: 8, padding: "13px 16px", color: "#08131F", fontWeight: 800, fontSize: 15, cursor: "pointer" }}>
+                        {contLigar.salvando ? "Ligando..." : `Ligar código a "${contLigar.escolhido.nome.slice(0, 40)}${contLigar.escolhido.nome.length > 40 ? "…" : ""}" e contar +1`}
+                      </button>
+                    )}
+                  </div>
+                )}
+                {sugestoesCont.length > 0 && (
+                  <div data-teste="cont-sugestoes" style={{ marginTop: 8, background: "#0F141C", border: "1px solid #2A3445", borderRadius: 8, overflow: "hidden" }}>
+                    {sugestoesCont.map(({ p, exato }) => (
+                      <button key={p.id} type="button" onMouseDown={e => e.preventDefault()} onClick={() => adicionarNaContagemProduto(p)}
+                        style={{ display: "flex", width: "100%", textAlign: "left", gap: 10, alignItems: "center", background: "none", border: "none", borderBottom: "1px solid #1B2433", padding: "10px 12px", cursor: "pointer", color: "#F3EFE6" }}>
+                        <span style={{ flex: 1, minWidth: 0 }}>
+                          <span style={{ display: "block", fontSize: 14, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.nome}</span>
+                          <span style={{ display: "block", fontSize: 11.5, color: "#8893A6", fontFamily: "monospace" }}>
+                            {[p.codigoBarras && `EAN ${p.codigoBarras}`, p.sku && !/^0+$/.test(String(p.sku)) && `SKU ${p.sku}`, p.marca && `Forn. ${p.marca}`].filter(Boolean).join(" · ") || "sem código"}
+                          </span>
+                        </span>
+                        {idsEsperadosCont.has(p.id) && <span style={{ fontSize: 11, color: "#2BD45F", border: "1px solid #1F5A33", borderRadius: 5, padding: "2px 6px", whiteSpace: "nowrap" }}>nesta porta-palete</span>}
+                        {exato && <span style={{ fontSize: 11, color: "#D2A256", whiteSpace: "nowrap" }}>código exato</span>}
+                        <span style={{ fontSize: 18, color: "#D2A256", fontWeight: 700 }}>+</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 {!contPP && portaPaletes.length > 0 && (
                   <div style={{ marginTop: 12, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                     <span style={{ fontSize: 12.5, color: "#8893A6" }}>ou escolha:</span>
@@ -5800,6 +6093,36 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
       )}
 
       {/* MODAL: Produto */}
+      {modalImport && (
+        <Modal title="Importar cadastro de produtos" onClose={() => { if (!impStatus) setModalImport(false); }} width={560}>
+          <div data-teste="imp-modal" style={{ fontSize: 13, color: "#AEB7C7", lineHeight: 1.55, marginBottom: 12 }}>
+            Escolha a planilha exportada do Tiny (.xlsx). Entram <b style={{ color: "#E8E4D9" }}>nome, SKU, código de barras (EAN), unidade e empresa</b>.
+            <b style={{ color: "#E8E4D9" }}> Nenhuma quantidade é alterada</b>: produtos novos entram com estoque 0. Quem já existe (mesmo SKU ou mesmo EAN) não é duplicado, só completa o que faltar.
+            Kits e produtos inativos ficam de fora.
+          </div>
+          <input type="file" accept=".xlsx,.xls,.csv" disabled={!!impStatus} onChange={e => { if (e.target.files[0]) lerPlanilhaCadastro(e.target.files[0]); e.target.value = ""; }}
+            style={{ ...inputStyle, padding: 8 }} />
+          {impStatus && <div style={{ marginTop: 12, fontSize: 13, color: "#D2A256" }}>{impStatus}</div>}
+          {impErro && <div style={{ marginTop: 12, fontSize: 13, color: "#FF8A7A", background: "#2A1515", border: "1px solid #5A2A2A", borderRadius: 8, padding: 10 }}>{impErro}</div>}
+          {impLeitura && !impStatus && (
+            <div data-teste="imp-resumo" style={{ marginTop: 14, background: "#0F141C", border: "1px solid #2A3445", borderRadius: 10, padding: 14, fontSize: 13, color: "#AEB7C7", lineHeight: 1.7 }}>
+              <div style={{ color: "#E8E4D9", fontWeight: 700, marginBottom: 4 }}>{impLeitura.arquivo}</div>
+              <div>{impLeitura.linhas.toLocaleString("pt-BR")} linhas na planilha</div>
+              <div>− {impLeitura.kits.toLocaleString("pt-BR")} kits e {impLeitura.inativos.toLocaleString("pt-BR")} inativos (ficam de fora){impLeitura.semSku ? ` · ${impLeitura.semSku} sem SKU/nome` : ""}</div>
+              <div>− {impLeitura.duplicados.toLocaleString("pt-BR")} repetidos (mesmo SKU em mais de uma conta → vira 1 cadastro)</div>
+              <div style={{ color: "#E8E4D9", fontWeight: 700, marginTop: 4 }}>= {impLeitura.itens.length.toLocaleString("pt-BR")} produtos · {impLeitura.comEan.toLocaleString("pt-BR")} com código de barras</div>
+              <div>{impLeitura.jaTem.toLocaleString("pt-BR")} já existem no sistema (serão completados, sem duplicar) · ~{(impLeitura.itens.length - impLeitura.jaTem).toLocaleString("pt-BR")} novos</div>
+              <div style={{ marginTop: 10 }}><Btn variant="primary" onClick={confirmarImportCadastro}>Importar {impLeitura.itens.length.toLocaleString("pt-BR")} produtos</Btn></div>
+            </div>
+          )}
+          {impResultado && !impStatus && (
+            <div data-teste="imp-resultado" style={{ marginTop: 14, background: "#0F2417", border: "1px solid #1F5A33", borderRadius: 10, padding: 14, fontSize: 13.5, color: "#2BD45F", lineHeight: 1.7 }}>
+              ✓ Pronto: <b>{impResultado.novos.toLocaleString("pt-BR")}</b> produtos novos cadastrados · <b>{impResultado.atualizados.toLocaleString("pt-BR")}</b> completados · {impResultado.sem_mudanca.toLocaleString("pt-BR")} já estavam certos.
+              <div style={{ color: "#AEB7C7", fontSize: 12.5 }}>Agora é só bipar ou buscar pelo nome na Contagem.</div>
+            </div>
+          )}
+        </Modal>
+      )}
       {modalProduto && (
         <Modal title={modalProduto.id ? "Editar produto" : "Novo produto"} onClose={() => setModalProduto(null)}>
           <form onSubmit={e => {
