@@ -3840,6 +3840,44 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   const indiceBuscaProdutos = useMemo(() => montarIndiceBusca(produtos), [produtos]);
   // código bipado que não existe: buscar o produto e ligar o código a ele
   const [contLigar, setContLigar] = useState(null);   // { codigo, termo, escolhido, salvando }
+  // trocar um produto cadastrado à mão pelo cadastro certo (ex.: do Tiny)
+  const [contTrocar, setContTrocar] = useState(null); // { origem, termo, escolhido, salvando }
+  const resultadosTrocar = contTrocar && normBusca(contTrocar.termo).length >= 2
+    ? buscarProdutos(indiceBuscaProdutos, contTrocar.termo, null, 30).filter(r => r.p.id !== contTrocar.origem.id).slice(0, 25) : [];
+  function abrirTrocarProduto(prod) {
+    const termo = String(prod.nome || "").split(/\s+/).filter(w => w.length > 1).slice(0, 3).join(" ");
+    setContLigar(null);
+    setContTrocar({ origem: prod, termo, escolhido: null, salvando: false });
+  }
+  async function confirmarTrocarProduto() {
+    if (!contTrocar || !contTrocar.escolhido || contTrocar.salvando) return;
+    const o = contTrocar.origem, d = contTrocar.escolhido;
+    const avisoCodigo = o.codigoBarras && d.codigoBarras && String(o.codigoBarras).trim() !== String(d.codigoBarras).trim()
+      ? `\n\nAtenção: os dois têm código de barras diferente. Fica o do novo (${d.codigoBarras}); o ${o.codigoBarras} deixa de funcionar.` : "";
+    if (!confirm(`Substituir\n"${o.nome}" (SKU ${o.sku || "—"})\npor\n"${d.nome}" (SKU ${d.sku || "—"})?\n\nA quantidade, as porta-paletes e o histórico passam para o novo, e o cadastro antigo é apagado.${avisoCodigo}`)) return;
+    setContTrocar(c => ({ ...c, salvando: true }));
+    const { data, error } = await supabaseClient.rpc("substituir_produto", { p_origem: o.id, p_destino: d.id, p_usuario: usuarioLogado.email });
+    if (error) {
+      tocarSom("erro");
+      setContTrocar(c => ({ ...c, salvando: false }));
+      setContMsg({ tipo: "erro", texto: "Não consegui substituir: " + error.message });
+      return;
+    }
+    // a contagem em andamento passa a usar o produto novo
+    setContItens(prev => {
+      if (prev[o.id] === undefined) return prev;
+      const n = { ...prev }; const v = n[o.id]; delete n[o.id];
+      n[d.id] = n[d.id] === undefined || n[d.id] === "" ? v : (Number(n[d.id]) || 0) + (Number(v) || 0);
+      return n;
+    });
+    setContOrdem(prev => [...new Set(prev.map(id => id === o.id ? d.id : id))]);
+    setProdutos(prev => prev.filter(p => p.id !== o.id).map(p => p.id === d.id
+      ? { ...p, qtd: (Number(p.qtd) || 0) + (Number(o.qtd) || 0), codigoBarras: p.codigoBarras || o.codigoBarras } : p));
+    setContTrocar(null);
+    tocarSom("ok");
+    setContMsg({ tipo: "ok", texto: `✓ "${o.nome}" substituído por "${d.nome}" (SKU ${d.sku || "—"}).` });
+    recarregarTudo();
+  }
   const resultadosLigar = contLigar && normBusca(contLigar.termo).length >= 2
     ? buscarProdutos(indiceBuscaProdutos, contLigar.termo, null, 25)
         .sort((a, b) => (a.p.codigoBarras ? 1 : 0) - (b.p.codigoBarras ? 1 : 0) || b.nota - a.nota) : [];
@@ -3872,8 +3910,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   }, [contPP, contItens, contOrdem]);
 
   useEffect(() => {
-    if (tela === "contagem" && contScanRef.current && !contConfirmar && !contLigar) contScanRef.current.focus();
-  }, [tela, contPP, contMsg, contConfirmar, !!contLigar]);
+    if (tela === "contagem" && contScanRef.current && !contConfirmar && !contLigar && !contTrocar) contScanRef.current.focus();
+  }, [tela, contPP, contMsg, contConfirmar, !!contLigar, !!contTrocar]);
 
   async function recarregarContagens() {
     const { data, error } = await supabaseClient.from("contagens").select("*").order("id", { ascending: false }).limit(50);
@@ -5735,6 +5773,49 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                     <input type="checkbox" checked={contZerar} onChange={e => setContZerar(e.target.checked)} />
                     Produto que o sistema diz estar nesta porta-palete e não for contado fica com <b>0</b> nela
                   </label>
+                  {contTrocar && (
+                    <div data-teste="trocar-painel" style={{ marginBottom: 12, background: "#0F141C", border: "2px solid #D2A256", borderRadius: 10, padding: 12 }}>
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 10, marginBottom: 10 }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 14, fontWeight: 700, color: "#E8E4D9" }}>Substituir produto</div>
+                          <div style={{ fontSize: 12.5, color: "#8893A6" }}>
+                            Trocar <b style={{ color: "#E8E4D9" }}>{contTrocar.origem.nome}</b> <span style={{ fontFamily: "monospace" }}>(SKU {contTrocar.origem.sku || "—"}{contTrocar.origem.codigoBarras ? ` · EAN ${contTrocar.origem.codigoBarras}` : ""})</span> pelo cadastro certo. Quantidade, porta-paletes e histórico passam para o novo e o antigo é apagado.
+                          </div>
+                        </div>
+                        <button type="button" onClick={() => setContTrocar(null)} style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer", fontSize: 18 }}>✕</button>
+                      </div>
+                      <input autoFocus data-teste="trocar-busca" value={contTrocar.termo} placeholder="Busque o produto certo pelo nome, SKU ou código..."
+                        onChange={e => setContTrocar(c => ({ ...c, termo: e.target.value, escolhido: null }))}
+                        style={{ ...inputStyle, fontSize: 15, padding: "11px 14px" }} />
+                      {normBusca(contTrocar.termo).length >= 2 && resultadosTrocar.length === 0 && <div style={{ fontSize: 12.5, color: "#FFC107", margin: "8px 2px" }}>Nenhum produto encontrado. Tente outra palavra ou o SKU.</div>}
+                      <div style={{ maxHeight: 300, overflowY: "auto", marginTop: 6 }}>
+                        {resultadosTrocar.map(({ p }) => {
+                          const sel = contTrocar.escolhido && contTrocar.escolhido.id === p.id;
+                          return (
+                            <button key={p.id} type="button" data-teste="trocar-item" onClick={() => setContTrocar(c => ({ ...c, escolhido: p }))}
+                              style={{ display: "flex", width: "100%", textAlign: "left", gap: 10, alignItems: "center", background: sel ? "#2B2410" : "none", border: "none", borderBottom: "1px solid #1B2433", borderLeft: sel ? "3px solid #D2A256" : "3px solid transparent", padding: "9px 10px", cursor: "pointer", color: "#F3EFE6" }}>
+                              <span style={{ width: 64, flexShrink: 0, fontSize: 12, color: "#8893A6", fontFamily: "monospace", overflow: "hidden", textOverflow: "ellipsis" }}>{p.sku && !/^0+$/.test(String(p.sku)) ? p.sku : "—"}</span>
+                              <span style={{ flex: 1, minWidth: 0 }}>
+                                <span style={{ display: "block", fontSize: 13.5, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{p.nome}</span>
+                                <span style={{ display: "block", fontSize: 11.5, color: "#8893A6" }}>
+                                  {p.empresaId ? empresaNome(p.empresaId) + "  " : ""}
+                                  {p.codigoBarras ? <span style={{ fontFamily: "monospace" }}>EAN {p.codigoBarras}</span> : <span style={{ color: "#FF8A5C" }}>sem código</span>}
+                                  {Number(p.qtd) ? <span> · estoque {Number(p.qtd).toLocaleString("pt-BR")}</span> : null}
+                                </span>
+                              </span>
+                              {sel && <span style={{ color: "#D2A256", fontWeight: 700 }}>✓</span>}
+                            </button>
+                          );
+                        })}
+                      </div>
+                      {contTrocar.escolhido && (
+                        <button type="button" data-teste="trocar-botao" disabled={contTrocar.salvando} onClick={confirmarTrocarProduto}
+                          style={{ marginTop: 10, width: "100%", background: "#D2A256", border: "none", borderRadius: 8, padding: "13px 16px", color: "#1A1408", fontWeight: 800, fontSize: 15, cursor: "pointer" }}>
+                          {contTrocar.salvando ? "Substituindo..." : `Substituir por "${contTrocar.escolhido.nome.slice(0, 40)}${contTrocar.escolhido.nome.length > 40 ? "…" : ""}" (SKU ${contTrocar.escolhido.sku || "—"})`}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <div style={{ border: "1px solid #2A3445", borderRadius: 10, overflow: "auto" }}>
                     <table>
                       <thead><tr><th>Produto</th><th>SKU</th><th style={{ textAlign: "center" }}>Sistema</th><th style={{ textAlign: "center" }}>Contado</th><th style={{ textAlign: "center" }}>Diferença</th><th></th></tr></thead>
@@ -5747,6 +5828,10 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                             <td style={{ fontWeight: 600 }}>
                               {l.prod.nome}
                               {!l.esperado && <div style={{ fontSize: 11, color: "#6FB0E0", fontWeight: 500 }}>não estava cadastrado aqui</div>}
+                              <button type="button" data-teste="trocar-abrir" onClick={() => abrirTrocarProduto(l.prod)}
+                                style={{ display: "block", marginTop: 3, background: "none", border: "none", padding: 0, color: "#D2A256", fontSize: 11.5, fontWeight: 600, cursor: "pointer", textDecoration: "underline" }}>
+                                Trocar produto / SKU
+                              </button>
                             </td>
                             <td style={{ fontFamily: "monospace", fontSize: 12, color: "#8893A6" }}>{l.prod.sku}</td>
                             <td style={{ textAlign: "center", fontWeight: 700 }}>{l.sistema}</td>
