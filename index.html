@@ -99,6 +99,7 @@ const TELAS_DISPONIVEIS = [
   { id: "portapaletes", label: "Porta-paletes" },
   { id: "separacaoPP", label: "Separação por Porta-palete" },
   { id: "contagem", label: "Contagem" },
+  { id: "contagemG2", label: "Contagem Galpão 2" },
   { id: "mapa3d", label: "Mapa 3D" },
 ];
 
@@ -544,6 +545,264 @@ function buscarProdutos(indice, consulta, preferidos, limite = 8) {
   }
   out.sort((a, b) => b.nota - a.nota || String(a.p.nome || "").localeCompare(String(b.p.nome || ""), "pt-BR"));
   return out.slice(0, limite);
+}
+
+// ==== CONTAGEM DO GALPÃO 2 (mercadoria no chão, 5 áreas) ====
+// Grava na tabela contagem_galpao2: NÃO mexe no estoque, nas porta-paletes nem nas movimentações do Galpão 1.
+// Cada bipe é um lançamento (várias pessoas contam juntas sem sobrescrever); o total é a soma.
+const G2_AREAS = [1, 2, 3, 4, 5];
+function hojeSP() { try { return new Date().toLocaleDateString("en-CA", { timeZone: "America/Sao_Paulo" }); } catch (e) { return new Date().toISOString().slice(0, 10); } }
+async function carregarContagemG2(dia) {
+  const tudo = []; const passo = 1000;
+  for (let de = 0; ; de += passo) {
+    const { data, error } = await supabaseClient.from("contagem_galpao2").select("*").eq("dia", dia).order("id", { ascending: true }).range(de, de + passo - 1);
+    if (error) throw error;
+    tudo.push(...(data || []));
+    if (!data || data.length < passo) break;
+  }
+  return tudo;
+}
+function csvG2(linhas) {
+  const esc = (v) => { const s = v == null ? "" : String(v); return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; };
+  return "﻿" + linhas.map(l => l.map(esc).join(";")).join("\r\n");
+}
+function baixarArquivoG2(nome, conteudo) {
+  const blob = new Blob([conteudo], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = nome; document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+function ContagemGalpao2({ produtos, indiceBusca, usuario, isAdmin, abrirCamera }) {
+  const [dia, setDia] = useState(hojeSP());
+  const [area, setAreaS] = useState(() => { try { const v = Number(localStorage.getItem("g2_area")); return G2_AREAS.includes(v) ? v : 1; } catch (e) { return 1; } });
+  const setArea = (a) => { setAreaS(a); try { localStorage.setItem("g2_area", String(a)); } catch (e) {} };
+  const [lanc, setLanc] = useState([]);
+  const [carregando, setCarregando] = useState(true);
+  const [erroCarga, setErroCarga] = useState("");
+  const [scan, setScan] = useState("");
+  const [qtd, setQtd] = useState("1");
+  const [msg, setMsg] = useState(null);
+  const [sugestoes, setSugestoes] = useState(null);   // { termo, lista }
+  const [semCad, setSemCad] = useState(null);         // { codigo, descricao }
+  const [enviando, setEnviando] = useState(false);
+  const [visao, setVisao] = useState("contar");       // contar | resumo
+  const [filtroResumo, setFiltroResumo] = useState("");
+  const scanRef = useRef(null);
+  const ehHoje = dia === hojeSP();
+
+  const carregar = useCallback(async () => {
+    try { const d = await carregarContagemG2(dia); setLanc(d); setErroCarga(""); }
+    catch (e) { setErroCarga("Não consegui carregar a contagem: " + (e.message || e)); }
+    finally { setCarregando(false); }
+  }, [dia]);
+  useEffect(() => { setCarregando(true); setLanc([]); carregar(); }, [carregar]);
+  // tempo real (outras pessoas contando) + conferência periódica
+  useEffect(() => {
+    let t = null; const agenda = () => { clearTimeout(t); t = setTimeout(carregar, 600); };
+    let canal = null;
+    try { canal = supabaseClient.channel("contagem-g2-" + Math.random().toString(36).slice(2)).on("postgres_changes", { event: "*", schema: "public", table: "contagem_galpao2" }, agenda).subscribe(); } catch (e) {}
+    const iv = setInterval(carregar, 20000);
+    return () => { clearTimeout(t); clearInterval(iv); try { canal && supabaseClient.removeChannel(canal); } catch (e) {} };
+  }, [carregar]);
+  const foco = () => setTimeout(() => { if (scanRef.current) scanRef.current.focus(); }, 30);
+  useEffect(() => { foco(); }, [area, visao]);
+  // leitura pela câmera (o scanner do app avisa por evento)
+  useEffect(() => {
+    const f = (e) => { const c = String((e.detail || "")).trim(); if (c) processar(c); };
+    window.addEventListener("stockctrl:g2-scan", f); return () => window.removeEventListener("stockctrl:g2-scan", f);
+  });
+
+  const prodPorId = useMemo(() => { const m = {}; (produtos || []).forEach(p => { m[p.id] = p; }); return m; }, [produtos]);
+  const chaveItem = (l) => l.produto_id ? "p:" + l.produto_id : "s:" + normBusca(l.descricao || l.codigo || "");
+  const nomeItem = (l) => { const p = l.produto_id && prodPorId[l.produto_id]; return p ? p.nome : (l.descricao || l.codigo || "Item sem cadastro"); };
+
+  // totais por item × área
+  const resumo = useMemo(() => {
+    const m = {};
+    lanc.forEach(l => {
+      const k = chaveItem(l);
+      if (!m[k]) { const p = l.produto_id && prodPorId[l.produto_id]; m[k] = { k, produtoId: l.produto_id, nome: nomeItem(l), sku: p ? p.sku : "", ean: p ? p.codigoBarras : (l.codigo || ""), semCadastro: !l.produto_id, areas: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }, total: 0, ult: 0 }; }
+      m[k].areas[l.area] = (m[k].areas[l.area] || 0) + Number(l.qtd); m[k].total += Number(l.qtd); m[k].ult = Math.max(m[k].ult, Number(l.id) || 0);
+    });
+    return Object.values(m);
+  }, [lanc, prodPorId]);
+  const totArea = useMemo(() => { const t = {}; G2_AREAS.forEach(a => { t[a] = { itens: 0, un: 0 }; }); resumo.forEach(r => G2_AREAS.forEach(a => { if (r.areas[a]) { t[a].itens++; t[a].un += r.areas[a]; } })); return t; }, [resumo]);
+  const daArea = useMemo(() => resumo.filter(r => r.areas[area]).sort((a, b) => b.ult - a.ult), [resumo, area]);
+  const ultimosDaArea = useMemo(() => lanc.filter(l => l.area === area).slice(-40).reverse(), [lanc, area]);
+
+  const qtdNum = () => { const n = Number(String(qtd).replace(",", ".")); return isFinite(n) && n > 0 ? n : 0; };
+  async function lancar({ produto, descricao, codigo }, n) {
+    if (!ehHoje) { setMsg({ tipo: "erro", texto: "Você está vendo outro dia. Volte para hoje para lançar." }); return; }
+    if (!n) { setMsg({ tipo: "erro", texto: "Quantidade inválida." }); tocarSom("erro"); return; }
+    setEnviando(true);
+    const linha = { dia, area, produto_id: produto ? produto.id : null, descricao: produto ? produto.nome : (descricao || null), codigo: codigo || (produto ? (produto.codigoBarras || produto.sku || null) : null), qtd: n, usuario: usuario || null };
+    const temp = { ...linha, id: "tmp" + Date.now(), criado_em: new Date().toISOString(), _temp: true };
+    setLanc(prev => [...prev, temp]);
+    const { data, error } = await supabaseClient.from("contagem_galpao2").insert(linha).select().single();
+    setEnviando(false);
+    if (error) {
+      setLanc(prev => prev.filter(l => l.id !== temp.id));
+      setMsg({ tipo: "erro", texto: "Não gravou: " + error.message }); tocarSom("erro"); foco(); return;
+    }
+    setLanc(prev => prev.map(l => l.id === temp.id ? data : l));
+    const nomeL = produto ? produto.nome : (descricao || codigo);
+    const totalAgora = resumo.filter(r => r.k === (produto ? "p:" + produto.id : "s:" + normBusca(descricao || codigo || ""))).reduce((s, r) => s + (r.areas[area] || 0), 0) + n;
+    setMsg({ tipo: "ok", texto: `+${n} ${nomeL} — Área ${area}: ${totalAgora}` }); tocarSom("ok");
+    setQtd("1"); setScan(""); setSugestoes(null); setSemCad(null); foco();
+  }
+  function processar(raw) {
+    const termo = String(raw || "").trim();
+    if (!termo) return;
+    const res = buscarProdutos(indiceBusca, termo, null, 8);
+    if (res.length && res[0].exato && !(res[1] && res[1].exato)) { lancar({ produto: res[0].p, codigo: termo }, qtdNum()); return; }
+    if (res.length) { setSugestoes({ termo, lista: res }); setScan(termo); tocarSom("info"); return; }
+    setSugestoes(null); setSemCad({ codigo: termo, descricao: "" }); setMsg({ tipo: "info", texto: `Nada encontrado para "${termo}". Pesquise de outro jeito ou lance como item sem cadastro.` }); tocarSom("erro");
+  }
+  async function apagar(l) {
+    if (!(isAdmin || l.usuario === usuario)) return;
+    if (!confirm(`Apagar o lançamento de ${l.qtd} × ${nomeItem(l)} (Área ${l.area})?`)) return;
+    const { error } = await supabaseClient.from("contagem_galpao2").delete().eq("id", l.id);
+    if (error) { setMsg({ tipo: "erro", texto: "Não apagou: " + error.message }); return; }
+    setLanc(prev => prev.filter(x => x.id !== l.id)); setMsg({ tipo: "info", texto: "Lançamento apagado." }); foco();
+  }
+  function exportar(detalhado) {
+    if (detalhado) {
+      const linhas = [["Data", "Hora", "Área", "SKU", "Código de barras", "Produto", "Quantidade", "Contado por"]];
+      lanc.forEach(l => { const p = l.produto_id && prodPorId[l.produto_id]; linhas.push([l.dia, new Date(l.criado_em).toLocaleTimeString("pt-BR"), "Área " + l.area, p ? p.sku : "", p ? p.codigoBarras : (l.codigo || ""), nomeItem(l) + (l.produto_id ? "" : " (sem cadastro)"), String(l.qtd).replace(".", ","), l.usuario || ""]); });
+      baixarArquivoG2(`contagem_galpao2_${dia}_lancamentos.csv`, csvG2(linhas));
+    } else {
+      const linhas = [["SKU", "Código de barras", "Produto", "Área 1", "Área 2", "Área 3", "Área 4", "Área 5", "Total Galpão 2"]];
+      resumo.slice().sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR")).forEach(r => linhas.push([r.sku || "", r.ean || "", r.nome + (r.semCadastro ? " (sem cadastro)" : ""), ...G2_AREAS.map(a => String(r.areas[a] || 0).replace(".", ",")), String(r.total).replace(".", ",")]));
+      baixarArquivoG2(`contagem_galpao2_${dia}.csv`, csvG2(linhas));
+    }
+  }
+
+  const msgCor = { ok: "#5CC98E", erro: "#E07A7A", info: "#6FB0E0" }, msgBg = { ok: "#143A2A", erro: "#3A1818", info: "#15324A" };
+  const caixa = { background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, padding: 16, marginBottom: 14 };
+  const btnSec = { background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, color: "#D2E1F5", padding: "8px 12px", cursor: "pointer", fontSize: 13, fontWeight: 600 };
+  const totalGeral = resumo.reduce((s, r) => s + r.total, 0);
+  const resumoFiltrado = resumo.filter(r => !filtroResumo || normBusca(r.nome + "|" + (r.sku || "") + "|" + (r.ean || "")).includes(normBusca(filtroResumo))).sort((a, b) => a.nome.localeCompare(b.nome, "pt-BR"));
+
+  return (
+    <div data-teste="contagem-g2">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+        <div>
+          <h1 style={{ fontFamily: "'Archivo', sans-serif", fontSize: 24, fontWeight: 800, marginBottom: 4, display: "flex", alignItems: "center", gap: 10 }}>
+            <Icon name="check-circle" size={22} color="#D2A256" /> Contagem · Galpão 2
+          </h1>
+          <p style={{ color: "#8893A6", fontSize: 13.5, maxWidth: 680 }}>Escolha a área, bipe ou pesquise o produto e lance a quantidade. Esta contagem fica separada: <b style={{ color: "#AEB7C7" }}>não altera o estoque do Galpão 1</b>.</p>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <input type="date" value={dia} max={hojeSP()} onChange={e => e.target.value && setDia(e.target.value)} style={{ background: "#0F141C", border: "1px solid #2A3445", borderRadius: 8, color: "#E8E4D9", padding: "7px 10px", fontSize: 13 }} />
+          <button style={{ ...btnSec, background: visao === "contar" ? "#D2A256" : "#1B2433", color: visao === "contar" ? "#1A1408" : "#AEB7C7" }} onClick={() => setVisao("contar")}>Contar</button>
+          <button style={{ ...btnSec, background: visao === "resumo" ? "#D2A256" : "#1B2433", color: visao === "resumo" ? "#1A1408" : "#AEB7C7" }} onClick={() => setVisao("resumo")}>Resumo do galpão</button>
+        </div>
+      </div>
+      {erroCarga && <div style={{ ...caixa, borderColor: "#5C2A2A", color: "#E07A7A" }}>{erroCarga} <button style={btnSec} onClick={carregar}>Tentar de novo</button></div>}
+      {!ehHoje && <div style={{ ...caixa, borderColor: "#5C4322", color: "#E8B458" }}>Vendo a contagem de {dia.split("-").reverse().join("/")}. Para lançar, volte para hoje. <button style={btnSec} onClick={() => setDia(hojeSP())}>Ir para hoje</button></div>}
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 14 }}>
+        {G2_AREAS.map(a => (
+          <button key={a} data-area={a} onClick={() => setArea(a)} style={{ textAlign: "left", padding: "12px 14px", borderRadius: 12, cursor: "pointer",
+            background: area === a && visao === "contar" ? "#2A2212" : "#161D29", border: "2px solid " + (area === a && visao === "contar" ? "#D2A256" : "#2A3445"), color: "#E8E4D9" }}>
+            <div style={{ fontSize: 16, fontWeight: 800, color: area === a && visao === "contar" ? "#D2A256" : "#E8E4D9" }}>Área {a}</div>
+            <div style={{ fontSize: 12, color: "#8893A6", marginTop: 3 }}>{totArea[a].itens} produto{totArea[a].itens === 1 ? "" : "s"} · {totArea[a].un.toLocaleString("pt-BR")} un.</div>
+          </button>))}
+      </div>
+
+      {visao === "contar" && (<>
+        <div style={{ background: "#161D29", border: "2px solid #D2A256", borderRadius: 12, padding: 16, marginBottom: 14 }}>
+          <div style={{ fontSize: 13, color: "#D2A256", fontWeight: 700, marginBottom: 10 }}>Contando a Área {area} · bipe o produto ou pesquise por nome, SKU, EAN ou código do fornecedor</div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <input data-teste="g2-qtd" value={qtd} onChange={e => setQtd(e.target.value.replace(/[^0-9.,]/g, ""))} inputMode="decimal" title="Quantidade de cada bipe"
+              style={{ width: 86, background: "#0F141C", border: "1px solid #3A4658", borderRadius: 8, padding: "12px 10px", color: "#F3EFE6", fontSize: 16, textAlign: "center" }} />
+            <input ref={scanRef} data-teste="g2-scan" autoFocus value={scan} onChange={e => { setScan(e.target.value); setSemCad(null); }} onKeyDown={e => { if (e.key === "Enter") processar(scan); }}
+              placeholder="Bipe o código ou digite o nome do produto..." disabled={!ehHoje}
+              style={{ flex: "1 1 260px", minWidth: 0, background: "#0F141C", border: "1px solid #3A4658", borderRadius: 8, padding: "12px 14px", color: "#F3EFE6", fontSize: 16, outline: "none", fontFamily: "monospace" }} />
+            <button onClick={() => processar(scan)} disabled={enviando || !ehHoje} style={{ background: "#D2A256", border: "none", borderRadius: 8, padding: "0 20px", color: "#1A1408", fontWeight: 700, cursor: "pointer" }}>Lançar</button>
+            {abrirCamera && <button title="Bipar com a câmera" onClick={abrirCamera} style={{ ...btnSec, width: 46, padding: 0, color: "#D2A256" }}><Icon name="camera" size={17} /></button>}
+          </div>
+          <div style={{ fontSize: 11.5, color: "#5C6678", marginTop: 6 }}>A quantidade à esquerda vale para o próximo bipe e volta para 1 depois de lançar.</div>
+          {msg && <div style={{ marginTop: 10, background: msgBg[msg.tipo], color: msgCor[msg.tipo], borderRadius: 8, padding: "8px 12px", fontSize: 13.5, fontWeight: 600 }}>{msg.texto}</div>}
+          {sugestoes && (
+            <div data-teste="g2-sugestoes" style={{ marginTop: 10, background: "#0F141C", border: "1px solid #2A3445", borderRadius: 10, overflow: "hidden" }}>
+              <div style={{ padding: "8px 12px", fontSize: 12, color: "#8893A6" }}>Escolha o produto para "{sugestoes.termo}":</div>
+              {sugestoes.lista.map(({ p }) => (
+                <div key={p.id} onClick={() => lancar({ produto: p, codigo: sugestoes.termo }, qtdNum())} style={{ padding: "9px 12px", borderTop: "1px solid #1E2738", cursor: "pointer", display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <span style={{ fontWeight: 600 }}>{p.nome}</span><span style={{ color: "#8893A6", fontSize: 12, fontFamily: "monospace" }}>{[p.sku, p.codigoBarras].filter(Boolean).join(" · ")}</span>
+                </div>))}
+              <div style={{ padding: "8px 12px", borderTop: "1px solid #1E2738", display: "flex", gap: 8 }}>
+                <button style={btnSec} onClick={() => { setSemCad({ codigo: sugestoes.termo, descricao: "" }); setSugestoes(null); }}>Não é nenhum desses (sem cadastro)</button>
+                <button style={btnSec} onClick={() => { setSugestoes(null); setScan(""); foco(); }}>Cancelar</button>
+              </div>
+            </div>)}
+          {semCad && (
+            <div data-teste="g2-semcad" style={{ marginTop: 10, background: "#0F141C", border: "1px solid #5C4322", borderRadius: 10, padding: 12 }}>
+              <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Lançar item sem cadastro <span style={{ fontFamily: "monospace", color: "#E8B458" }}>{semCad.codigo}</span></div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <input autoFocus value={semCad.descricao} onChange={e => setSemCad({ ...semCad, descricao: e.target.value })} placeholder="Descreva o item (nome, marca...)"
+                  onKeyDown={e => { if (e.key === "Enter" && semCad.descricao.trim()) lancar({ descricao: semCad.descricao.trim(), codigo: semCad.codigo }, qtdNum()); }}
+                  style={{ flex: "1 1 240px", background: "#161D29", border: "1px solid #3A4658", borderRadius: 8, padding: "10px 12px", color: "#F3EFE6", fontSize: 14 }} />
+                <button style={{ ...btnSec, background: "#D2A256", color: "#1A1408", border: "none" }} disabled={!semCad.descricao.trim()} onClick={() => lancar({ descricao: semCad.descricao.trim(), codigo: semCad.codigo }, qtdNum())}>Lançar</button>
+                <button style={btnSec} onClick={() => { setSemCad(null); setScan(""); foco(); }}>Cancelar</button>
+              </div>
+            </div>)}
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 14 }}>
+          <div style={caixa}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>Área {area}: total por produto <span style={{ color: "#8893A6", fontWeight: 500, fontSize: 12.5 }}>({daArea.length} produtos · {totArea[area].un.toLocaleString("pt-BR")} un.)</span></div>
+            {carregando ? <div style={{ color: "#8893A6" }}>Carregando...</div> : daArea.length === 0 ? <div style={{ color: "#5C6678", fontSize: 13 }}>Nada contado nesta área ainda.</div> : (
+              <div style={{ maxHeight: 420, overflow: "auto" }}>
+                {daArea.map(r => (
+                  <div key={r.k} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "7px 2px", borderBottom: "1px solid #1E2738" }}>
+                    <div style={{ minWidth: 0 }}><div style={{ fontWeight: 600, fontSize: 13.5 }}>{r.nome}{r.semCadastro && <span style={{ color: "#E8B458", fontSize: 11 }}> · sem cadastro</span>}</div>
+                      <div style={{ color: "#5C6678", fontSize: 11.5, fontFamily: "monospace" }}>{[r.sku, r.ean].filter(Boolean).join(" · ")}</div></div>
+                    <div style={{ fontWeight: 800, fontSize: 16, color: "#5CC98E", whiteSpace: "nowrap" }}>{r.areas[area].toLocaleString("pt-BR")}</div>
+                  </div>))}
+              </div>)}
+          </div>
+          <div style={caixa}>
+            <div style={{ fontWeight: 700, marginBottom: 8 }}>Últimos lançamentos da Área {area}</div>
+            {ultimosDaArea.length === 0 ? <div style={{ color: "#5C6678", fontSize: 13 }}>Nenhum lançamento.</div> : (
+              <div style={{ maxHeight: 420, overflow: "auto" }}>
+                {ultimosDaArea.map(l => (
+                  <div key={l.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 2px", borderBottom: "1px solid #1E2738", opacity: l._temp ? 0.6 : 1 }}>
+                    <div style={{ color: "#8893A6", fontSize: 11.5, width: 44 }}>{new Date(l.criado_em).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}</div>
+                    <div style={{ flex: 1, minWidth: 0 }}><div style={{ fontSize: 13, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{nomeItem(l)}</div><div style={{ color: "#5C6678", fontSize: 11 }}>{l.usuario || ""}</div></div>
+                    <div style={{ fontWeight: 700, color: Number(l.qtd) < 0 ? "#E07A7A" : "#E8E4D9" }}>{Number(l.qtd) > 0 ? "+" : ""}{Number(l.qtd).toLocaleString("pt-BR")}</div>
+                    {(isAdmin || l.usuario === usuario) && !l._temp && ehHoje && <button title="Apagar lançamento" data-teste="g2-apagar" onClick={() => apagar(l)} style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer", fontSize: 15 }}>✕</button>}
+                  </div>))}
+              </div>)}
+          </div>
+        </div>
+      </>)}
+
+      {visao === "resumo" && (
+        <div style={caixa}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
+            <div style={{ fontWeight: 700 }}>Galpão 2 em {dia.split("-").reverse().join("/")}: {resumo.length} produtos · {totalGeral.toLocaleString("pt-BR")} un.</div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <input value={filtroResumo} onChange={e => setFiltroResumo(e.target.value)} placeholder="Filtrar..." style={{ background: "#0F141C", border: "1px solid #2A3445", borderRadius: 8, color: "#E8E4D9", padding: "7px 10px", fontSize: 13 }} />
+              <button style={btnSec} onClick={() => exportar(false)} disabled={!resumo.length}>Baixar planilha (por produto)</button>
+              <button style={btnSec} onClick={() => exportar(true)} disabled={!lanc.length}>Baixar lançamentos</button>
+            </div>
+          </div>
+          <div style={{ overflow: "auto", maxHeight: 560 }}>
+            <table>
+              <thead><tr><th>SKU</th><th>Produto</th>{G2_AREAS.map(a => <th key={a} style={{ textAlign: "right" }}>Área {a}</th>)}<th style={{ textAlign: "right" }}>Total</th></tr></thead>
+              <tbody>
+                {resumoFiltrado.map(r => (
+                  <tr key={r.k}><td style={{ fontFamily: "monospace", fontSize: 12.5 }}>{r.sku || "—"}</td><td>{r.nome}{r.semCadastro && <span style={{ color: "#E8B458", fontSize: 11 }}> · sem cadastro</span>}</td>
+                    {G2_AREAS.map(a => <td key={a} style={{ textAlign: "right", color: r.areas[a] ? "#E8E4D9" : "#3A4658" }}>{(r.areas[a] || 0).toLocaleString("pt-BR")}</td>)}
+                    <td style={{ textAlign: "right", fontWeight: 800, color: "#5CC98E" }}>{r.total.toLocaleString("pt-BR")}</td></tr>))}
+                {!resumoFiltrado.length && <tr><td colSpan={8} style={{ color: "#5C6678" }}>{carregando ? "Carregando..." : "Nada contado."}</td></tr>}
+              </tbody>
+            </table>
+          </div>
+        </div>)}
+    </div>
+  );
 }
 
 function rowToProduto(r) {
@@ -2849,6 +3108,8 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
       if (codigoQuickAddPPRef.current) codigoQuickAddPPRef.current.value = codigo;
     } else if (scannerAlvo === "contagem") {
       handleScanContagem(codigo);
+    } else if (scannerAlvo === "contagemG2") {
+      try { window.dispatchEvent(new CustomEvent("stockctrl:g2-scan", { detail: codigo })); } catch (e) {}
     } else if (scannerAlvo === "separacaoPP") {
       handleScanPP(codigo);
     }
@@ -4571,11 +4832,12 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
     { id: "separacao", label: "Separação de Pedidos", icon: "clipboard-list" },
     { id: "separacaoPP", label: "Separação por Porta-palete", icon: "scan" },
     { id: "contagem", label: "Contagem", icon: "check-circle" },
+    { id: "contagemG2", label: "Contagem Galpão 2", icon: "check-circle" },
     { id: "mapa3d", label: "Mapa 3D", icon: "map-pin" },
   ];
   const menu = usuarioLogado.admin
     ? menuCompleto
-    : menuCompleto.filter(m => (usuarioLogado.permissoes || []).includes(m.id));
+    : menuCompleto.filter(m => (usuarioLogado.permissoes || []).includes(m.id) || (m.id === "contagemG2" && (usuarioLogado.permissoes || []).includes("contagem")));
 
   if (carregandoDados) {
     return (
@@ -5648,6 +5910,9 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
           </>
         )}
 
+        {tela === "contagemG2" && (
+          <ContagemGalpao2 produtos={produtos} indiceBusca={indiceBuscaProdutos} usuario={usuarioLogado.email} isAdmin={!!usuarioLogado.admin} abrirCamera={() => setScannerAlvo("contagemG2")} />
+        )}
         {tela === "contagem" && (() => {
           const msgColors = { ok: "#5CC98E", erro: "#E07A7A", info: "#6FB0E0" };
           const msgBg = { ok: "#143A2A", erro: "#3A1818", info: "#15324A" };
