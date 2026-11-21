@@ -174,6 +174,96 @@ function tocarSom(tipo) {
   } catch (e) { /* ambiente sem suporte a áudio — ignora silenciosamente */ }
 }
 
+// Gráfico de Pareto da curva ABC: uma barra por produto (da maior saída para a menor, na cor da curva)
+// e a linha do acumulado em %, com as marcas de 80% (fim da curva A) e 95% (fim da curva B)
+function GraficoPareto({ g }) {
+  const [dica, setDica] = useState(null);
+  const itens = g.lista.filter(x => x.saida > 0).slice(0, 40);
+  if (!itens.length) return <div style={{ color: "#5C6678", fontSize: 13, padding: "30px 0", textAlign: "center" }}>Nenhuma saída no período para montar o gráfico.</div>;
+  const W = 1000, H = 300, mE = 52, mD = 46, mT = 16, mB = 58, lw = W - mE - mD, lh = H - mT - mB;
+  const max = Math.max(...itens.map(x => x.saida)), passo = lw / itens.length, bw = Math.max(4, passo * 0.72);
+  const y = (v) => mT + lh - v / max * lh, yP = (p) => mT + lh - p / 100 * lh;
+  const pts = itens.map((x, i) => `${mE + passo * (i + 0.5)},${yP(x.acum)}`).join(" ");
+  const ticks = [0, 0.25, 0.5, 0.75, 1].map(f => Math.round(max * f));
+  return (
+    <div style={{ position: "relative", marginBottom: 14 }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: "auto", display: "block" }} onMouseLeave={() => setDica(null)}>
+        {ticks.map((t, i) => <g key={i}><line x1={mE} x2={W - mD} y1={y(t)} y2={y(t)} stroke="#222c3c" /><text x={mE - 8} y={y(t) + 4} fill="#8893A6" fontSize="11" textAnchor="end">{t.toLocaleString("pt-BR")}</text></g>)}
+        {[0, 50, 80, 95, 100].map(p => <text key={p} x={W - mD + 8} y={yP(p) + 4} fill={p === 80 ? CORES_GIRO.alta : p === 95 ? CORES_GIRO.media : "#8893A6"} fontSize="11" fontWeight={p === 80 || p === 95 ? 700 : 400}>{p}%</text>)}
+        <line x1={mE} x2={W - mD} y1={yP(80)} y2={yP(80)} stroke={CORES_GIRO.alta} strokeDasharray="5 5" opacity="0.8" />
+        <line x1={mE} x2={W - mD} y1={yP(95)} y2={yP(95)} stroke={CORES_GIRO.media} strokeDasharray="5 5" opacity="0.8" />
+        {itens.map((x, i) => { const k = g.classe[x.prod.id], cx = mE + passo * (i + 0.5);
+          return <g key={x.prod.id} onMouseEnter={() => setDica({ x, i, k })} style={{ cursor: "pointer" }}>
+            <rect x={cx - passo / 2} y={mT} width={passo} height={lh} fill="transparent" />
+            <rect x={cx - bw / 2} y={y(x.saida)} width={bw} height={mT + lh - y(x.saida)} rx="2" fill={CORES_GIRO[k]} opacity={dica && dica.i !== i ? 0.55 : 1} />
+            {itens.length <= 24 && <text x={cx} y={H - mB + 14} fill="#8893A6" fontSize="10.5" textAnchor="end" transform={`rotate(-40 ${cx} ${H - mB + 14})`}>{String(x.prod.sku || x.prod.nome).slice(0, 12)}</text>}
+          </g>; })}
+        <polyline points={pts} fill="none" stroke="#F3EFE6" strokeWidth="2.2" />
+        {itens.map((x, i) => <circle key={i} cx={mE + passo * (i + 0.5)} cy={yP(x.acum)} r="3" fill="#F3EFE6" />)}
+        <line x1={mE} x2={W - mD} y1={mT + lh} y2={mT + lh} stroke="#3a4558" />
+        <text x={mE} y={H - 4} fill="#5C6678" fontSize="11">Produtos, do que mais saiu para o que menos saiu{itens.length < g.lista.filter(x => x.saida > 0).length ? " (os 40 primeiros)" : ""}</text>
+        <text x={W - mD} y={H - 4} fill="#5C6678" fontSize="11" textAnchor="end">— linha branca: % acumulado das saídas</text>
+      </svg>
+      {dica && <div style={{ position: "absolute", left: `min(calc(${(mE + passo * (dica.i + 0.5)) / W * 100}% + 10px), calc(100% - 230px))`, top: 6, background: "rgba(12,15,20,0.96)", border: "1px solid " + CORES_GIRO[dica.k], borderRadius: 8, padding: "7px 10px", fontSize: 12.5, pointerEvents: "none", width: 220 }}>
+        <div style={{ fontWeight: 700, color: "#F3EFE6", marginBottom: 2 }}>{dica.x.prod.nome}</div>
+        <div style={{ color: CORES_GIRO[dica.k], fontWeight: 700 }}>{NOMES_GIRO[dica.k]}</div>
+        <div style={{ color: "#AEB7C7" }}>{dica.x.saida.toLocaleString("pt-BR")} un. · {dica.x.pct.toFixed(1)}% das saídas</div>
+        <div style={{ color: "#8893A6" }}>acumulado: {dica.x.acum.toFixed(1)}%</div>
+      </div>}
+    </div>
+  );
+}
+
+// Gráfico do dashboard: Curva ABC das saídas (A = 80% das saídas, B = 15%, C = 5%) + produtos com estoque e sem saída
+function GraficoGiro({ movimentacoes, produtos }) {
+  const [dias, setDias] = useState(90);
+  const [aberta, setAberta] = useState("alta");
+  const g = useMemo(() => calcularGiro(movimentacoes, produtos, dias), [movimentacoes, produtos, dias]);
+  const grupos = { alta: [], media: [], baixa: [], sem: [] };
+  g.lista.forEach(x => { const k = g.classe[x.prod.id]; if (k === "sem" && !((Number(x.prod.qtd) || 0) > 0)) return; grupos[k].push(x); });
+  const somaSaida = (k) => grupos[k].reduce((a, x) => a + x.saida, 0);
+  const nProd = Object.values(grupos).reduce((a, v) => a + v.length, 0) || 1;
+  const cartao = { background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, padding: 18, minWidth: 0 };
+  const lista = grupos[aberta], maxL = Math.max(1, ...lista.map(x => x.saida));
+  return (
+    <div style={{ marginBottom: 26 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 10 }}>
+        <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>Curva ABC de produtos (saídas)</h2>
+        <select value={dias} onChange={e => setDias(Number(e.target.value))} style={{ width: "auto", padding: "5px 10px", fontSize: 13 }}>
+          <option value={30}>Últimos 30 dias</option><option value={90}>Últimos 90 dias</option><option value={180}>Últimos 180 dias</option></select>
+        <span style={{ fontSize: 12, color: "#5C6678" }}>A = produtos que fazem 80% das saídas · B = próximos 15% · C = últimos 5%. Não conta ajuste, correção nem transferência.</span>
+      </div>
+      <div style={cartao}>
+        <GraficoPareto g={g} />
+        {/* barra única: quanto dos produtos está em cada curva */}
+        <div style={{ display: "flex", height: 26, borderRadius: 8, overflow: "hidden", marginBottom: 12, border: "1px solid #2A3445" }}>
+          {["alta", "media", "baixa", "sem"].map(k => grupos[k].length ? (
+            <div key={k} onClick={() => setAberta(k)} title={NOMES_GIRO[k]} style={{ width: grupos[k].length / nProd * 100 + "%", background: CORES_GIRO[k], display: "grid", placeItems: "center", color: "#111", fontWeight: 800, fontSize: 12, cursor: "pointer", minWidth: 28 }}>
+              {({ alta: "A", media: "B", baixa: "C", sem: "—" })[k]}</div>) : null)}
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10, marginBottom: 14 }}>
+          {["alta", "media", "baixa", "sem"].map(k => (
+            <button key={k} onClick={() => setAberta(k)} style={{ textAlign: "left", padding: "10px 12px", borderRadius: 10, cursor: "pointer", border: "1px solid " + (aberta === k ? CORES_GIRO[k] : "#2A3445"), background: aberta === k ? CORES_GIRO[k] + "1f" : "#1B2433", color: "#E8E4D9" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 7, fontWeight: 800, color: CORES_GIRO[k] }}><span style={{ width: 10, height: 10, borderRadius: 3, background: CORES_GIRO[k] }} />{NOMES_GIRO[k]}</div>
+              <div style={{ fontSize: 20, fontWeight: 800, marginTop: 4 }}>{grupos[k].length} <span style={{ fontSize: 12, color: "#8893A6", fontWeight: 500 }}>produto(s)</span></div>
+              <div style={{ fontSize: 12, color: "#8893A6" }}>{k === "sem" ? "com estoque e nenhuma saída" : somaSaida(k).toLocaleString("pt-BR") + " un. saíram · " + (g.total ? Math.round(somaSaida(k) / g.total * 100) : 0) + "% das saídas"}</div>
+            </button>))}
+        </div>
+        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 6, color: CORES_GIRO[aberta] }}>{NOMES_GIRO[aberta]} — {lista.length} produto(s)</div>
+        <div style={{ maxHeight: 300, overflowY: "auto" }}>
+          {lista.length ? lista.map(x => (
+            <div key={x.prod.id} style={{ display: "grid", gridTemplateColumns: "minmax(0, 1.3fr) minmax(0, 1fr) 70px 54px", gap: 10, alignItems: "center", padding: "5px 0", borderTop: "1px solid #1E2738" }}>
+              <div title={x.prod.nome} style={{ fontSize: 13, color: "#E8E4D9", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{x.prod.nome}<span style={{ color: "#5C6678", fontSize: 11.5 }}> · {x.prod.sku}</span></div>
+              <div style={{ height: 11, background: "#1B2433", borderRadius: 6, overflow: "hidden" }}><div style={{ width: (x.saida ? Math.max(3, x.saida / maxL * 100) : 0) + "%", height: "100%", background: CORES_GIRO[aberta], borderRadius: 6 }} /></div>
+              <div style={{ textAlign: "right", fontSize: 13, fontWeight: 700 }}>{x.saida.toLocaleString("pt-BR")} un.</div>
+              <div style={{ textAlign: "right", fontSize: 12, color: "#8893A6" }}>{x.pct ? x.pct.toFixed(1) + "%" : "—"}</div>
+            </div>)) : <div style={{ color: "#5C6678", fontSize: 13 }}>Nenhum produto nesta curva no período.</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function Stat({ label, value, sub, tone = "default" }) {
   const tones = {
     default: "#E8E4D9",
@@ -495,6 +585,317 @@ function salvarStorage(chave, valor) {
 }
 
 // ---- Conversão entre as colunas do Supabase (snake_case) e os objetos do app (camelCase) ----
+
+// ==== LEITURA DE NOTA FISCAL (XML da NF-e, PDF com texto, PDF digitalizado e foto) ====
+// Funções puras: não dependem do React nem do Supabase (assim dá para testar isoladas).
+const NF_UNIDADES = /^(UN|UND|UNID|UNI|UNIDADE|PC|PCS|PÇ|PÇS|PEC|PECA|PEÇA|PCT|PT|CX|CXA|KG|G|GR|MT|M|M2|M3|LT|L|ML|PAR|PR|JG|KIT|RL|ROL|FD|SC|DZ|CJ|BD|GL|TB|BL|EMB|FR|VD|AMP|TON|T|MIL|CT|BOB|BR|SAC)$/i;
+const NF_CABECALHO = /DADOS\s+ADICIONAIS|C[ÁA]LCULO\s+DO|ISSQN|INFORMA[ÇC][ÕO]ES\s+COMPLEMENTARES|RESERVADO\s+AO\s+FISCO|TRANSPORTADOR|VALOR\s+TOTAL\s+D|DESCRI[ÇC][ÃA]O\s+DO\s+PRODUTO|DADOS\s+DOS\s+PRODUTOS/i;
+const NF_INFO_EXTRA = /^(refer[eê]ncia|ref\.?|lote|fci|ped(ido)?|xped|info|valor\s+aprox|n[º°]\s*item|validade|fab)/i;
+
+// Número no formato brasileiro, tolerante ao que o OCR costuma trocar.
+function nfNumero(str) {
+  if (str == null) return NaN;
+  let s = String(str).trim().replace(/[^\d.,]/g, "");
+  if (!/\d/.test(s)) return NaN;
+  if (s.includes(",")) {
+    const i = s.lastIndexOf(",");
+    s = s.slice(0, i).replace(/[.,]/g, "") + "." + s.slice(i + 1).replace(/[.,]/g, "");
+  } else if (s.includes(".")) {
+    const partes = s.split(".");
+    if (partes.slice(1).every(p => p.length === 3)) s = partes.join("");          // 47.700 -> 47700
+    else s = partes.slice(0, -1).join("") + "." + partes[partes.length - 1];      // 1.020000000 -> 1.02 | 36.000.00 -> 36000.00
+  }
+  const n = parseFloat(s);
+  return isNaN(n) ? NaN : n;
+}
+
+// Corrige as trocas típicas do OCR em pedaços que deveriam ser só números (O->0, l->1, S->5...).
+function nfTokenNumerico(t) {
+  const m = String(t).replace(/^[\[({|'"`“”‘’]+/, "").replace(/[\])}|!;:'"`“”‘’]+$/, "");
+  if (!m) return m;
+  const digitos = (m.match(/\d/g) || []).length;
+  const parecidos = (m.match(/[\dOoDQlIS.,]/g) || []).length;
+  if (digitos >= 1 && parecidos / m.length >= 0.8) return m.replace(/[OoDQ]/g, "0").replace(/[lI]/g, "1").replace(/S/g, "5");
+  return m;
+}
+const nfEhNumero = (t) => /^\d[\d.,]*$/.test(t) && /\d/.test(t);
+
+// Tenta ler UMA linha da tabela "Dados dos produtos" do DANFE.
+// Âncora: NCM (8 dígitos) seguido de CST, CFOP, UN, QUANT, V.UNIT, V.TOTAL.
+function nfLerLinhaItem(linha) {
+  const tokens = linha.replace(/[|\[\]{}]/g, " ").split(/\s+/).filter(Boolean);
+  if (tokens.length < 4) return null;
+  const num = tokens.map(nfTokenNumerico);
+  for (let i = 1; i < tokens.length - 1; i++) {
+    const ncm = num[i].replace(/\./g, "");
+    if (!/^\d{8}$/.test(ncm)) continue;
+    const resto = num.slice(i + 1);
+    // unidade comercial (UN, PC, CX...) logo depois de CST/CFOP
+    let iUn = -1;
+    for (let k = 0; k < Math.min(6, resto.length); k++) {
+      if (NF_UNIDADES.test(tokens[i + 1 + k].replace(/[^A-Za-zÇç0-9]/g, ""))) { iUn = k; break; }
+    }
+    // linha de produto de verdade tem a unidade (UN, PC...) ou um CFOP (ex.: 5102, 6905) logo depois do NCM.
+    // Isso evita confundir com linhas do cabeçalho da nota (CEP, telefone, fatura/duplicata).
+    const temCfop = resto.slice(0, 4).some(t => /^[1-7]\d{3}$/.test(t));
+    if (iUn < 0 && !temCfop) continue;
+    let numeros;
+    if (iUn >= 0) {
+      numeros = resto.slice(iUn + 1).filter(nfEhNumero);
+      // OCR às vezes separa o milhar com espaço: "24 000" -> "24000"
+      if (numeros.length > 1 && /^\d{1,3}$/.test(numeros[0]) && /^\d{3}([.,]\d+)?$/.test(numeros[1])) numeros.splice(0, 2, numeros[0] + numeros[1]);
+    }
+    else {
+      numeros = resto.filter(nfEhNumero);
+      // sem unidade legível: descarta CST (3 díg.) e CFOP (4 díg.) do começo
+      let pul = 0;
+      while (numeros.length > 3 && pul < 2 && /^\d{3,4}$/.test(numeros[0])) { numeros.shift(); pul++; }
+    }
+    if (numeros.length < 1) continue;
+    const quantidade = nfNumero(numeros[0]);
+    if (!(quantidade > 0)) continue;
+
+    const antes = tokens.slice(0, i);
+    let codigo = "";
+    const cand = nfTokenNumerico(antes[0]);
+    if (antes.length >= 2 && /\d/.test(cand) && cand.length >= 3 && /^[A-Za-z0-9.\-\/_]+$/.test(cand)) {
+      codigo = cand;
+      antes.shift();
+    }
+    const descricao = antes.join(" ").replace(/^[-–—:;.,]+\s*/, "").replace(/\s*[-–—]+$/, "").trim();
+    return {
+      codigo, descricao, ncm,
+      unidade: iUn >= 0 ? tokens[i + 1 + iUn].replace(/[^A-Za-zÇç0-9]/g, "").toUpperCase() : "UN",
+      quantidade,
+      quantidadeTexto: numeros[0],
+      valorUnitario: numeros[1] ? nfNumero(numeros[1]) : 0,
+      valorTotal: numeros[2] ? nfNumero(numeros[2]) : 0,
+      outrosValores: numeros.slice(3, 6).map(nfNumero).filter(n => n > 0),
+    };
+  }
+  return null;
+}
+
+// Limpa a linha de continuação da descrição (ex.: "AMBAR 360LM o oo do Lo") cortando o lixo do OCR.
+function nfLimparContinuacao(linha) {
+  const tokens = linha.replace(/[|\[\]{}]/g, " ").split(/\s+/).filter(Boolean);
+  const out = [];
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k], prox = tokens[k + 1] || "";
+    if (/^[-–—]+$/.test(t)) continue;
+    if (t.length <= 2 && !/^\d+$/.test(t) && prox.length <= 2) break; // começo de sequência de lixo
+    out.push(t);
+  }
+  const txt = out.join(" ").trim();
+  const letras = (txt.match(/[A-Za-zÀ-ú0-9]/g) || []).length;
+  return txt.length >= 2 && letras / txt.length >= 0.7 ? txt : "";
+}
+
+function nfLerItensTexto(texto) {
+  const linhas = String(texto).split(/[\r\n]+/).map(l => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const itens = [];
+  let atual = null, linhasCont = 0;
+  for (const l of linhas) {
+    const it = nfLerLinhaItem(l);
+    if (it) { atual = it; linhasCont = 0; itens.push(it); continue; }
+    if (!atual) continue;
+    if (NF_CABECALHO.test(l)) { atual = null; continue; }
+    if (++linhasCont > 3) { atual = null; continue; }
+    // código que quebrou de linha na coluna COD. PROD.
+    const soNum = nfTokenNumerico(l.split(" ")[0]);
+    if (/^\d{1,6}$/.test(soNum) && l.split(" ").length <= 2 && /^\d+$/.test(atual.codigo || "x")) { atual.codigo += soNum; continue; }
+    if (NF_INFO_EXTRA.test(l.replace(/^[^A-Za-z]+/, ""))) { atual.infoExtra = (atual.infoExtra ? atual.infoExtra + " " : "") + l; continue; }
+    // linha que parece o começo de outro item (código longo + descrição) não é continuação
+    if (/[A-Za-z0-9]{9,}/.test(l.split(" ").slice(0, 3).join(" ")) && l.length > 40) { atual = null; continue; }
+    const cont = nfLimparContinuacao(l).slice(0, 45);
+    if (cont) atual.descricao = (atual.descricao + " " + cont).trim();
+  }
+  return itens;
+}
+
+// Os dígitos de a e b são quase iguais? (ex.: OCR leu 47.100 e o certo é 47.700)
+function nfDigitosParecidos(a, b) {
+  const sa = String(Math.round(a * 1000)), sb = String(Math.round(b * 1000));
+  if (sa.length !== sb.length) return false;
+  let dif = 0;
+  for (let k = 0; k < sa.length; k++) if (sa[k] !== sb[k]) dif++;
+  return dif <= 2;
+}
+
+// Confere QUANT × V.UNIT contra V.TOTAL. Se o OCR errou um dígito da quantidade, corrige pela conta.
+function nfConferirItem(it) {
+  const q = it.quantidade, vu = it.valorUnitario;
+  const totais = [it.valorTotal, ...(it.outrosValores || [])].filter(v => v > 0);
+  const candidatos = [];
+  totais.forEach(v => { candidatos.push(v); if (Number.isInteger(v)) candidatos.push(v / 100); });
+  const bate = (x, v) => v >= 1 && Math.abs(x - v) <= Math.max(0.02, v * 0.002);
+  if (!(vu > 0) || candidatos.length === 0)
+    return { ...it, conferido: false, aviso: "Não deu para conferir a quantidade com o valor da nota — confira." };
+  if (!candidatos.some(v => bate(q * vu, v)) && Number.isInteger(vu) && vu >= 10) {
+    for (let e = 1; e <= 10; e++) {
+      const vu2 = vu / Math.pow(10, e);
+      if (candidatos.some(v => bate(q * vu2, v))) return nfConferirItem({ ...it, valorUnitario: vu2 });
+    }
+  }
+  if (candidatos.some(v => bate(q * vu, v))) return { ...it, valorTotal: Math.round(q * vu * 100) / 100, conferido: true, aviso: "" };
+  for (const v of candidatos) {
+    const alt = Math.round((v / vu) * 1000) / 1000;
+    // "47,700" lido com vírgula vira 47,7: só nesse caso aceita a quantidade 10/100/1000x maior
+    const razao = alt / q, potencia10 = /,/.test(it.quantidadeTexto || "") && [10, 100, 1000].some(p => Math.abs(razao - p) < p * 1e-6);
+    if (alt > 0 && bate(alt * vu, v) && (nfDigitosParecidos(q, alt) || potencia10))
+      return { ...it, quantidade: alt, quantidadeLida: q, valorTotal: Math.round(alt * vu * 100) / 100, conferido: true,
+               aviso: `Quantidade corrigida de ${q.toLocaleString("pt-BR")} para ${alt.toLocaleString("pt-BR")} (bate com o valor total).` };
+    const altVu = v / q;
+    if (nfDigitosParecidos(vu, altVu)) return { ...it, valorUnitario: altVu, valorTotal: v, conferido: true, aviso: "" };
+  }
+  return { ...it, conferido: false, aviso: "Quantidade × valor unitário não bate com o valor total — confira na nota." };
+}
+
+// Junta várias leituras de OCR da mesma página (pré-processamentos diferentes).
+// Fica com o valor que confere com o valor total; se nenhum conferir e as leituras discordarem, avisa.
+function nfMaisComum(lista) {
+  const c = {}; let m = null;
+  lista.forEach(v => { if (v === "" || v == null) return; c[v] = (c[v] || 0) + 1; if (m === null || c[v] > c[m]) m = v; });
+  return m;
+}
+function nfMesclarLeituras(leituras) {
+  const validas = leituras.filter(l => l.length);
+  if (!validas.length) return [];
+  const pont = l => l.filter(x => x.conferido).length * 10 + l.length;
+  const base = validas.slice().sort((a, b) => pont(b) - pont(a))[0];
+  const usados = new Map(validas.map(l => [l, new Set()]));
+  return base.map((x, k) => {
+    // a mesma linha nas outras leituras: mesmo código; senão, mesma posição (se tiverem o mesmo nº de itens)
+    const versoes = [x];
+    validas.forEach(l => {
+      if (l === base) return;
+      const u = usados.get(l);
+      let j = x.codigo ? l.findIndex((y, i) => !u.has(i) && y.codigo === x.codigo) : -1;
+      if (j < 0 && l.length === base.length && !u.has(k)) j = k;
+      if (j >= 0) { u.add(j); versoes.push(l[j]); }
+    });
+    const ok = versoes.filter(v => v.conferido);
+    let item;
+    if (ok.length) item = { ...ok.find(v => v.quantidade === nfMaisComum(ok.map(o => o.quantidade))) };
+    else {
+      // sem conferência: fica com a quantidade mais repetida; se empatar e uma for o final da outra (7700 x 47700), fica com a maior
+      const qs = versoes.map(v => v.quantidade);
+      let q = nfMaisComum(qs);
+      const cont = qs.filter(v => v === q).length;
+      if (cont === 1) q = qs.slice().sort((a, b) => String(b).length - String(a).length)[0];
+      item = { ...(versoes.find(v => v.quantidade === q) || x) };
+    }
+    const qtds = [...new Set(versoes.map(v => v.quantidade))].filter(v => v > 0);
+    item.quantidadesLidas = ok.length ? [] : qtds;
+    if (!ok.length && qtds.length > 1)
+      item.aviso = "As leituras deram quantidades diferentes (" + qtds.map(q => q.toLocaleString("pt-BR")).join(" ou ") + ") — confira na nota.";
+    const cods = versoes.map(v => v.codigo).filter(Boolean);
+    item.codigo = nfMaisComum(cods) || "";
+    item.codigosLidos = [...new Set(cods)];
+    // descrição: a mais "limpa" (menos lixo de OCR); a que se repete ganha; a conferida ganha
+    const notaDesc = (v) => {
+      const d = v.descricao || ""; if (!d) return -1;
+      const t = d.split(" "), bons = t.filter(w => /^[A-Za-zÀ-ú0-9][A-Za-zÀ-ú0-9\-\/.,]*$/.test(w) && (w.length >= 2 || /\d/.test(w))).length;
+      const repete = versoes.filter(o => o.descricao === d).length;
+      return bons / t.length + (repete > 1 ? 0.3 : 0) + (v.conferido ? 0.1 : 0) - (d.length > 90 ? 0.3 : 0);
+    };
+    item.descricao = versoes.slice().sort((a, b) => notaDesc(b) - notaDesc(a))[0].descricao || x.descricao;
+    return item;
+  });
+}
+
+// Chave de acesso (44 dígitos, com dígito verificador módulo 11).
+function nfChaveValida(ch) {
+  if (!/^\d{44}$/.test(ch)) return false;
+  let soma = 0, peso = 2;
+  for (let k = 42; k >= 0; k--) { soma += Number(ch[k]) * peso; peso = peso === 9 ? 2 : peso + 1; }
+  const r = soma % 11, dv = r < 2 ? 0 : 11 - r;
+  return dv === Number(ch[43]);
+}
+function nfAcharChave(texto) {
+  for (const l of String(texto).split(/[\r\n]+/)) {
+    const d = l.replace(/[\s.]/g, "").replace(/[Oo]/g, "0");
+    const ms = d.match(/\d{44,}/g) || [];
+    for (const m of ms) for (let k = 0; k + 44 <= m.length; k++) { const c = m.slice(k, k + 44); if (nfChaveValida(c)) return c; }
+  }
+  return "";
+}
+function nfDadosDaChave(ch) {
+  return ch ? { numero: String(parseInt(ch.slice(25, 34), 10)), cnpjEmitente: ch.slice(6, 20), serie: String(parseInt(ch.slice(22, 25), 10)) } : null;
+}
+function nfAcharNumero(texto) {
+  const ch = nfAcharChave(texto);
+  if (ch) return nfDadosDaChave(ch).numero;
+  const m = String(texto).match(/\bN(?:[º°o]\.?|\.)\s*:?\s*(\d{1,3}(?:\.\d{3}){1,2}|\d{1,9})\b/i);
+  return m ? String(parseInt(m[1].replace(/\./g, ""), 10)) : "";
+}
+
+// XML da NF-e (o arquivo que o fornecedor manda junto com o DANFE): leitura exata.
+function nfLerXml(texto) {
+  const doc = new DOMParser().parseFromString(texto, "application/xml");
+  if (doc.getElementsByTagName("parsererror").length) throw new Error("O arquivo XML está corrompido ou não é um XML válido.");
+  const g = (el, tag) => (el && el.getElementsByTagName(tag)[0] ? el.getElementsByTagName(tag)[0].textContent.trim() : "");
+  const dets = Array.from(doc.getElementsByTagName("det"));
+  if (!dets.length) throw new Error("Este XML não parece ser de uma NF-e (não encontrei os itens da nota).");
+  const itens = dets.map(d => {
+    const p = d.getElementsByTagName("prod")[0];
+    const ean = g(p, "cEAN");
+    return {
+      codigo: g(p, "cProd"), descricao: g(p, "xProd"), ncm: g(p, "NCM"),
+      unidade: (g(p, "uCom") || "UN").toUpperCase(),
+      quantidade: Number(g(p, "qCom")) || 0,
+      valorUnitario: Number(g(p, "vUnCom")) || 0,
+      valorTotal: Number(g(p, "vProd")) || 0,
+      ean: /^\d{8,14}$/.test(ean) ? ean : "",
+      conferido: true, aviso: "",
+    };
+  });
+  const ide = doc.getElementsByTagName("ide")[0], emit = doc.getElementsByTagName("emit")[0];
+  const infNFe = doc.getElementsByTagName("infNFe")[0];
+  const chave = ((infNFe && infNFe.getAttribute("Id")) || "").replace(/\D/g, "") || g(doc, "chNFe");
+  return {
+    itens, numero: g(ide, "nNF"), chave,
+    cnpjEmitente: g(emit, "CNPJ") || g(emit, "CPF"), nomeEmitente: g(emit, "xNome"),
+    totalProdutos: Number(g(doc.getElementsByTagName("ICMSTot")[0], "vProd")) || 0,
+  };
+}
+
+// Casa o item da nota com um produto já cadastrado: pelo código (SKU), pelo EAN ou sugere pela descrição.
+function nfPalavras(s) {
+  return new Set(String(s || "").toUpperCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+    .split(/[^A-Z0-9]+/).filter(w => w.length >= 2));
+}
+function nfCasarProduto(it, produtos) {
+  const cod = String(it.codigo || "").trim().toLowerCase();
+  if (cod) {
+    const p = produtos.find(x => String(x.sku || "").trim().toLowerCase() === cod);
+    if (p) return { produto: p, por: "codigo" };
+  }
+  if (it.ean) {
+    const p = produtos.find(x => x.sku && String(x.codigoBarras || "").trim() === it.ean);
+    if (p) return { produto: p, por: "ean" };
+  }
+  const a = nfPalavras(it.descricao);
+  if (a.size < 2) return null;
+  let melhor = null, nota = 0;
+  for (const p of produtos) {
+    if (!p.sku) continue;
+    const b = nfPalavras(p.nome);
+    if (!b.size) continue;
+    let inter = 0; a.forEach(w => { if (b.has(w)) inter++; });
+    const j = inter / (a.size + b.size - inter);
+    if (j > nota) { nota = j; melhor = p; }
+  }
+  return nota >= 0.45 ? { produto: melhor, por: "descricao", nota } : null;
+}
+
+// Pontua um texto de OCR: quanto mais palavras típicas de DANFE, mais provável que a página esteja na posição certa.
+function nfPontuarTexto(texto) {
+  const pal = ["DANFE", "NCM", "CFOP", "QUANT", "PRODUTO", "VALOR", "TOTAL", "NOTA", "FISCAL", "ICMS", "EMITENTE",
+    "DESTINAT", "TRANSPORT", "CNPJ", "NATUREZA", "PROTOCOLO", "INSCRI", "FRETE", "BASE", "CÁLCULO", "DESCRI"];
+  const t = String(texto).toUpperCase();
+  return pal.filter(p => t.includes(p)).length + nfLerItensTexto(texto).length * 3;
+}
 
 function rowToEmpresa(r) {
   return { id: r.id, nomeFantasia: r.nome_fantasia, razaoSocial: r.razao_social, cnpj: r.cnpj, status: r.status };
@@ -836,10 +1237,32 @@ function produtoToRow(p) {
 // Não usamos uma coluna nova em "estoque" para linkar produto -> porta-palete:
 // reaproveitamos os campos fileira/porta/nivel que o produto já tem. Um produto
 // "está" numa porta-palete quando fileira+porta+nivel do produto batem com os da porta-palete.
+// Bloco "quantos paletes tem aqui?" (mapa e contagem). Só faz sentido em posição ocupada.
+function PaletesDaPosicao({ pp, itens, usuario, larg, C, compacto }) {
+  const [salvando, setSalvando] = useState(null); const [erro, setErro] = useState("");
+  if (!pp || larg) return null;
+  const r = paletesPos(pp, itens);
+  if (!r.ocupada) return <div style={{ marginTop: 8, fontSize: 12, color: C.sec }}>Posição vazia · 2 vagas de palete livres</div>;
+  const marcar = async (n) => { setSalvando(n); setErro(""); try { await salvarPaletesPP(pp.id, n, usuario); } catch (e) { setErro("Não salvou: " + (e.message || e)); } finally { setSalvando(null); } };
+  const b = (n) => { const sel = r.conferido && r.usados === n; return (
+    <button key={n} disabled={salvando !== null} onClick={() => marcar(n)} style={{ flex: 1, padding: "8px 6px", borderRadius: 8, cursor: "pointer", fontWeight: 700, fontSize: 13,
+      border: "1px solid " + (sel ? C.verde : C.borda), background: sel ? C.verde + "22" : "#18202b", color: sel ? C.verde : C.texto }}>{salvando === n ? "Salvando…" : n === 1 ? "1 palete" : "2 paletes"}</button>); };
+  return (
+    <div style={{ marginTop: 10, background: "#18202b", border: "1px solid " + (r.conferido ? C.borda : CORES_CAMADA.conferir), borderRadius: 8, padding: "8px 10px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 6, fontSize: 12 }}>
+        <span style={{ color: C.sec }}>Quantos paletes tem aqui?</span>
+        {r.conferido ? <b style={{ color: C.verde }}>{r.usados === 1 ? "1 palete · 1 vaga livre" : "2 paletes · cheia"}</b> : <b style={{ color: CORES_CAMADA.conferir }}>Não conferido · supondo 2</b>}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>{b(1)}{b(2)}</div>
+      {r.conferido && pp.paletesPor && !compacto && <div style={{ fontSize: 11, color: C.sec, marginTop: 5 }}>Marcado por {pp.paletesPor}{pp.paletesEm ? " · " + new Date(pp.paletesEm).toLocaleString("pt-BR") : ""}</div>}
+      {erro && <div style={{ fontSize: 11.5, color: C.vermelho, marginTop: 5 }}>{erro}</div>}
+    </div>);
+}
 function rowToPortaPalete(r) {
   return {
     id: r.id, codigo: r.codigo, fileira: r.fileira, porta: r.porta, nivel: r.nivel,
     descricao: r.descricao, empresaId: r.empresa_id,
+    paletes: r.paletes == null ? null : Number(r.paletes), paletesEm: r.paletes_em || null, paletesPor: r.paletes_por || null,
   };
 }
 function portaPaleteToRow(pp) {
@@ -868,6 +1291,44 @@ function notaToRow(n) {
 function rowToEntrada(r) {
   return { id: r.id, tipo: "Entrada", produtoId: r.produto_id, quantidade: Number(r.quantidade) || 0, numeroNf: r.numero_nf, obs: r.observacoes, data: r.data, usuario: r.usuario };
 }
+// Giro dos produtos pelas SAÍDAS do período (não conta ajuste, correção, transferência ou contagem)
+const MOTIVO_SEM_GIRO = /ajuste|corre[cç]|transf|trasnf|misturad|invent|contagem/i;
+// Curva ABC pelas saídas: A = produtos que somam os primeiros 80% das saídas, B = os próximos 15%, C = os últimos 5%
+const CORES_GIRO = { alta: "#FF4A1C", media: "#FFC107", baixa: "#2BD45F", sem: "#9B6BFF" };
+const NOMES_GIRO = { alta: "Curva A", media: "Curva B", baixa: "Curva C", sem: "Sem saída no período" };
+const DESC_GIRO = { alta: "80% das saídas", media: "próximos 15%", baixa: "últimos 5%", sem: "nenhuma saída" };
+function calcularGiro(movimentacoes, produtos, dias) {
+  const desde = Date.now() - dias * 864e5, tot = {};
+  (movimentacoes || []).forEach(m => {
+    if (m.tipo !== "Saída" || !m.produtoId || !m.data || new Date(m.data).getTime() < desde) return;
+    if (MOTIVO_SEM_GIRO.test((m.destino || "") + " " + (m.motivo || ""))) return;
+    tot[m.produtoId] = (tot[m.produtoId] || 0) + (Number(m.quantidade) || 0);
+  });
+  const lista = (produtos || []).map(p => ({ prod: p, saida: tot[p.id] || 0 })).sort((a, b) => b.saida - a.saida);
+  const com = lista.filter(x => x.saida > 0), total = com.reduce((a, x) => a + x.saida, 0), classe = {};
+  let acum = 0;
+  com.forEach(x => { const antes = total ? acum / total : 0; acum += x.saida; classe[x.prod.id] = antes < 0.8 ? "alta" : antes < 0.95 ? "media" : "baixa"; x.pct = total ? x.saida / total * 100 : 0; x.acum = total ? acum / total * 100 : 0; });
+  lista.forEach(x => { if (!classe[x.prod.id]) classe[x.prod.id] = "sem"; });
+  return { lista, classe, tot, total };
+}
+
+const CORES_CAMADA = { ocupadas: "#2F6BFF", livres: "#00E5C7", vagas: "#7ee36b", conferir: "#f5a524" };
+// Quantos paletes há de fato numa posição (porta-palete). Vazia = 0. Ocupada = o que foi conferido (1 ou 2);
+// se ninguém conferiu ainda, supõe 2 (cheia): na dúvida o sistema nunca mostra uma vaga que pode não existir.
+function paletesPos(pp, itens) {
+  if (!(itens || []).length) return { usados: 0, conferido: true, ocupada: false };
+  const n = pp ? Number(pp.paletes) : NaN;
+  return { usados: n === 1 ? 1 : 2, conferido: n === 1 || n === 2, ocupada: true };
+}
+// grava quantos paletes tem na posição (1 ou 2) e avisa o app para recarregar as porta-paletes
+async function salvarPaletesPP(ppId, n, usuario) {
+  const v = Number(n) === 1 ? 1 : 2;
+  const { error } = await supabaseClient.from("porta_paletes").update({ paletes: v, paletes_em: new Date().toISOString(), paletes_por: usuario || null }).eq("id", ppId);
+  if (error) throw error;
+  try { window.dispatchEvent(new CustomEvent("stockctrl:pp-paletes", { detail: { ppId, paletes: v } })); } catch (e) {}
+  return v;
+}
+
 function rowToSaida(r) {
   return { id: r.id, tipo: "Saída", produtoId: r.produto_id, quantidade: Number(r.quantidade) || 0, destino: r.destino, motivo: r.motivo, data: r.data, usuario: r.usuario };
 }
@@ -978,7 +1439,18 @@ function mapa3dLayout(portaPaletes, cfg) {
   if (cfg.inverterCorredores) corredores = corredores.slice().reverse();
   if (cfg.inverterLetras) letras = letras.slice().reverse();
   const BW = cfg.larguraBaia, D = cfg.profundidade, LH = cfg.alturaNivel, A = cfg.larguraCorredor;
-  const zDe = (f) => corredores.indexOf(f) * (D + A);
+  // fileiras de costas uma para a outra, em pares (1 e 2, 3 e 4, 5 e 6...): a ímpar olha para o corredor de um lado,
+  // a par para o do outro. Com 3 pares ficam 4 corredores: um antes do 1º par, um entre cada par e um depois do último.
+  const GAP = 0.2, blocoDe = (f) => Math.floor((f + 1) / 2);
+  const blocosN = corredores.map(blocoDe); const bMin = blocosN.length ? Math.min(...blocosN) : 1, bMax = blocosN.length ? Math.max(...blocosN) : 1, nB = bMax - bMin + 1;
+  const passoB = 2 * D + GAP + A;
+  const zBase = (f) => (blocoDe(f) - bMin) * passoB + (f % 2 === 0 ? D + GAP : 0);
+  const zUlt = (nB - 1) * passoB + D + GAP;
+  const espelha = (z) => cfg.inverterCorredores ? zUlt - z : z;
+  const zDe = (f) => espelha(zBase(f));
+  const ruas = []; for (let k = 0; k <= nB; k++) ruas.push({ num: k + 1, z: espelha(k === 0 ? -D / 2 - A / 2 : (k - 1) * passoB + D + GAP + D / 2 + A / 2), fileiras: [] });
+  const ruaIdx = (f) => blocoDe(f) - bMin + (f % 2 === 0 ? 1 : 0);
+  corredores.forEach(f => ruas[ruaIdx(f)].fileiras.push(f));
   const xDe = (l) => letras.indexOf(l) * BW;
   const celulas = {}; const baias = {}; const repetidas = {};
   ok.forEach(pp => {
@@ -997,13 +1469,15 @@ function mapa3dLayout(portaPaletes, cfg) {
   const semPosicao = portaPaletes.filter(pp => !ok.includes(pp));
   const duplicadas = Object.entries(repetidas).filter(([, ids]) => ids.length > 1).map(([k]) => k);
   const xL = -BW / 2 - 1.1, xR = Math.max(0, letras.length - 1) * BW + BW / 2 + 1.1; // eixos das ruas transversais
-  const corredorZ = (f) => zDe(f) + D / 2 + A / 2;
-  const zMax = Math.max(0, corredores.length - 1) * (D + A);
+  const corredorZ = (f) => ruas[ruaIdx(f)].z;   // corredor que atende a fileira
+  const ruaDe = (f) => ruas[ruaIdx(f)].num;     // número do corredor (1..N) da fileira
+  const zMax = zUlt;
   const nivelMax = Math.max(1, ...Object.values(baias).map(b => b.niveis));
   // caixas de colisão das estruturas (para câmera e rota não atravessarem)
   const solidos = Object.values(baias).map(b => ({ x0: b.x - BW / 2 - 0.08, x1: b.x + BW / 2 + 0.08, z0: b.z - D / 2 - 0.08, z1: b.z + D / 2 + 0.08, h: b.niveis * LH + 0.2 }));
   const m = cfg.margem;
-  let minX = xL - m, maxX = xR + m, minZ = -D / 2 - m - 1, maxZ = zMax + D / 2 + A + m;
+  const zsR = ruas.map(r => r.z);
+  let minX = xL - m, maxX = xR + m, minZ = Math.min(...zsR) - A / 2 - m, maxZ = Math.max(...zsR) + A / 2 + m;
   // área de preparação: o prédio cresce para o lado escolhido. Sistema local da área: u = ao longo da parede, v = da borda interna até a parede.
   let prep = null;
   const Dp = Math.max(4, Number(cfg.prepProfundidade) || 0);
@@ -1016,7 +1490,7 @@ function mapa3dLayout(portaPaletes, cfg) {
     const c = Math.cos(prep.rot), sn = Math.sin(prep.rot);
     prep.mundo = (u, v) => ({ x: prep.ox + u * c + v * sn, z: prep.oz - u * sn + v * c });
   }
-  return { corredores, letras, celulas, baias, semPosicao, duplicadas, xL, xR, corredorZ, zMax, nivelMax, solidos, BW, D, LH, A, prep,
+  return { corredores, ruas, ruaDe, zFileira: zDe, letras, celulas, baias, semPosicao, duplicadas, xL, xR, corredorZ, zMax, nivelMax, solidos, BW, D, LH, A, prep,
     predio: { minX, maxX, minZ, maxZ, W: maxX - minX, P: maxZ - minZ, cx: (minX + maxX) / 2, cz: (minZ + maxZ) / 2, H: Math.max(cfg.peDireito, nivelMax * LH + 2.5) } };
 }
 
@@ -1033,7 +1507,10 @@ const CORES_ROTA = ["#2fc4ee", "#f472b6", "#a3e635", "#fb923c", "#c084fc", "#fac
 const iniciais = (email) => { const n = String(email || "?").split("@")[0].split(/[._-]+/).filter(Boolean); return ((n[0] || "?")[0] + (n[1] ? n[1][0] : (n[0] || "").slice(1, 2))).toUpperCase(); };
 const nomeCurto = (email) => String(email || "—").split("@")[0];
 
-function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, contagens, fornecedorNome, movimentacoes = [], usuarioEmail, presencas = [] }) {
+function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, contagens, fornecedorNome, movimentacoes = [], usuarioEmail, presencas = [], sync = null }) {
+  const [camada, setCamada] = useState("");   // "" | "ocupadas" | "livres" | "calor" — só aparece quando você clica
+  const [giroDias, setGiroDias] = useState(90);
+  const giro = useMemo(() => calcularGiro(movimentacoes, produtos, giroDias), [movimentacoes, produtos, giroDias]);
   const caixaRef = useRef(null);
   const st = useRef({});
   const [erro, setErro] = useState("");
@@ -1144,7 +1621,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     // ordem otimizada: corredor por corredor (do mais perto da doca), entrando pela ponta mais próxima
     const doca = pontoDoca(layout, cfg).dentro;
     const grupos = {}; lista.forEach(s => { (grupos[s.c.f] = grupos[s.c.f] || []).push(s); });
-    const ordemCorr = Object.keys(grupos).map(Number).sort((a, b) => Math.abs(layout.corredorZ(a) - doca.z) - Math.abs(layout.corredorZ(b) - doca.z));
+    const ordemCorr = Object.keys(grupos).map(Number).sort((a, b) => Math.abs(layout.corredorZ(a) - doca.z) - Math.abs(layout.corredorZ(b) - doca.z) || a - b);
     let px = doca.x; const ordenada = [];
     ordemCorr.forEach(f => {
       const g = grupos[f]; const minx = Math.min(...g.map(s => s.c.x)), maxx = Math.max(...g.map(s => s.c.x));
@@ -1178,12 +1655,13 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   // --- resumo de um corredor ---
   const infoCorredor = useMemo(() => {
     if (selCorredor === null) return null;
-    const pps = portaPaletes.filter(pp => Number(pp.fileira) === Number(selCorredor));
+    const pps = portaPaletes.filter(pp => layout.celulas[pp.id] && layout.ruaDe(layout.celulas[pp.id].f) === Number(selCorredor));
     const ocup = pps.filter(pp => (porPP[pp.id] || []).length);
     const prods = {}; pps.forEach(pp => (porPP[pp.id] || []).forEach(it => { const k = String(it.produtoId); prods[k] = prods[k] || { nome: it.produto ? it.produto.nome : "Produto", qtd: 0 }; prods[k].qtd += it.qtd; }));
-    return { f: selCorredor, total: pps.length, ocupadas: ocup.length, livres: pps.length - ocup.length, pct: pps.length ? Math.round(ocup.length / pps.length * 100) : 0,
+    const rua = layout.ruas.find(r => r.num === Number(selCorredor));
+    return { f: selCorredor, fileiras: rua ? rua.fileiras : [], total: pps.length, ocupadas: ocup.length, livres: pps.length - ocup.length, pct: pps.length ? Math.round(ocup.length / pps.length * 100) : 0,
       produtos: Object.values(prods).sort((a, b) => b.qtd - a.qtd), divergencias: pps.filter(pp => diverg[pp.id]).length };
-  }, [selCorredor, portaPaletes, porPP, diverg]);
+  }, [selCorredor, portaPaletes, porPP, diverg, layout]);
 
   // --- doca: movimentações reais de hoje ---
   const infoDoca = useMemo(() => {
@@ -1238,13 +1716,19 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     if (rotas.length) rotas.forEach(r => r.paradas.forEach((s, i) => { if (!m[s.ppId]) m[s.ppId] = s.falta ? "#e5484d" : s.ok ? "#3fbf7f" : r.cor; }));
     else if (achados) achados.pps.forEach(id => { m[id] = "#2fc4ee"; });
     else if (verDiverg) Object.entries(ultimaContagem).forEach(([id, c]) => { m[id] = c.diferenca_total ? "#e5484d" : "#3fbf7f"; });
-    else if (selCorredor !== null) portaPaletes.forEach(pp => { if (Number(pp.fileira) === Number(selCorredor)) m[pp.id] = "#e8892f"; });
+    else if (selCorredor !== null) portaPaletes.forEach(pp => { const c = layout.celulas[pp.id]; if (c && layout.ruaDe(c.f) === Number(selCorredor)) m[pp.id] = "#e8892f"; });
+    else if (camada === "ocupadas" || camada === "livres") portaPaletes.forEach(pp => { const oc = (porPP[pp.id] || []).length > 0; if (oc === (camada === "ocupadas")) m[pp.id] = camada === "ocupadas" ? CORES_CAMADA.ocupadas : CORES_CAMADA.livres; });
+    else if (camada === "vagas") portaPaletes.forEach(pp => { const c = layout.celulas[pp.id]; const cap = c && c.larg ? 1 : 2; if (paletesPos(pp, porPP[pp.id]).usados < cap) m[pp.id] = CORES_CAMADA.vagas; });
+    else if (camada === "conferir") portaPaletes.forEach(pp => { const r = paletesPos(pp, porPP[pp.id]); if (r.ocupada && !r.conferido) m[pp.id] = CORES_CAMADA.conferir; });
+    else if (camada === "calor") portaPaletes.forEach(pp => { const its = porPP[pp.id] || []; if (!its.length) return; const ordem = ["alta", "media", "baixa", "sem"];
+      m[pp.id] = CORES_GIRO[ordem.find(k => its.some(it => giro.classe[it.produtoId] === k)) || "sem"]; });
     Object.keys(aoVivo.porPP).forEach(id => { if (!m[id]) m[id] = "#a78bfa"; });   // sendo contada agora
     if (selPP && !m[selPP]) m[selPP] = "#ffffff";
     return m;
-  }, [rotas, achados, verDiverg, ultimaContagem, selCorredor, selPP, portaPaletes, aoVivo]);
+  }, [rotas, achados, verDiverg, ultimaContagem, selCorredor, selPP, portaPaletes, aoVivo, camada, porPP, giro, layout]);
   const principal = selPP || (rota && rota.paradas[rota.proxima >= 0 ? rota.proxima : 0] ? rota.paradas[rota.proxima >= 0 ? rota.proxima : 0].ppId : null) || (achados && [...achados.pps][0]) || null;
-  const temDestaqueModo = rotas.length > 0 || !!achados || verDiverg || selCorredor !== null;
+  const temDestaqueModo = rotas.length > 0 || !!achados || verDiverg || selCorredor !== null || !!camada;
+  const camadaAtiva = !rotas.length && !achados && !verDiverg && selCorredor === null ? camada : "";
 
   // ---------- motor 3D (uma vez) ----------
   useEffect(() => {
@@ -1380,6 +1864,9 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         montante: std({ color: "#2a2e35", map: T.perfil, roughness: 0.42, metalness: 0.5 }),   // colunas escuras, como as estruturas reais
         travessa: std({ color: "#9aa3ad", roughness: 0.35, metalness: 0.85 }),
         longarina: std({ color: "#e86f17", roughness: 0.35, metalness: 0.4 }),
+        vagaLivre: new THREE.MeshBasicMaterial({ color: "#7ee36b", transparent: true, opacity: 0.28, depthWrite: false, toneMapped: false }),
+        vagaLivreBorda: new THREE.MeshBasicMaterial({ color: "#7ee36b", transparent: true, opacity: 0.75, depthWrite: false, toneMapped: false }),
+
         sapata: std({ color: "#e86f17", roughness: 0.45, metalness: 0.4 }),
         madeira: std({ map: T.madeira, roughness: 0.92 }),
         caixa: std({ map: T.papelao, roughness: 0.85 }),
@@ -1389,6 +1876,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         sombra: new THREE.MeshBasicMaterial({ map: T.sombra, transparent: true, depthWrite: false, opacity: 0.85 }),
         hit: new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false }),
       };
+      mat.vagaLivre.userData.semSombra = true; mat.vagaLivreBorda.userData.semSombra = true;   // marca de vaga livre não faz sombra
       mat.filme.userData.semSombra = true; mat.sombra.userData.semSombra = true; mat.led.userData.semSombra = true;
       const geo = { cubo: new THREE.BoxGeometry(1, 1, 1), cil: new THREE.CylinderGeometry(1, 1, 1, 20), plano: new THREE.PlaneGeometry(1, 1), disco: new THREE.CircleGeometry(1, 24) };
       const peca = (g, m, p, s, r) => { const x = new THREE.Mesh(g, m); x.position.set(...p); if (s) x.scale.set(...s); if (r) x.rotation.set(...r); x.castShadow = true; x.receiveShadow = true; return x; };
@@ -1415,6 +1903,31 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         const mesh = new THREE.Mesh(geo.plano, P.m);
         const alt = altura * (sub ? 1.4 : 1); mesh.scale.set(alt * P.asp, alt, 1);
         return mesh;
+      }
+      // etiqueta de endereço igual à do galpão: código de barras (Code 39) com o endereço embaixo e a seta amarela ao lado
+      // (seta para baixo = palete do chão / 1º andar; seta para cima = palete que fica em cima desta longarina)
+      const C39 = { "0": "nnnwwnwnn", "1": "wnnwnnnnw", "2": "nnwwnnnnw", "3": "wnwwnnnnn", "4": "nnnwwnnnw", "5": "wnnwwnnnn", "6": "nnwwwnnnn", "7": "nnnwnnwnw", "8": "wnnwnnwnn", "9": "nnwwnnwnn",
+        A: "wnnnnwnnw", B: "nnwnnwnnw", C: "wnwnnwnnn", D: "nnnnwwnnw", E: "wnnnwwnnn", F: "nnwnwwnnn", G: "nnnnnwwnw", H: "wnnnnwwnn", I: "nnwnnwwnn", J: "nnnnwwwnn", K: "wnnnnnnww", L: "nnwnnnnww", M: "wnwnnnnwn",
+        N: "nnnnwnnww", O: "wnnnwnnwn", P: "nnwnwnnwn", Q: "nnnnnnwww", R: "wnnnnnwwn", S: "nnwnnnwwn", T: "nnnnwnwwn", U: "wwnnnnnnw", V: "nwwnnnnnw", W: "wwwnnnnnn", X: "nwnnwnnnw", Y: "wwnnwnnnn", Z: "nwwnwnnnn", "-": "nwnnnnwnw", "*": "nwnnwnwnn" };
+      function etiquetaEnd(texto, paraCima, altura = 0.1) {
+        const k = "end|" + texto + "|" + (paraCima ? 1 : 0);
+        if (!placas[k]) {
+          const cod = "*" + String(texto).toUpperCase().replace(/[^0-9A-Z-]/g, "") + "*";
+          const mod = 3; let largBar = 0; for (const ch of cod) { const pt = C39[ch] || C39["-"]; for (const e of pt) largBar += e === "w" ? mod * 2.5 : mod; largBar += mod; }
+          const H = 128, padX = 14, wEt = Math.max(Math.ceil(largBar) + padX * 2, 210), wSeta = Math.round(H * 0.82), gap = 14;
+          const c = document.createElement("canvas"); c.width = wEt + gap + wSeta; c.height = H; const g = c.getContext("2d");
+          g.fillStyle = "#f7f7f4"; g.fillRect(0, 0, wEt, H);
+          g.fillStyle = "#111"; let x = (wEt - largBar) / 2;
+          for (const ch of cod) { const pt = C39[ch] || C39["-"]; [...pt].forEach((e, i) => { const w = e === "w" ? mod * 2.5 : mod; if (i % 2 === 0) g.fillRect(x, 10, w, H * 0.42); x += w; }); x += mod; }
+          g.font = "500 40px Inter, Segoe UI, sans-serif"; g.textAlign = "center"; g.textBaseline = "middle"; g.fillText(texto, wEt / 2, H * 0.76);
+          g.fillStyle = "#f2d230"; g.fillRect(wEt + gap, 0, wSeta, H);
+          g.fillStyle = "#151515"; const cx = wEt + gap + wSeta / 2, cy = H / 2, s1 = wSeta * 0.34, s2 = H * 0.36;
+          g.save(); g.translate(cx, cy); if (paraCima) g.scale(1, -1);
+          g.beginPath(); g.moveTo(-s1 * 0.38, -s2); g.lineTo(s1 * 0.38, -s2); g.lineTo(s1 * 0.38, 0); g.lineTo(s1, 0); g.lineTo(0, s2); g.lineTo(-s1, 0); g.lineTo(-s1 * 0.38, 0); g.closePath(); g.fill(); g.restore();
+          const t = new THREE.CanvasTexture(c); t.encoding = THREE.sRGBEncoding; t.anisotropy = 8;
+          placas[k] = { t, asp: c.width / H, m: new THREE.MeshBasicMaterial({ map: t, toneMapped: false }) };
+        }
+        const P = placas[k]; const mesh = new THREE.Mesh(geo.plano, P.m); mesh.scale.set(altura * P.asp, altura, 1); return mesh;
       }
       function etiqueta(texto, { fundo = "#2fc4ee", cor = "#06131a", tam = 0.4 } = {}) {   // só para números de parada e seleção
         const k = "s|" + texto + fundo + cor;
@@ -1490,6 +2003,14 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       }, { passive: false });
       dom.addEventListener("keydown", e => { fp.teclas[e.key.toLowerCase()] = true; if (st.current.modoPessoa && ["arrowup", "arrowdown", "arrowleft", "arrowright", " "].includes(e.key.toLowerCase())) e.preventDefault(); });
       dom.addEventListener("keyup", e => { fp.teclas[e.key.toLowerCase()] = false; });
+      // ao entrar na 1ª pessoa, se o ponto de partida estiver dentro de algo (móvel, estrutura, parede), procura o lugar livre mais perto
+      function livrarPessoa() {
+        if (!colide(fp.x, fp.z, 0.4)) return;
+        for (let r = 0.5; r <= 30; r += 0.5) for (let a = 0; a < Math.PI * 2; a += Math.PI / 12) {
+          const x = fp.x + Math.sin(a) * r, z = fp.z + Math.cos(a) * r;
+          if (!colide(x, z, 0.5)) { fp.x = x; fp.z = z; return; }
+        }
+      }
       function andar(frente, lado) {
         const nx = fp.x + Math.sin(fp.yaw) * frente + Math.cos(fp.yaw) * lado, nz = fp.z + Math.cos(fp.yaw) * frente - Math.sin(fp.yaw) * lado;
         if (!colide(nx, fp.z)) fp.x = nx; if (!colide(fp.x, nz)) fp.z = nz;   // desliza encostado na estrutura
@@ -1655,16 +2176,17 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         giroflex.emissiveIntensity = (Math.floor(t / 380) % 2) ? 2.5 : 0.15;
         if (st.current.velTeste) dt *= st.current.velTeste;   // só testes locais (acelera)
         const alvosV = st.current.alvosAuto || [];
-        const fp = st.current.frotaPorPedido = st.current.frotaPorPedido || {};
+        const fpPed = st.current.frotaPorPedido = st.current.frotaPorPedido || {};
         const est = st.current.frotaEstado = st.current.frotaEstado || [];
         const L0 = st.current.layoutAtual, vagasPk = st.current.vagasParada || [], vagasSep = st.current.vagasSeparacao || [];
+        const syncF = st.current.sync || { ativo: false, lider: true }, seguidor = syncF.ativo && !syncF.lider && st.current.frotaRecebidaEm && performance.now() - st.current.frotaRecebidaEm < 20000;
         // libera a paleteira de pedido que saiu da separação só depois que ela devolveu o palete e estacionou
-        Object.keys(fp).forEach(pid => { const es = est[fp[pid]]; if (!alvosV.some(a => a.pedidoId === pid) && (!es || (es.fase === "livre" && es.estacionada && !es.fila))) delete fp[pid]; });
-        alvosV.forEach(a => { if (fp[a.pedidoId] === undefined) { const usados = new Set(Object.values(fp)); let n = 0; while (usados.has(n)) n++; if (n < 4) fp[a.pedidoId] = n; } });
-        const nFrota = Math.max(1, ...Object.values(fp).map(n => n + 1));
+        if (!seguidor) Object.keys(fpPed).forEach(pid => { const es = est[fpPed[pid]]; if (!alvosV.some(a => a.pedidoId === pid) && (!es || (es.fase === "livre" && es.estacionada && !es.fila))) delete fpPed[pid]; });
+        if (!seguidor) alvosV.forEach(a => { if (fpPed[a.pedidoId] === undefined) { const usados = new Set(Object.values(fpPed)); let n = 0; while (usados.has(n)) n++; if (n < 4) fpPed[a.pedidoId] = n; } });
+        const nFrota = Math.max(1, ...Object.values(fpPed).map(n => n + 1));
         while (frota.length < nFrota) { const nova = emp.clone(); scene.add(nova); frota.push(nova); }
         while (chao.length < frota.length) { const c = emp.getObjectByName("carga").clone(); c.visible = false; scene.add(c); chao.push(c); }
-        const corredorDe = (q) => { if (!L0 || !q) return null; for (const f of L0.corredores) { if (Math.abs(q.z - L0.corredorZ(f)) < L0.A / 2 - 0.05 && q.x > L0.xL + 0.5 && q.x < L0.xR - 0.5) return f; } return null; };
+        const corredorDe = (q) => { if (!L0 || !q) return null; for (const { num: f, z: zf } of L0.ruas) { if (Math.abs(q.z - zf) < L0.A / 2 - 0.05 && q.x > L0.xL + 0.5 && q.x < L0.xR - 0.5) return f; } return null; };
         // monta a próxima sequência de movimentos a partir de onde a paleteira está
         const planejar = (es, n, tipo, alvo) => {
           if (!L0) return null;
@@ -1681,7 +2203,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           };
           const caminho = (q) => { const c0 = corredorDe(pos); if (c0 !== null && c0 === corredorDe(q)) { andar([{ x: q.x, z: q.z }]); return; } const e = (Math.abs(pos.x - eL) + Math.abs(eL - q.x)) <= (Math.abs(pos.x - eR) + Math.abs(eR - q.x)) ? eL : eR; andar([{ x: e, z: pos.z }, { x: e, z: q.z }, { x: q.x, z: q.z }]); };
           const fixo = (extra) => Object.assign({ x: pos.x, z: pos.z, ang }, extra);
-          const rack = (a) => { const za = L0.corredorZ(a.f), yPal = a.n > 1 ? a.y + 0.02 : 0; return { x: a.x, z: za, face: Math.atan2(0, Math.sign(a.z - za) || -1), h: Math.max(0.02, yPal + 0.075 - 0.14) }; };
+          const rack = (a) => { const za = L0.corredorZ(a.f), yPal = a.n > 1 ? a.y + 0.02 : 0; return { x: a.larg ? a.x : a.x + (Math.sign(za - a.z) || 1) * L0.BW / 4, z: za, face: Math.atan2(0, Math.sign(a.z - za) || -1), h: Math.max(0.02, yPal + 0.075 - 0.14) }; };
           const vaga = vagasSep[n % Math.max(1, vagasSep.length)];
           let ini = { carga: false, chao: false, fora: null }, fim = {};
           if (tipo === "buscar") {
@@ -1728,7 +2250,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           }
           if (!acoes.length) return null;
           const corredores = new Set(); acoes.forEach(a2 => (a2.pts || [a2]).forEach(q => { const f2 = q.x !== undefined ? corredorDe(q) : null; if (f2 !== null) corredores.add(f2); }));
-          return { corredores, acoes, duracao: acoes.reduce((a, b) => a + b.dur, 0), ini, semLaco: true, fim, tipo, chaoPose: fim.chaoPose || es.chaoPose };
+          return { id: Math.random().toString(36).slice(2, 9), corredores, acoes, duracao: acoes.reduce((a, b) => a + b.dur, 0), ini, semLaco: true, fim, tipo, chaoPose: fim.chaoPose || es.chaoPose };
         };
         const foraAgora = new Set();
         frota.forEach((e, n) => {
@@ -1737,11 +2259,11 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           const pk = vagasPk[n] || vagasPk[0];
           let es = est[n];
           if (!es) { if (!pk) { e.visible = false; return; } es = est[n] = { pos: { x: pk.x, z: pk.z }, ang: pk.ang, fase: "livre", estacionada: true, fila: null, relogio: 0, pose: null, alvoPP: null, naVaga: false, chaoPose: null }; }
-          const pid = Object.keys(fp).find(k => fp[k] === n);
+          const pid = Object.keys(fpPed).find(k => fpPed[k] === n);
           const info = pid ? alvosV.find(a => a.pedidoId === pid) : null, alvo = info ? info.alvo : null;
           // decide o próximo passo quando termina o anterior (comandado pelos bipes da separação)
           const bonecoOk = !pid || !pid.startsWith("ct:") || !!((st.current.bonecos || {})[pid.slice(3)] || {}).montado;
-          if (!es.fila) {
+          if (!es.fila && !seguidor) {
             if (es.fase === "livre") {
               if (alvo && bonecoOk) { es.fila = planejar(es, n, "buscar", alvo); if (es.fila) { es.fase = "buscando"; es.alvoPP = alvo; es.estacionada = false; } }
               else if (!alvo && !es.estacionada) { es.fila = planejar(es, n, "estacionar"); es.fase = es.fila ? "estacionando" : "livre"; if (!es.fila) es.estacionada = true; }
@@ -1753,25 +2275,33 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           let pose;
           if (es.fila) {
             const cand = poseNa(es.fila, es.relogio + dt), atual = es.pose || poseNa(es.fila, es.relogio);
-            let bloqueada = false; const fc = corredorDe(cand), fa = corredorDe(atual); es.esperaPor = null;
+            let bloqueada = false; const fc = corredorDe(cand), fa = corredorDe(atual);
+            if (seguidor) { bloqueada = !!es.motivo; }   // quem só acompanha: para quando o condutor diz que ela está esperando
+            else { es.esperaPor = null;
+            if (es.corrAnt != null && es.corrAnt !== fa && es.fila.corredores) es.fila.corredores.delete(es.corrAnt);   // já saiu deste corredor: não espera mais por ele
+            es.corrAnt = fa;
             if (fc !== null && fc !== fa) bloqueada = est.some((o, m) => m !== n && o && o.pose && corredorDe(o.pose) === fc);
+            es.motivo = bloqueada ? "corredor" : null;
             // corredor ocupado: espera longe da boca (fora do caminho de quem está saindo)
-            if (!bloqueada && L0) for (const f of L0.corredores) {
+            if (!bloqueada && L0) for (const { num: f, z: zc } of L0.ruas) {
               if (f === fa || !(es.fila.corredores && es.fila.corredores.has(f))) continue;   // só espera se for entrar nesse corredor
-              const zc = L0.corredorZ(f), dB = (q) => Math.min(Math.hypot(q.x - L0.xL, q.z - zc), Math.hypot(q.x - L0.xR, q.z - zc));
+              const dB = (q) => Math.min(Math.hypot(q.x - L0.xL, q.z - zc), Math.hypot(q.x - L0.xR, q.z - zc));
               if (!(dB(cand) < 2.3 && dB(cand) < dB(atual))) continue;
-              if (est.some((o, m) => m !== n && o && o.pose && (corredorDe(o.pose) === f || (dB(o.pose) < 1.7 && o.fila)))) { bloqueada = true; es.esperaPor = f; break; }
+              if (est.some((o, m) => m !== n && o && o.pose && (corredorDe(o.pose) === f || (dB(o.pose) < 1.7 && o.fila)))) { bloqueada = true; es.esperaPor = f; es.motivo = "boca"; break; }
             }
             // fora dos corredores: cede para quem tem prioridade, para quem está parado e nunca encosta na traseira de quem vai na frente
             if (!bloqueada && fa === null) bloqueada = est.some((o, m) => {
               if (m === n || !o || !o.pose) return false;
-              if (o.esperaPor != null && Math.abs(atual.z - L0.corredorZ(o.esperaPor)) < L0.A / 2 + 0.7) return false;   // ela está me esperando sair
+              if (o.esperaPor != null && L0.ruas[o.esperaPor - 1] && Math.abs(atual.z - L0.ruas[o.esperaPor - 1].z) < L0.A / 2 + 0.7) return false;   // ela está me esperando sair
               const d1 = Math.hypot(cand.x - o.pose.x, cand.z - o.pose.z), d0 = Math.hypot(atual.x - o.pose.x, atual.z - o.pose.z);
               if (!(d1 < 2.0 && d1 < d0)) return false;
               if (m < n || !o.fila) return true;
+              if (o.motivo === "cede") return false;   // a outra está parada esperando por mim: quem tem prioridade segue (evita as duas travarem)
               const pv = o.posePrev || o.pose, vx = o.pose.x - pv.x, vz = o.pose.z - pv.z;
               return vx * (atual.x - o.pose.x) + vz * (atual.z - o.pose.z) <= 1e-4;   // a outra não vem na minha direção: vou atrás dela
             });
+            if (bloqueada && !es.motivo) es.motivo = "cede";
+            if (!bloqueada) es.motivo = null; }
             if (!bloqueada) es.relogio += dt;
             pose = bloqueada ? atual : cand;
             if (es.relogio >= es.fila.duracao) {   // terminou a sequência
@@ -1797,11 +2327,22 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           if (pose.fora) foraAgora.add(String(pose.fora));
         });
         for (let n = frota.length; n < chao.length; n++) chao[n].visible = false;
+        // condutor: manda o estado das paleteiras para os outros mapas quando algo muda (e a cada 6 s enquanto se mexem)
+        if (syncF.ativo && !seguidor && syncF.enviar) {
+          const ag = performance.now(), ult = st.current.frotaEnviadaEm || 0;
+          const assin = est.map(e => e ? [e.fase, e.fila ? e.fila.id : "", e.motivo || "", e.estacionada ? 1 : 0, e.alvoPP ? e.alvoPP.ppId : ""].join("|") : "-").join(";") + JSON.stringify(fpPed);
+          const mexendo = est.some(e => e && (e.fila || !e.estacionada));
+          if (ag - ult > 1000 && (assin !== st.current.frotaAssin || (mexendo && ag - ult > 3000) || ag - ult > 15000 || (st.current.pedirFrota && ag - ult > 1000))) {
+            st.current.frotaAssin = assin; st.current.frotaEnviadaEm = ag; st.current.pedirFrota = false;
+            syncF.enviar({ fp: { ...fpPed }, est: est.map(e => e && { pos: e.pos, ang: e.ang, fase: e.fase, estacionada: e.estacionada, alvoPP: e.alvoPP, naVaga: e.naVaga, chaoPose: e.chaoPose,
+              recuo: e.recuo || 0, motivo: e.motivo || null, esperaPor: e.esperaPor == null ? null : e.esperaPor, relogio: e.relogio, fila: e.fila ? { ...e.fila, corredores: [...(e.fila.corredores || [])] } : null }) });
+          }
+        }
         // ---- bonequinhos: cada pessoa contando vai até a porta-palete; no 2º/3º nível ela pilota uma paleteira, desce o palete, conta e devolve ----
         const bon = st.current.bonecos = st.current.bonecos || {};
         if (L0) {
           const lista = st.current.contadores || [], v0 = vagasSep[0] || vagasPk[0], casa = v0 ? { x: v0.x, z: v0.z } : { x: L0.xL - 3, z: 0 };
-          const zonaCorr = (q) => { for (const f of L0.corredores) { const zc = L0.corredorZ(f); if (Math.abs(q.z - zc) < L0.A / 2 && q.x > L0.xL - 0.3 && q.x < L0.xR + 0.3) return f; } return null; };
+          const zonaCorr = (q) => { for (const { num: f, z: zc } of L0.ruas) { if (Math.abs(q.z - zc) < L0.A / 2 && q.x > L0.xL - 0.3 && q.x < L0.xR + 0.3) return f; } return null; };
           const posto = (u) => { const za = L0.corredorZ(u.f), lado = Math.sign(u.z - za) || -1; return { x: u.x + 0.85, z: za + lado * (L0.A / 2 - 0.55), ang: lado > 0 ? 0 : Math.PI }; };
           const rotaP = (de, para) => {
             const pts = [{ x: de.x, z: de.z }], ca = zonaCorr(de), cb = zonaCorr(para);
@@ -1819,7 +2360,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
           lista.forEach(u => { if (!bon[u.usuario]) bon[u.usuario] = Object.assign(criarBoneco(u.usuario), { pos: { ...casa }, ang: 0, pts: null, i: 0, meta: null, montado: false, ocioso: 0, fase: 0 }); });
           Object.keys(bon).forEach(k => {
             const b = bon[k], u = lista.find(x => x.usuario === k) || null;
-            const nK = fp["ct:" + k], esK = nK !== undefined ? est[nK] : null;
+            const nK = fpPed["ct:" + k], esK = nK !== undefined ? est[nK] : null;
             // rótulo
             if (u) { b.ocioso = 0; const t1 = nomeDe(k), t2 = (b.montado ? `paleteira · ${u.cod || ""}` : `contando ${u.cod || ""}`) + ` · ${u.pecas} pç`; if (b.texto !== t1 + t2) { b.texto = t1 + t2; b.escrever(t1, t2); } }
             else { if (!b.ocioso) { b.escrever(nomeDe(k), "contagem finalizada ✓"); b.texto = ""; } b.ocioso = (b.ocioso || 0) + dt; }
@@ -1898,7 +2439,21 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       };
       raf = requestAnimationFrame(loop);
 
-      st.current = { ...st.current, THREE, renderer, scene, camera, conteudo, telhado, rotaGrupo, mat, geo, T, peca, placa, etiqueta, cam, fp, voar, sol, foco, colide,
+      // quem só acompanha: recebe do mapa condutor o estado das paleteiras e continua o movimento daqui
+      st.current.receberFrota = (p) => {
+        if (!p || !p.est) return;
+        st.current.frotaRecebidaEm = performance.now();
+        const fpR = st.current.frotaPorPedido = st.current.frotaPorPedido || {}; Object.keys(fpR).forEach(k => delete fpR[k]); Object.assign(fpR, p.fp || {});
+        const estR = st.current.frotaEstado = st.current.frotaEstado || [];
+        p.est.forEach((r, n) => {
+          if (!r) { estR[n] = null; return; }
+          const atual = estR[n] || {}, fila = r.fila ? { ...r.fila, corredores: new Set(r.fila.corredores || []) } : null;
+          const mesma = atual.fila && fila && atual.fila.id === fila.id;
+          estR[n] = { ...atual, ...r, fila, relogio: mesma && Math.abs((atual.relogio || 0) - r.relogio) < 0.6 ? atual.relogio : r.relogio, pose: mesma ? atual.pose : null };
+        });
+        estR.length = p.est.length;
+      };
+      st.current = { ...st.current, THREE, renderer, scene, camera, conteudo, telhado, rotaGrupo, mat, geo, T, peca, placa, etiquetaEnd, etiqueta, cam, fp, voar, sol, foco, colide, livrarPessoa,
         limpar: () => { cancelAnimationFrame(raf); ro.disconnect(); renderer.dispose(); pmrem.dispose(); Object.values(T).forEach(x => x.dispose()); Object.values(placas).forEach(x => { x.t.dispose(); x.m && x.m.dispose(); }); if (dom.parentNode) dom.parentNode.removeChild(dom); } };
       if (location.hostname === "localhost") window.__m3d = st;   // só para testes locais
       setPronto(true);
@@ -1907,6 +2462,13 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   }, []);
 
   st.current.alvosAuto = alvosAuto;
+  // várias telas no mapa: um mapa conduz as paleteiras e manda o movimento; os outros mostram exatamente o mesmo
+  st.current.sync = sync ? { ativo: true, lider: !!sync.lider, enviar: sync.enviar } : { ativo: false, lider: true };
+  useEffect(() => {
+    if (!sync || !sync.registrar) return;
+    sync.registrar((p) => { if (p && st.current.receberFrota) st.current.receberFrota(p); });
+    return () => sync.registrar(null);
+  }, [sync]);
   st.current.contadores = contadores;
   st.current.aoEscolher = (u) => {
     if (!u) { setSelPP(null); setSelCorredor(null); setSelDoca(false); setSelPrep(false); return; }
@@ -1920,7 +2482,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   // ---------- galpão: prédio, estruturas, paletes e caixas (refaz quando os dados mudam, em tempo real) ----------
   useEffect(() => {
     if (!pronto) return;
-    const { THREE, conteudo, telhado, mat, geo, T, placa, sol, cam } = st.current;
+    const { THREE, conteudo, telhado, mat, geo, T, placa, etiquetaEnd, sol, cam } = st.current;
     const std = (o) => new THREE.MeshStandardMaterial(o);
     (st.current.descartar || []).forEach(x => x.dispose && x.dispose());
     st.current.descartar = [];
@@ -1944,8 +2506,9 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
 
     const lotes = {}; const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), eu = new THREE.Euler(), vp = new THREE.Vector3(), vs = new THREE.Vector3();
     const branco = new THREE.Color(1, 1, 1);
-    const por = (chave, g, m, pos, s, r, cor, ppId, grupo) => {
-      const lt = lotes[chave] = lotes[chave] || { g, m, ms: [], cores: [], pps: [], grupo: grupo || conteudo };
+    const por = (chave, g, m, pos, s, r, cor, ppId, grupo, prodId) => {
+      const lt = lotes[chave] = lotes[chave] || { g, m, ms: [], cores: [], pps: [], prods: [], grupo: grupo || conteudo, chave };
+      lt.prods.push(prodId === undefined ? null : prodId);
       eu.set(r ? r[0] : 0, r ? r[1] : 0, r ? r[2] : 0); q.setFromEuler(eu);
       lt.ms.push(m4.compose(vp.set(pos[0], pos[1], pos[2]), q, vs.set(s[0], s[1], s[2])).clone());
       lt.cores.push(cor ? new THREE.Color(cor) : null); lt.pps.push(ppId === undefined ? null : ppId);
@@ -1997,7 +2560,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     }
     for (let x = p.minX + 4; x < p.maxX; x += 4) por("estrFina", geo.cubo, mat.estrutura, [x, H + 1.05, p.cz], [0.08, 0.08, p.P], null, null, null, telhado);
     // luminárias industriais (campânulas LED) sobre os corredores e ruas
-    const lumZ = [...L.corredores.map(f => L.corredorZ(f)), p.minZ + 3.5];
+    const lumZ = [...L.ruas.map(r => r.z), p.minZ + 3.5];
     lumZ.forEach(z => { for (let x = p.minX + 3; x < p.maxX - 2; x += 6) {
       por("cabo", geo.cil, mat.luminaria, [x, H - 0.4, z], [0.01, 0.9, 0.01], null, null, null, telhado);
       por("lumi", geo.cil, mat.luminaria, [x, H - 0.95, z], [0.42, 0.22, 0.42], null, null, null, telhado);
@@ -2226,11 +2789,11 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       st.current.vagasParada = [0, 1, 2, 3].map(k => ({ x: dk.dentro.x + lado.x * (dw / 2 + 0.6) + ent.x * k * 2.3, z: dk.dentro.z + lado.z * (dw / 2 + 0.6) + ent.z * k * 2.3, ang: dk.rot + Math.PI })); }
 
     // ---- ruas: faixas amarelas de circulação, número do corredor pintado no piso e placas nas pontas ----
-    L.corredores.forEach(f => {
-      const zc = L.corredorZ(f), comp = L.xR - L.xL + 1.6;
+    L.ruas.forEach(({ num: f, z: zc }) => {
+      const comp = L.xR - L.xL + 1.6;
       [-1, 1].forEach(s => por("faixa", geo.cubo, mat.faixa, [(L.xL + L.xR) / 2, 0.006, zc + s * (A / 2 - 0.18)], [comp, 0.008, 0.09]));
       [L.xL - 0.4, L.xR + 0.4].forEach((x, i) => {
-        const num = placa(pad2(f), { fundo: "transparent", cor: "rgba(235,238,242,0.85)", altura: 0.75, fonte: "700" });
+        const num = placa(String(f), { fundo: "transparent", cor: "rgba(235,238,242,0.85)", altura: 0.75, fonte: "700" });
         num.rotation.x = -Math.PI / 2; num.rotation.z = i ? -Math.PI / 2 : Math.PI / 2; num.position.set(x + (i ? -0.9 : 0.9), 0.012, zc); conteudo.add(num);
         const hitC = new THREE.Mesh(geo.cubo, mat.hit); hitC.scale.set(1.8, 0.1, A - 0.4); hitC.position.set(x + (i ? -0.9 : 0.9), 0.05, zc); hitC.userData = { corredor: f }; conteudo.add(hitC); hits.push(hitC);
       });
@@ -2253,7 +2816,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         for (let i = 0; i < nD; i++) por("travessa", geo.cubo, mat.travessa, [x, 0.15 + passo * (i + 0.5), b.z], [0.03, comp, 0.03], [(i % 2 ? 1 : -1) * Math.atan2(D - 0.1, passo), 0, 0]);
         [0.15, h - 0.08].forEach(y => por("travessa", geo.cubo, mat.travessa, [x, y, b.z], [0.035, 0.035, D - 0.08]));
       });
-      for (let n = 1; n <= b.niveis; n++) {
+      for (let n = 1; n < b.niveis; n++) {   // longarina n segura o palete do nível n+1; acima do último nível não tem
         const y = n * LH - 0.04;
         [-1, 1].forEach(sz => {
           por("longarina", geo.cubo, mat.longarina, [b.x, y, b.z + sz * (D / 2 - 0.05)], [BW - 0.12, 0.11, 0.05]);
@@ -2263,7 +2826,13 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       }
       por("sombraRack", geo.plano, mat.sombra, [b.x, 0.004, b.z], [BW * 1.2, D * 2.2, 1], [-Math.PI / 2, 0, 0]);
     });
-    // protetores de coluna amarelos nas pontas de cada fileira e placa discreta do corredor
+    // espaçadores que unem as duas fileiras de costas (1 e 2, 3 e 4...)
+    Object.values(L.baias).forEach(b => {
+      if (b.f % 2 !== 1) return; const par = L.baias[(b.f + 1) + "-" + b.l]; if (!par) return;
+      const zm = (b.z + par.z) / 2, hh = Math.min(b.niveis, par.niveis) * LH, vao = Math.abs(par.z - b.z) - D + 0.1;
+      if (vao > 0) [-1, 1].forEach(sx => { const x = b.x + sx * (BW / 2 - 0.05); for (let y = 0.5; y < hh; y += 1.6) por("travessa", geo.cubo, mat.montante, [x, y, zm], [0.05, 0.05, vao]); });
+    });
+    // protetores de coluna amarelos nas pontas de cada fileira e placa discreta da fileira
     Object.entries(fileiras).forEach(([f, bs]) => {
       const xs = bs.map(b => b.x); const xa = Math.min(...xs) - BW / 2, xb = Math.max(...xs) + BW / 2; const z = bs[0].z; const hMax = Math.max(...bs.map(b => b.niveis)) * LH;
       [[xa, -1], [xb, 1]].forEach(([x, s]) => {
@@ -2272,7 +2841,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         const pl = new THREE.Mesh(geo.plano, placaCorredor(pad2(f))); pl.scale.set(0.95, 0.74, 1);
         pl.position.set(x + s * 0.07, hMax + 0.5, z); pl.rotation.y = s * Math.PI / 2; conteudo.add(pl); placasCorr.push(pl);
         por("travessa", geo.cubo, mat.montante, [x + s * 0.03, hMax + 0.18, z], [0.05, 0.36, 0.05]);
-        const hitP = new THREE.Mesh(geo.cubo, mat.hit); hitP.scale.set(0.3, 1.2, D); hitP.position.set(x + s * 0.1, 2, z); hitP.userData = { corredor: Number(f) }; conteudo.add(hitP); hits.push(hitP);
+        const hitP = new THREE.Mesh(geo.cubo, mat.hit); hitP.scale.set(0.3, 1.2, D); hitP.position.set(x + s * 0.1, 2, z); hitP.userData = { corredor: L.ruaDe(Number(f)) }; conteudo.add(hitP); hits.push(hitP);
       });
     });
 
@@ -2284,36 +2853,66 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       const largCel = c.larg || BW; const itens = porPP[c.pp.id] || [];
       const y0 = c.n > 1 ? c.y + 0.02 : 0;
       const pw = Math.min(1.2, largCel - 0.3), pd = Math.min(1.0, D - 0.08);
-      const plc = placa(enderecoPP(c.pp), { fundo: "#f4f5f7", cor: "#111418", altura: 0.075, fonte: "700" });   // etiqueta de endereço na longarina
-      plc.position.set(c.x, c.n > 1 ? c.y - 0.04 : 0.09, c.z + D / 2 - 0.02); conteudo.add(plc); placasPos.push(plc);
+      const ladoC = Math.sign(L.corredorZ(c.f) - c.z) || 1;   // face que dá para o corredor (quem olha do corredor tem a direita em x = ladoC)
+      const bz = L.baias[c.f + "-" + c.l]; const temLong = c.n > 1 || (bz && bz.niveis > 1);
+      if (temLong) {
+        const doChao = c.n === 1, yL = (doChao ? 1 : c.n - 1) * LH - 0.04;   // 1º andar: 1ª longarina; nível n: longarina n-1
+        const plc = etiquetaEnd(enderecoPP(c.pp), !doChao, 0.085);
+        const lado = doChao ? 1 : -1;   // 1º andar à direita, de cima à esquerda
+        plc.position.set(c.x + ladoC * lado * largCel * 0.24, yL, c.z + ladoC * (D / 2 + 0.003)); if (ladoC < 0) plc.rotation.y = Math.PI; conteudo.add(plc); placasPos.push(plc);
+      } else {   // porta-palete de um nível só: etiqueta no chão, na frente
+        const plc = placa(enderecoPP(c.pp), { fundo: "#f4f5f7", cor: "#111418", altura: 0.075, fonte: "700" });
+        plc.position.set(c.x, 0.09, c.z + ladoC * (D / 2 - 0.02)); if (ladoC < 0) plc.rotation.y = Math.PI; conteudo.add(plc); placasPos.push(plc);
+      }
       const hit = new THREE.Mesh(geo.cubo, mat.hit); hit.scale.set(largCel, LH, D); hit.position.set(c.x, c.y + LH / 2, c.z); hit.userData = { ppId: c.pp.id }; conteudo.add(hit); hits.push(hit);
       const tot = itens.reduce((s, x) => s + x.qtd, 0);
       if (tot <= 0) return;   // posição livre: sem palete fictício
-      // palete PBR 1,2 × 1,0 m: 3 blocos-longarina, 7 tábuas de cima e 3 de baixo
-      [-0.42, 0, 0.42].forEach(oz => por("madeira", geo.cubo, mat.madeira, [c.x, y0 + 0.075, c.z + oz * pd], [pw, 0.09, 0.1], null, null, c.pp.id));
-      for (let i = 0; i < 7; i++) por("madeira", geo.cubo, mat.madeira, [c.x - pw / 2 + pw * (i + 0.5) / 7, y0 + 0.135, c.z], [pw / 7 - 0.035, 0.022, pd], null, null, c.pp.id);
-      for (let i = 0; i < 3; i++) por("madeira", geo.cubo, mat.madeira, [c.x - pw / 2 + 0.06 + (pw - 0.12) * i / 2, y0 + 0.015, c.z], [0.1, 0.02, pd], null, null, c.pp.id);
-      // quanto mais saldo, mais alta a carga; cada produto da posição com seu tom de caixa
-      const fr = Math.min(1, 0.25 + 0.75 * Math.log10(tot + 1) / Math.log10(maxQ + 1));
-      const altMax = LH - 0.45, alt = Math.max(0.3, altMax * fr);
-      let usado = 0; const base = y0 + 0.146;
-      const prods = itens.slice(0, 4);
-      prods.forEach((it, pi) => {
-        // produtos dividem a carga em fatias; cada produto tem um tamanho de caixa próprio
-        const fatia = pw / prods.length; const x0 = c.x - pw / 2 + fatia * pi;
-        const hsh = Math.abs(String(it.produtoId).split("").reduce((h, ch) => (h * 17 + ch.charCodeAt(0)) | 0, 3));
-        const bw0 = [0.3, 0.4, 0.6, 0.25][hsh % 4], bh0 = [0.28, 0.32, 0.4, 0.22][(hsh >> 2) % 4], bd0 = [0.33, 0.5, 0.25, 0.4][(hsh >> 4) % 4];
-        const nx = Math.max(1, Math.round(fatia / bw0)), nz = Math.max(1, Math.round(pd / bd0)), ny = Math.max(1, Math.round(alt / bh0));
-        const bw = fatia / nx, bd = pd / nz, bh = alt / ny;
-        const cor = corProd(it.produtoId);
-        for (let yy = 0; yy < ny; yy++) for (let xx = 0; xx < nx; xx++) for (let zz = 0; zz < nz; zz++) {
-          const j = (Math.sin(c.x * 12.9 + c.z * 78.2 + xx * 3.1 + yy * 7.7 + zz * 1.3) * 43758.5) % 1;
-          por("caixa", geo.cubo, mat.caixa, [x0 + bw * (xx + 0.5), base + bh * (yy + 0.5), c.z - pd / 2 + bd * (zz + 0.5)], [bw * 0.97, bh * 0.98, bd * (0.96 + 0.02 * j)], [0, (j - 0.5) * 0.025, 0], cor, c.pp.id);
-        }
-        usado = Math.max(usado, alt);
+      // 2 paletes PBR lado a lado em cada posição (ex.: 03-A-01 = palete da esquerda + palete da direita).
+      // 1 produto: a carga se divide nos dois; vários produtos: cada palete leva parte dos produtos.
+      const pinfo = paletesPos(c.pp, itens);
+      if (!c.larg && pinfo.usados === 1) {   // só 1 palete: fica do lado direito; o lado esquerdo é vaga livre (em destaque)
+        const xv = c.x - ladoC * BW / 4, pwv = Math.min(1.15, BW / 2 - 0.2);
+        por("vagaLivre", geo.cubo, mat.vagaLivre, [xv, y0 + 0.07, c.z], [pwv, 0.12, pd]);
+        por("vagaLivreBorda", geo.cubo, mat.vagaLivreBorda, [xv, y0 + 0.012, c.z], [pwv + 0.06, 0.02, pd + 0.06]);
+      }
+      if (pinfo.ocupada && !pinfo.conferido) {   // ninguém confirmou ainda se são 1 ou 2 paletes
+        const pc = placa("CONFERIR", { fundo: CORES_CAMADA.conferir, cor: "#111418", altura: 0.06, fonte: "800" });
+        const yC = temLong ? (c.n === 1 ? 1 : c.n - 1) * LH - 0.04 - 0.105 : 0.2;
+        pc.position.set(c.x, yC, c.z + ladoC * (D / 2 + 0.004)); if (ladoC < 0) pc.rotation.y = Math.PI; conteudo.add(pc); placasPos.push(pc);
+      }
+      const vagas = c.larg ? [{ x: c.x, itens }] : pinfo.usados === 1 ? [{ x: c.x + ladoC * BW / 4, itens }] : (itens.length > 1
+        ? [0, 1].map(k => ({ x: c.x + (k ? 1 : -1) * BW / 4, itens: itens.filter((_, ii) => ii % 2 === k) }))
+        : [0, 1].map(k => ({ x: c.x + (k ? 1 : -1) * BW / 4, itens })));
+      const pwV = c.larg ? pw : Math.min(1.15, BW / 2 - 0.2);
+      vagas.forEach(vg => {
+        const cx0 = vg.x, pw = pwV;
+        const totV = vg.itens.reduce((s2, x) => s2 + x.qtd, 0) / (vagas.length > 1 && itens.length === 1 ? 2 : 1);
+        if (totV <= 0) return;
+        // palete PBR: 3 blocos-longarina, 7 tábuas de cima e 3 de baixo
+        [-0.42, 0, 0.42].forEach(oz => por("madeira", geo.cubo, mat.madeira, [cx0, y0 + 0.075, c.z + oz * pd], [pw, 0.09, 0.1], null, null, c.pp.id));
+        for (let i = 0; i < 7; i++) por("madeira", geo.cubo, mat.madeira, [cx0 - pw / 2 + pw * (i + 0.5) / 7, y0 + 0.135, c.z], [pw / 7 - 0.035, 0.022, pd], null, null, c.pp.id);
+        for (let i = 0; i < 3; i++) por("madeira", geo.cubo, mat.madeira, [cx0 - pw / 2 + 0.06 + (pw - 0.12) * i / 2, y0 + 0.015, c.z], [0.1, 0.02, pd], null, null, c.pp.id);
+        // quanto mais saldo, mais alta a carga; cada produto com seu tom de caixa
+        const fr = Math.min(1, 0.25 + 0.75 * Math.log10(totV + 1) / Math.log10(maxQ + 1));
+        const altMax = LH - 0.45, alt = Math.max(0.3, altMax * fr);
+        let usado = 0; const base = y0 + 0.146;
+        const prods = vg.itens.slice(0, 3);
+        prods.forEach((it, pi) => {
+          const fatia = pw / prods.length; const x0 = cx0 - pw / 2 + fatia * pi;
+          const hsh = Math.abs(String(it.produtoId).split("").reduce((h, ch) => (h * 17 + ch.charCodeAt(0)) | 0, 3));
+          const bw0 = [0.3, 0.4, 0.6, 0.25][hsh % 4], bh0 = [0.28, 0.32, 0.4, 0.22][(hsh >> 2) % 4], bd0 = [0.33, 0.5, 0.25, 0.4][(hsh >> 4) % 4];
+          const nx = Math.max(1, Math.round(fatia / bw0)), nz = Math.max(1, Math.round(pd / bd0)), ny = Math.max(1, Math.round(alt / bh0));
+          const bw = fatia / nx, bd = pd / nz, bh = alt / ny;
+          const cor = corProd(it.produtoId);
+          for (let yy = 0; yy < ny; yy++) for (let xx = 0; xx < nx; xx++) for (let zz = 0; zz < nz; zz++) {
+            const j = (Math.sin(cx0 * 12.9 + c.z * 78.2 + xx * 3.1 + yy * 7.7 + zz * 1.3) * 43758.5) % 1;
+            por("caixa", geo.cubo, mat.caixa, [x0 + bw * (xx + 0.5), base + bh * (yy + 0.5), c.z - pd / 2 + bd * (zz + 0.5)], [bw * 0.97, bh * 0.98, bd * (0.96 + 0.02 * j)], [0, (j - 0.5) * 0.025, 0], cor, c.pp.id, undefined, it.produtoId);
+          }
+          usado = Math.max(usado, alt);
+        });
+        por("filme", geo.cubo, mat.filme, [cx0, base + usado / 2, c.z], [pw + 0.015, usado + 0.015, pd + 0.015], null, null, c.pp.id);
+        if (c.n === 1) por("sombraPal", geo.plano, mat.sombra, [cx0, 0.006, c.z], [pw * 1.4, pd * 1.5, 1], [-Math.PI / 2, 0, 0]);
       });
-      por("filme", geo.cubo, mat.filme, [c.x, base + usado / 2, c.z], [pw + 0.015, usado + 0.015, pd + 0.015], null, null, c.pp.id);
-      if (c.n === 1) por("sombraPal", geo.plano, mat.sombra, [c.x, 0.006, c.z], [pw * 1.4, pd * 1.5, 1], [-Math.PI / 2, 0, 0]);
     });
 
     const instancias = [];
@@ -2322,7 +2921,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       lt.ms.forEach((mm, i) => im.setMatrixAt(i, mm));
       if (lt.cores.some(Boolean) || lt.pps.some(x => x !== null)) { lt.cores.forEach((cc, i) => im.setColorAt(i, cc || branco)); im.instanceColor.needsUpdate = true; }
       im.castShadow = !lt.m.userData.semSombra; im.receiveShadow = !lt.m.userData.semSombra;
-      im.userData = { cores: lt.cores, pps: lt.pps, mats: lt.pps.some(x => x !== null) ? lt.ms : null };
+      im.userData = { cores: lt.cores, pps: lt.pps, prods: lt.prods, chave: lt.chave, mats: lt.pps.some(x => x !== null) ? lt.ms : null };
       lt.grupo.add(im); instancias.push(im); descartar(im);
     });
     st.current.hits = hits; st.current.instancias = instancias; st.current.foraAnterior = new Set(); st.current.placasPos = placasPos; st.current.placasCorr = placasCorr;
@@ -2350,14 +2949,50 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     while (rotaGrupo.children.length) rotaGrupo.remove(rotaGrupo.children[0]);
     const L = layout; const { BW, D, LH } = L;
     const algum = Object.keys(destaques).length > 0 && temDestaqueModo;
-    const tmp = new THREE.Color();
+    const tmp = new THREE.Color(), corD = new THREE.Color();
     (st.current.instancias || []).forEach(im => {
-      const { cores, pps } = im.userData; if (!im.instanceColor || !pps.some(x => x !== null)) return;
-      pps.forEach((id, i) => { tmp.copy(cores[i] || new THREE.Color(1, 1, 1)); if (algum && id !== null && !destaques[id]) tmp.multiplyScalar(0.35); im.setColorAt(i, tmp); });
+      const { cores, pps, prods, chave } = im.userData; if (!im.instanceColor || !pps.some(x => x !== null)) return;
+      const ehCaixa = chave === "caixa";
+      pps.forEach((id, i) => {
+        tmp.copy(cores[i] || new THREE.Color(1, 1, 1));
+        if (algum && id !== null) {
+          if (!destaques[id]) tmp.multiplyScalar(camadaAtiva ? 0.2 : 0.28);   // o que não interessa fica bem apagado
+          else if (ehCaixa && destaques[id] !== "#ffffff") {                    // o que interessa ganha a cor forte (a caixa fica da cor, não um tom pálido)
+            const cc = camadaAtiva === "calor" && prods[i] ? CORES_GIRO[giro.classe[prods[i]] || "sem"] : destaques[id];
+            corD.set(cc); tmp.copy(corD).multiplyScalar(1.45);
+          }
+        }
+        im.setColorAt(i, tmp);
+      });
       im.instanceColor.needsUpdate = true;
     });
+    // posições LIVRES: um bloco translúcido da cor em cada vaga vazia
+    if (camadaAtiva === "vagas") {
+      const blocos = [];
+      Object.values(L.celulas).forEach(c => {
+        const u = paletesPos(c.pp, porPP[c.pp.id]).usados, ld = Math.sign(L.corredorZ(c.f) - c.z) || 1, y = (c.n > 1 ? c.y : 0) + (LH - 0.4) / 2 + 0.06;
+        if (u === 0) blocos.push([c.x, y, c.z, (c.larg || BW) - 0.3]);
+        else if (u === 1 && !c.larg) blocos.push([c.x - ld * BW / 4, y, c.z, BW / 2 - 0.25]);
+      });
+      if (blocos.length) {
+        const imv = new THREE.InstancedMesh(geo.cubo, new THREE.MeshBasicMaterial({ color: CORES_CAMADA.vagas, transparent: true, opacity: 0.45, depthWrite: false, toneMapped: false }), blocos.length);
+        const m4 = new THREE.Matrix4();
+        blocos.forEach(([x, y, z, w], i) => imv.setMatrixAt(i, m4.compose(new THREE.Vector3(x, y, z), new THREE.Quaternion(), new THREE.Vector3(w, LH - 0.4, D - 0.12))));
+        rotaGrupo.add(imv);
+      }
+    }
+    if (camadaAtiva === "livres") {
+      const vz = Object.values(L.celulas).filter(c => !(porPP[c.pp.id] || []).length);
+      if (vz.length) {
+        const imv = new THREE.InstancedMesh(geo.cubo, new THREE.MeshBasicMaterial({ color: CORES_CAMADA.livres, transparent: true, opacity: 0.42, depthWrite: false, toneMapped: false }), vz.length);
+        const m4 = new THREE.Matrix4();
+        vz.forEach((c, i) => imv.setMatrixAt(i, m4.compose(new THREE.Vector3(c.x, (c.n > 1 ? c.y : 0) + (LH - 0.4) / 2 + 0.06, c.z), new THREE.Quaternion(), new THREE.Vector3((c.larg || BW) - 0.3, LH - 0.4, D - 0.12))));
+        rotaGrupo.add(imv);
+      }
+    }
     const brilhos = [];
     Object.entries(destaques).forEach(([id, cor]) => {
+      if (camadaAtiva && id !== String(selPP)) return;   // nas camadas (ocupadas, livres, calor) a cor vai direto nas caixas, sem contorno em cada uma
       const c = L.celulas[id]; if (!c) return;
       const larg = (c.larg || BW) - 0.06, alt = LH - 0.1;
       const cx = c.x, cy = c.y + LH / 2 + 0.03, cz = c.z;
@@ -2370,13 +3005,13 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
     });
     // luz localizada sobre o endereço principal
     const pc = principal && L.celulas[principal];
-    if (pc) { foco.position.set(pc.x, pc.y + LH + 3.2, pc.z + D / 2 + 1.8); foco.target.position.set(pc.x, pc.y + LH / 2, pc.z); foco.color.set(destaques[principal] || "#bfeeff"); st.current.focoAlvo = 3.2; }
+    if (pc) { const ld = Math.sign(L.corredorZ(pc.f) - pc.z) || 1; foco.position.set(pc.x, pc.y + LH + 3.2, pc.z + ld * (D / 2 + 1.8)); foco.target.position.set(pc.x, pc.y + LH / 2, pc.z); foco.color.set(destaques[principal] || "#bfeeff"); st.current.focoAlvo = 3.2; }
     else st.current.focoAlvo = 0;
 
     // rotas pelo piso: saem da DOCA 1, usam só ruas e corredores (nunca atravessam estrutura ou parede)
     st.current.tracosLista = [];
     // (as paleteiras automáticas agora são comandadas em tempo real pelos bipes — ver o laço de animação)
-    const dentroDeFileira = (z) => L.corredores.some(f => { const zr = L.corredorZ(f) - L.A / 2 - L.D / 2; return Math.abs(z - zr) < L.D / 2 + 0.3; });
+    const dentroDeFileira = (z) => L.corredores.some(f => Math.abs(z - L.zFileira(f)) < L.D / 2 + 0.3);
     rotas.forEach((r, ri) => {
       if (!r.paradas.length) return;
       const off = (ri - (rotas.length - 1) / 2) * 0.22;   // cada rota numa "faixa" própria dentro do corredor
@@ -2427,7 +3062,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       const c = L.celulas[id]; if (!c) return;
       lista.forEach((pz, k) => {
         const cr = etiqueta(iniciais(pz.usuario), { fundo: "#a78bfa", cor: "#120a24", tam: 0.46 });
-        cr.position.set(c.x - 0.35 + k * 0.5, c.y + LH + 0.28, c.z + D / 2 + 0.05); rotaGrupo.add(cr);
+        cr.position.set(c.x - 0.35 + k * 0.5, c.y + LH + 0.28, c.z + (Math.sign(L.corredorZ(c.f) - c.z) || 1) * (D / 2 + 0.05)); rotaGrupo.add(cr);
       });
     });
     st.current.brilhos = brilhos;
@@ -2446,19 +3081,20 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       else if (ids.length) {
         const cs = ids.map(id => L.celulas[id]);
         const minX = Math.min(...cs.map(c => c.x)), maxX = Math.max(...cs.map(c => c.x)), minZ = Math.min(...cs.map(c => c.z)), maxZ = Math.max(...cs.map(c => c.z));
-        const centro = new THREE.Vector3((minX + maxX) / 2, Math.min(...cs.map(c => c.y)) + LH / 2, (minZ + maxZ) / 2 + (ids.length === 1 ? 0.6 : 1.5));
+        const ld = ids.length === 1 ? (Math.sign(L.corredorZ(cs[0].f) - cs[0].z) || 1) : 1;   // olha pela face que dá para o corredor
+        const centro = new THREE.Vector3((minX + maxX) / 2, Math.min(...cs.map(c => c.y)) + LH / 2, (minZ + maxZ) / 2 + ld * (ids.length === 1 ? 0.6 : 1.5));
         const r = ids.length === 1 ? 7.5 : Math.max(12, Math.max(maxX - minX, maxZ - minZ) * 1.25 + 8);
         voar(centro, r, ids.length === 1 ? 1.2 : 0.95, 1300, ids.length === 1 ? 0.25 : 0.5);
       }
     }
-  }, [pronto, versao, destaques, rotas, rotasAuto, achados, verDiverg, layout, selPP, selCorredor, pedidoId, busca, principal, cfg, aoVivo, temDestaqueModo, ultimaContagem]);
+  }, [pronto, versao, destaques, rotas, rotasAuto, achados, verDiverg, layout, selPP, selCorredor, pedidoId, busca, principal, cfg, aoVivo, temDestaqueModo, ultimaContagem, camadaAtiva, giro, porPP]);
 
   // ---------- vistas de câmera ----------
   function irVista(v) {
     const s = st.current; if (!s.THREE || !s.layoutAtual) return;
     const pr = s.layoutAtual.predio; const V = s.THREE.Vector3; const r = Math.max(18, Math.max(pr.W, pr.P) * 0.95);
     s.interagiu = true;
-    if (v === "pessoa") { s.modoPessoa = true; setPessoa(true); setVista(v); s.renderer.domElement.focus(); return; }
+    if (v === "pessoa") { s.livrarPessoa && s.livrarPessoa(); s.modoPessoa = true; setPessoa(true); setVista(v); try { s.renderer.domElement.focus({ preventScroll: true }); } catch (e) {} return; }
     s.modoPessoa = false; setPessoa(false); setVista(v);
     if (v === "superior") s.voar(new V(pr.cx, 0, pr.cz), r * 1.05, 0.04, 1200, 0);
     else if (v === "frontal") s.voar(new V(pr.cx, 2.5, pr.cz), r * 0.9, 1.32, 1200, 0);
@@ -2470,15 +3106,19 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   // ---------- interface ----------
   const totalPP = portaPaletes.length;
   const ocupadas = portaPaletes.filter(pp => (porPP[pp.id] || []).length).length;
+  // vagas de palete: cada posição comporta 2 paletes (1 quando o vão é dividido entre várias porta-paletes)
+  let vagasTot = 0, vagasUsadas = 0, aConferir = 0;
+  portaPaletes.forEach(pp => { const c = layout.celulas[pp.id], cap = c && c.larg ? 1 : 2, r = paletesPos(pp, porPP[pp.id]); vagasTot += cap; vagasUsadas += Math.min(cap, r.usados); if (r.ocupada && !r.conferido) aConferir++; });
+  const vagasLivres = vagasTot - vagasUsadas;
   const ppSel = selPP ? portaPaletes.find(pp => pp.id === selPP) : null;
   const contSel = ppSel ? ultimaContagem[ppSel.id] : null;
   const C = { painel: "#141a23", borda: "#262f3d", texto: "#e7ebf2", sec: "#8a94a6", azul: "#2f6fd6", ciano: "#2fc4ee", laranja: "#e8892f", verde: "#3fbf7f", vermelho: "#e5484d" };
-  const kpi = (icone, titulo, valor, cor, barra) => (
-    <div style={{ background: C.painel, border: "1px solid " + C.borda, borderRadius: 10, padding: estreito ? "6px 9px" : "9px 13px", display: "flex", alignItems: "center", gap: 10, minWidth: estreito ? 0 : 128, flex: estreito ? "0 0 auto" : "1 1 0" }}>
+  const kpi = (icone, titulo, valor, cor, barra, extra = {}) => (
+    <div onClick={extra.onClick} title={extra.dica} style={{ cursor: extra.onClick ? "pointer" : "default", boxShadow: extra.ativo ? "0 0 0 2px " + cor + ", 0 0 18px " + cor + "55" : "none", background: extra.ativo ? cor + "1c" : C.painel, border: "1px solid " + (extra.ativo ? cor : C.borda), borderRadius: 10, padding: estreito ? "6px 9px" : "9px 13px", display: "flex", alignItems: "center", gap: 10, minWidth: estreito ? 0 : 128, flex: estreito ? "0 0 auto" : "1 1 0" }}>
       {!estreito && <div style={{ width: 30, height: 30, borderRadius: 8, background: (cor || C.azul) + "22", display: "grid", placeItems: "center" }}><Icon name={icone} size={16} color={cor || C.azul} /></div>}
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: estreito ? 9.5 : 11, color: C.sec, whiteSpace: "nowrap" }}>{titulo}</div>
-        <div style={{ fontSize: estreito ? 14 : 18, fontWeight: 700, color: C.texto, lineHeight: 1.15 }}>{valor}</div>
+        <div style={{ fontSize: estreito ? 14 : 18, fontWeight: 700, color: extra.ativo ? cor : C.texto, lineHeight: 1.15 }}>{valor}{extra.sub && <span style={{ fontSize: estreito ? 10.5 : 12, fontWeight: 600, color: C.sec, marginLeft: 6 }}>{extra.sub}</span>}</div>
         {barra !== undefined && !estreito && <div style={{ height: 3, background: "#222b38", borderRadius: 2, marginTop: 4 }}><div style={{ width: barra + "%", height: 3, background: cor || C.azul, borderRadius: 2 }} /></div>}
       </div>
     </div>
@@ -2490,7 +3130,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
   // ao tocar numa porta-palete, corredor ou doca nova, o painel volta a abrir sozinho
   useEffect(() => { if (selPP || selCorredor !== null || selDoca || selPrep) setPainelRecolhido(false); }, [selPP, selCorredor, selDoca, selPrep]);
   const tituloPainel = ppSel ? enderecoPP(ppSel) : rota ? "Rota · " + rotas.map(r => r.ped.numeroPedido).join(", ") : achados ? "Busca · " + achados.linhas.length
-    : infoCorredor ? "Corredor " + pad2(infoCorredor.f) : selPrep ? "Área de preparação" : selDoca ? "Doca 1" : verAoVivo ? "Ao vivo" : verDiverg ? "Divergências" : "Detalhes";
+    : infoCorredor ? "Corredor " + infoCorredor.f : selPrep ? "Área de preparação" : selDoca ? "Doca 1" : verAoVivo ? "Ao vivo" : verDiverg ? "Divergências" : "Detalhes";
   const campo = (k, rotulo, passo = 0.1) => (
     <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: C.sec, minWidth: 0 }}>{rotulo}
       <input style={{ width: "100%", minWidth: 0, boxSizing: "border-box" }} type="number" step={passo} value={st.current.cfgRasc ? st.current.cfgRasc[k] : cfg[k]} onChange={e => { st.current.cfgRasc = { ...(st.current.cfgRasc || cfg), [k]: e.target.value }; setVersao(v => v + 1); }} />
@@ -2516,10 +3156,12 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       </div>
 
       <div style={{ display: "flex", gap: 8, marginBottom: 10, overflowX: estreito ? "auto" : "visible", flexWrap: estreito ? "nowrap" : "wrap" }}>
-        {kpi("dashboard", "Ocupação do estoque", totalPP ? Math.round(ocupadas / totalPP * 100) + "%" : "—", C.azul, totalPP ? ocupadas / totalPP * 100 : 0)}
+        {kpi("dashboard", "Ocupação do estoque", vagasTot ? Math.round(vagasUsadas / vagasTot * 100) + "%" : "—", C.azul, vagasTot ? vagasUsadas / vagasTot * 100 : 0, { sub: vagasUsadas + (vagasUsadas === 1 ? " palete" : " paletes") + " de " + vagasTot + " vagas" })}
         {kpi("map-pin", "Porta-paletes", totalPP, C.laranja)}
-        {kpi("check-circle", "Posições ocupadas", ocupadas, C.verde)}
-        {kpi("package", "Posições livres", totalPP - ocupadas, C.sec)}
+        {kpi("check-circle", "Posições ocupadas ▸", ocupadas, CORES_CAMADA.ocupadas, undefined, { ativo: camadaAtiva === "ocupadas", dica: "Mostrar no mapa as porta-paletes ocupadas", onClick: () => { setCamada(c => c === "ocupadas" ? "" : "ocupadas"); setVerDiverg(false); setSelCorredor(null); setBusca(""); } })}
+        {kpi("package", "Posições livres ▸", totalPP - ocupadas, CORES_CAMADA.livres, undefined, { ativo: camadaAtiva === "livres", dica: "Mostrar no mapa as porta-paletes livres", onClick: () => { setCamada(c => c === "livres" ? "" : "livres"); setVerDiverg(false); setSelCorredor(null); setBusca(""); } })}
+        {kpi("check-circle", "Vagas livres ▸", vagasLivres, CORES_CAMADA.vagas, undefined, { sub: "confirmadas", ativo: camadaAtiva === "vagas", dica: "Vagas de palete livres (posições vazias + o lado vazio das que têm só 1 palete)", onClick: () => { setCamada(c => c === "vagas" ? "" : "vagas"); setVerDiverg(false); setSelCorredor(null); setBusca(""); } })}
+        {kpi("alert-triangle", "A conferir ▸", aConferir, CORES_CAMADA.conferir, undefined, { sub: aConferir === 1 ? "posição" : "posições", ativo: camadaAtiva === "conferir", dica: "Posições ocupadas em que ninguém confirmou se são 1 ou 2 paletes (o sistema supõe 2)", onClick: () => { setCamada(c => c === "conferir" ? "" : "conferir"); setVerDiverg(false); setSelCorredor(null); setBusca(""); } })}
         {kpi("clipboard-list", "Pedidos em aberto", pedidosAbertos.length, C.ciano)}
         {kpi("barcode", "Produtos cadastrados", produtos.length, "#a78bfa")}
       </div>
@@ -2537,6 +3179,8 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
         <button onClick={() => { setPedidoIds(emSeparacaoAgora.slice(0, 6)); setBusca(""); setVerDiverg(false); setSelCorredor(null); }} disabled={!emSeparacaoAgora.length}
           style={{ ...btn(false, C.ciano), opacity: emSeparacaoAgora.length ? 1 : 0.5 }}>Em separação agora ({emSeparacaoAgora.length})</button>
         <button onClick={() => { setVerDiverg(v => !v); setBusca(""); setPedidoId(""); setSelCorredor(null); }} style={btn(verDiverg, C.vermelho)}>Divergências ({Object.keys(diverg).length})</button>
+        <button onClick={() => { setCamada(c => c === "calor" ? "" : "calor"); setVerDiverg(false); setSelCorredor(null); setBusca(""); }} style={btn(camadaAtiva === "calor", CORES_GIRO.alta)}>
+          <span style={{ display: "inline-block", width: 22, height: 8, borderRadius: 3, marginRight: 7, verticalAlign: "middle", background: `linear-gradient(90deg, ${CORES_GIRO.baixa}, ${CORES_GIRO.media}, ${CORES_GIRO.alta})` }} />Mapa de calor (curva ABC)</button>
         <button onClick={() => setVerAoVivo(v => !v)} style={btn(verAoVivo, "#a78bfa")}>
           <span style={{ display: "inline-block", width: 7, height: 7, borderRadius: 4, background: aoVivo.contando.length + aoVivo.separando.length ? "#a78bfa" : C.sec, marginRight: 6, verticalAlign: "middle" }} />
           Ao vivo: {aoVivo.contando.length} contando · {aoVivo.separando.length + aoVivo.separandoPP.length} separando</button>
@@ -2564,6 +3208,23 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
       <div style={{ position: "relative", height: estreito ? "calc(100vh - 170px)" : "calc(100vh - 290px)", minHeight: estreito ? 430 : 480, borderRadius: 12, overflow: "hidden", border: "1px solid " + C.borda, background: "#0c1016" }}>
         <div ref={caixaRef} style={{ position: "absolute", inset: 0 }} />
         {!pronto && !erro && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: C.sec }}>Montando o galpão em 3D…</div>}
+        {pronto && camadaAtiva && (() => {   // legenda da camada de cores ligada
+          const caixaL = { position: "absolute", left: 10, bottom: 10, zIndex: 5, background: "rgba(12,14,18,0.93)", border: "1px solid " + C.borda, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, color: C.texto, minWidth: 210, boxShadow: "0 6px 24px rgba(0,0,0,.45)" };
+          const item = (cor, txt, n) => <div key={txt} style={{ display: "flex", alignItems: "center", gap: 8, padding: "3px 0" }}><span style={{ width: 14, height: 14, borderRadius: 3, background: cor, boxShadow: "0 0 10px " + cor + "88" }} /><span style={{ flex: 1 }}>{txt}</span>{n !== undefined && <b>{n}</b>}</div>;
+          const fechar = <a onClick={() => setCamada("")} style={{ color: C.sec, cursor: "pointer", fontSize: 11.5 }}>esconder ✕</a>;
+          if (camadaAtiva === "ocupadas") return <div style={caixaL}><div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4, fontWeight: 700 }}>Porta-paletes ocupadas {fechar}</div>{item(CORES_CAMADA.ocupadas, "Ocupadas (" + (totalPP ? Math.round(ocupadas / totalPP * 100) : 0) + "%)", ocupadas + " paletes")}</div>;
+          if (camadaAtiva === "vagas") return <div style={caixaL}><div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4, fontWeight: 700 }}>Vagas de palete livres {fechar}</div>{item(CORES_CAMADA.vagas, "Vagas livres confirmadas", vagasLivres + " de " + vagasTot)}<div style={{ color: C.sec, fontSize: 11, marginTop: 6, maxWidth: 240, lineHeight: 1.4 }}>Posições vazias e o lado vazio das que têm só 1 palete. Posição não conferida conta como cheia.</div></div>;
+          if (camadaAtiva === "conferir") return <div style={caixaL}><div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4, fontWeight: 700 }}>Posições a conferir {fechar}</div>{item(CORES_CAMADA.conferir, "Sem confirmação de 1 ou 2 paletes", aConferir + " pos.")}<div style={{ color: C.sec, fontSize: 11, marginTop: 6, maxWidth: 240, lineHeight: 1.4 }}>Enquanto ninguém confirmar, o sistema supõe 2 paletes (cheia). Clique na posição para marcar.</div></div>;
+          if (camadaAtiva === "livres") return <div style={caixaL}><div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 4, fontWeight: 700 }}>Porta-paletes livres {fechar}</div>{item(CORES_CAMADA.livres, "Livres para guardar", (totalPP - ocupadas) + " posições")}</div>;
+          const contaPos = { alta: 0, media: 0, baixa: 0, sem: 0 }; Object.values(destaques).forEach(c => { const k = Object.keys(CORES_GIRO).find(k2 => CORES_GIRO[k2] === c); if (k) contaPos[k]++; });
+          return <div style={caixaL}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 6, fontWeight: 700 }}>Mapa de calor · Curva ABC {fechar}</div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6, color: C.sec, fontSize: 11.5 }}>Saídas dos últimos
+              <select value={giroDias} onChange={e => setGiroDias(Number(e.target.value))} style={{ width: "auto", padding: "2px 6px", fontSize: 11.5 }}><option value={30}>30 dias</option><option value={90}>90 dias</option><option value={180}>180 dias</option></select></div>
+            {["alta", "media", "baixa", "sem"].map(k => item(CORES_GIRO[k], <span>{NOMES_GIRO[k]} <span style={{ color: C.sec, fontSize: 11 }}>· {DESC_GIRO[k]}</span></span>, contaPos[k] + " pos."))}
+            <div style={{ color: C.sec, fontSize: 11, marginTop: 6, maxWidth: 230, lineHeight: 1.4 }}>Cada caixa fica da cor do giro do seu produto. Não conta ajuste, correção nem transferência.</div>
+          </div>;
+        })()}
         {erro && <div style={{ position: "absolute", inset: 0, display: "grid", placeItems: "center", color: "#ff8a93", padding: 20, textAlign: "center" }}>{erro}</div>}
 
         {(!cfgSalva || layout.semPosicao.length > 0 || layout.duplicadas.length > 0) && pronto && (
@@ -2667,7 +3328,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
                   {locais.length ? locais.map(l => { const pp = portaPaletes.find(x => x.id === l.ppId); return pp && (
                     <div key={l.ppId} onClick={() => setSelPP(l.ppId)} style={{ marginTop: 6, background: "#18202b", border: "1px solid " + C.borda, borderRadius: 8, padding: "6px 8px", cursor: "pointer" }}>
                       <div style={{ color: C.ciano, fontWeight: 700 }}>{enderecoPP(pp)} <span style={{ color: C.sec, fontWeight: 500 }}>{pp.codigo}</span></div>
-                      <div style={{ color: C.sec, fontSize: 12 }}>Corredor {pad2(pp.fileira)} · Posição {String(pp.porta).toUpperCase()} · Nível {pad2(pp.nivel)} — {l.qtd ? l.qtd + " un." : "endereço cadastrado, sem saldo"}</div>
+                      <div style={{ color: C.sec, fontSize: 12 }}>Fileira {pad2(pp.fileira)} · Corredor {layout.ruaDe(Number(pp.fileira))} · Posição {String(pp.porta).toUpperCase()} · Nível {pad2(pp.nivel)} — {l.qtd ? l.qtd + " un." : "endereço cadastrado, sem saldo"}</div>
                     </div>); }) : <div style={{ color: "#f5a524", marginTop: 4 }}>Sem porta-palete definida</div>}
                 </div>); })}
             </div>)}
@@ -2686,7 +3347,7 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
             </div>)}
 
             {infoCorredor && !ppSel && (<div style={{ marginBottom: 12 }}>
-              {titulo("Corredor " + pad2(infoCorredor.f), C.laranja)}
+              {titulo("Corredor " + infoCorredor.f + (infoCorredor.fileiras.length ? " · fileira" + (infoCorredor.fileiras.length > 1 ? "s " : " ") + infoCorredor.fileiras.map(pad2).join(" e ") : ""), C.laranja)}
               {linha("Porta-paletes", infoCorredor.total)}{linha("Posições ocupadas", infoCorredor.ocupadas, C.verde)}{linha("Posições livres", infoCorredor.livres)}
               {linha("Ocupação", infoCorredor.pct + "%")}{linha("Divergências", infoCorredor.divergencias, infoCorredor.divergencias ? C.vermelho : C.verde)}
               <div style={{ height: 5, background: "#222b38", borderRadius: 3, margin: "8px 0" }}><div style={{ width: infoCorredor.pct + "%", height: 5, background: C.laranja, borderRadius: 3 }} /></div>
@@ -2729,12 +3390,13 @@ function Mapa3D({ portaPaletes, estoquePP, produtos, pedidos, itensPorPedido, co
             {ppSel && (<div style={{ borderTop: (rota || achados || verDiverg) ? "1px solid " + C.borda : "none", paddingTop: (rota || achados || verDiverg) ? 12 : 0 }}>
               {titulo("Endereço", C.ciano)}
               <div style={{ fontSize: 22, fontWeight: 800, letterSpacing: 0.5 }}>{enderecoPP(ppSel)} <span style={{ fontSize: 13, color: C.sec, fontWeight: 500 }}>{ppSel.codigo}</span></div>
-              <div style={{ color: C.sec, fontSize: 12, margin: "2px 0 8px" }}>Corredor {pad2(ppSel.fileira)} · Posição {String(ppSel.porta || "").toUpperCase()} · Nível {pad2(ppSel.nivel)}</div>
+              <div style={{ color: C.sec, fontSize: 12, margin: "2px 0 8px" }}>Fileira {pad2(ppSel.fileira)} · Corredor {layout.ruaDe(Number(ppSel.fileira))} · Posição {String(ppSel.porta || "").toUpperCase()} · Nível {pad2(ppSel.nivel)}</div>
               {(porPP[ppSel.id] || []).length ? (porPP[ppSel.id] || []).map(it => (
                 <div key={it.produtoId} style={{ display: "flex", justifyContent: "space-between", gap: 8, padding: "5px 0", borderTop: "1px solid #1f2733" }}>
                   <span>{it.produto ? it.produto.nome : "Produto"}<div style={{ fontSize: 11.5, color: C.sec }}>{it.produto ? "SKU " + (it.produto.sku || "—") : ""}</div></span><b>{it.qtd}</b>
                 </div>
               )) : <div style={{ color: C.sec, padding: "4px 0" }}>Posição livre</div>}
+              <PaletesDaPosicao pp={ppSel} itens={porPP[ppSel.id]} usuario={usuarioEmail} larg={!!(layout.celulas[ppSel.id] && layout.celulas[ppSel.id].larg)} C={C} />
               <div style={{ marginTop: 10, background: "#18202b", border: "1px solid " + C.borda, borderRadius: 8, padding: "8px 10px" }}>
                 {contSel ? (<>
                   <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: C.sec, fontSize: 12 }}>Última contagem</span><b style={{ color: contSel.diferenca_total ? C.vermelho : C.verde, fontSize: 12 }}>{contSel.diferenca_total ? "Divergência " + (contSel.diferenca_total > 0 ? "+" : "") + contSel.diferenca_total : "Conferida ✓"}</b></div>
@@ -3042,9 +3704,11 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
   const [entradaFornecedorSel, setEntradaFornecedorSel] = useState("");
   const [entradaEmpresaSel, setEntradaEmpresaSel] = useState("");
   const [entradaPPSel, setEntradaPPSel] = useState("");
+  const [entradaPaletes, setEntradaPaletes] = useState(null);   // depois de guardar: quantos paletes ficam na posição
   const [entradaFileira, setEntradaFileira] = useState("");
   const [entradaPorta, setEntradaPorta] = useState("");
   const [entradaNivel, setEntradaNivel] = useState("");
+  useEffect(() => { setEntradaPaletes(null); }, [entradaProdutoId, entradaModo, entradaFileira, entradaPorta, entradaNivel, entradaPPSel]);   // mudou o destino: pergunta de novo
   const [entradaErro, setEntradaErro] = useState("");
   const [salvandoEntrada, setSalvandoEntrada] = useState(false);
   const [saidaProdutoId, setSaidaProdutoId] = useState("");
@@ -3151,6 +3815,21 @@ function SistemaEstoque({ usuarioLogado, usuarios, setUsuarios, onLogout }) {
     const bruto = p.localizacao || [p.fileira, p.porta, p.nivel].filter(Boolean).join("-");
     return String(bruto).split("|").map(s => s.trim()).filter(Boolean);
   };
+
+  // vagas de palete no galpão: cada posição comporta 2 paletes (1 se o vão é dividido entre várias porta-paletes).
+  // Posição ocupada sem conferência conta como cheia (2): toda vaga livre mostrada é confirmada.
+  const vagasPalete = useMemo(() => {
+    const comItens = new Set(estoquePP.filter(e => e.qtd > 0).map(e => String(e.ppId)));
+    const chave = (pp) => Number(pp.fileira) + "|" + String(pp.porta || "").trim().toUpperCase() + "|" + Number(pp.nivel);
+    const porVao = {}; portaPaletes.forEach(pp => { const k = chave(pp); porVao[k] = (porVao[k] || 0) + 1; });
+    let total = 0, usadas = 0, aConferir = 0, posLivres = 0;
+    portaPaletes.forEach(pp => {
+      const cap = porVao[chave(pp)] > 1 ? 1 : 2, r = paletesPos(pp, comItens.has(String(pp.id)) ? [1] : []);
+      total += cap; usadas += Math.min(cap, r.usados);
+      if (!r.ocupada) posLivres++; else if (!r.conferido) aConferir++;
+    });
+    return { total, usadas, livres: total - usadas, aConferir, posLivres };
+  }, [estoquePP, portaPaletes]);
 
   const stats = useMemo(() => {
     const pendentes = notas.filter(n => n.status === "Pendente").length;
@@ -3477,12 +4156,19 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     setEntradaProdutoId(""); setEntradaModo("existente"); setEntradaNovoNome("");
     setEntradaFornecedorSel(""); setEntradaEmpresaSel(empresas.length === 1 ? String(empresas[0].id) : "");
     setEntradaPPSel(""); setEntradaFileira(""); setEntradaPorta(""); setEntradaNivel("");
-    setProdutoCodBarras(""); setEntradaErro(""); setSalvandoEntrada(false);
+    setProdutoCodBarras(""); setEntradaErro(""); setSalvandoEntrada(false); setEntradaPaletes(null);
     setModalEntrada(true);
   }
 
+  // porta-palete onde a mercadoria da entrada vai ficar (a escolhida, ou a localização do produto / a digitada)
+  function alvoPPEntrada() {
+    if (entradaPPSel) return portaPaleteById(entradaPPSel) || null;
+    const loc = entradaModo === "novo" ? { fileira: entradaFileira, porta: entradaPorta, nivel: entradaNivel } : produtos.find(p => String(p.id) === String(entradaProdutoId));
+    if (!loc || !loc.fileira || !String(loc.porta || "").trim() || !loc.nivel) return null;
+    return portaPaletes.find(pp => Number(pp.fileira) === Number(loc.fileira) && String(pp.porta || "").trim().toUpperCase() === String(loc.porta).trim().toUpperCase() && Number(pp.nivel) === Number(loc.nivel)) || null;
+  }
   function escolherPPNaEntrada(id) {
-    setEntradaPPSel(id);
+    setEntradaPPSel(id); setEntradaPaletes(null);
     const pp = portaPaleteById(id);
     if (pp) {
       setEntradaFileira(String(pp.fileira ?? "")); setEntradaPorta(pp.porta || ""); setEntradaNivel(String(pp.nivel ?? ""));
@@ -3502,7 +4188,10 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     setEntradaErro("");
     const qtd = Number(d.quantidade);
     if (!qtd || qtd < 1) { setEntradaErro("Informe uma quantidade maior que zero."); return; }
+    const alvoPal = alvoPPEntrada();
+    if (alvoPal && !entradaPaletes) { setEntradaErro(`Diga quantos paletes ficam na posição ${alvoPal.codigo} depois de guardar (1 ou 2).`); return; }
     setSalvandoEntrada(true);
+    const gravarPaletes = async () => { if (alvoPal && entradaPaletes) { try { await salvarPaletesPP(alvoPal.id, entradaPaletes, usuarioLogado.email); } catch (e) { alert("A entrada foi registrada, mas não gravou a quantidade de paletes: " + (e.message || e) + "\nMarque pelo Mapa 3D."); } } };
     try {
       let produtoId, produtoCriado = false;
 
@@ -3540,6 +4229,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
           p_numero_nf: d.numeroNf || null, p_obs: d.obs || null, p_usuario: usuarioLogado.email,
         });
         if (errEnt) { setEntradaErro("Erro ao registrar a entrada: " + errEnt.message); return; }
+        await gravarPaletes();
         await recarregarTudo();
         setModalEntrada(false);
         return;
@@ -3554,6 +4244,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
         if (produtoCriado) await supabaseClient.from("estoque").delete().eq("id", produtoId);
         setEntradaErro("Erro ao registrar a entrada: " + errMov.message); return;
       }
+      await gravarPaletes();
       await recarregarTudo();
       setModalEntrada(false);
     } finally {
@@ -3772,218 +4463,390 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     setPdfArquivoNome("");
   }
 
-  function parseNumeroBR(str) {
-    if (!str) return 0;
-    let s = String(str).trim();
-    s = s.replace(/\.(?=\d{3}(\D|$))/g, "").replace(",", ".");
-    const n = parseFloat(s);
-    return isNaN(n) ? 0 : n;
-  }
-
-  function parseItensDanfe(textoOriginal) {
-    // Remove ruído típico de OCR (bordas de tabela reconhecidas como | [ ] { })
-    // mas preserva quebras de linha, que ajudam a separar um item do outro
-    // e a recuperar códigos que quebram em duas linhas na coluna COD.PROD.
-    const linhas = textoOriginal
-      .replace(/[|\[\]{}]/g, " ")
-      .split(/[\r\n]+/)
-      .map((l) => l.replace(/\s+/g, " ").trim())
-      .filter(Boolean);
-
-    const itens = [];
-    // COD.PROD  DESCRIÇÃO ... NCM/SH(7-8 díg.) ... UN  QUANT.  [V.UNITARIO] ...
-    // Entre NCM e UN aceitamos qualquer ruído (CST/CFOP às vezes saem
-    // corrompidos do OCR), por isso usamos .*? em vez de exigir os
-    // dígitos exatos de CST e CFOP.
-    const rowRegex = /^(\d{8,14})\s+(.+?)\s+(\d{7,8})\s+.*?\b([A-Z]{2,4})\b\s+([\d.,]{1,12})(?:\s+([\d.,]{1,12}))?/;
-
-    for (let i = 0; i < linhas.length; i++) {
-      const m = linhas[i].match(rowRegex);
-      if (!m) continue;
-      const quantidade = parseNumeroBR(m[5]);
-      if (quantidade <= 0) continue;
-
-      let codigo = m[1];
-      // Se a linha seguinte for só um fragmento curto de dígitos (sufixo do
-      // código que quebrou de linha na coluna COD.PROD), anexa ao código.
-      const proxima = linhas[i + 1];
-      if (proxima && proxima.length <= 8 && !/^\d{8,14}\s/.test(proxima)) {
-        const sufixo = proxima.match(/^(\d{1,4})(?:\D|$)/);
-        if (sufixo) codigo += sufixo[1];
-      }
-
-      itens.push({
-        id: Math.random().toString(36).slice(2),
-        codigo,
-        descricao: m[2].replace(/[-–]\s*$/, "").trim(),
-        unidade: m[4],
-        quantidade,
-        valorUnitario: m[6] ? parseNumeroBR(m[6]) : 0,
-        incluir: true,
-      });
-    }
-    return itens;
-  }
-
-  // Parser alternativo, mais tolerante, usado quando o layout padrão de DANFE
-  // não é reconhecido (comum em PDFs gerados por apps de scanner como o
-  // CamScanner, onde o OCR sai com colunas desalinhadas, sem NCM legível etc.)
-  function parseItensFallback(textoOriginal) {
-    const linhas = textoOriginal
-      .replace(/[|\[\]{}]/g, " ")
-      .split(/[\r\n]+/)
-      .map((l) => l.replace(/\s+/g, " ").trim())
-      .filter(Boolean);
-
-    const itens = [];
-    // CÓDIGO (alfanumérico) ... DESCRIÇÃO (texto) ... [UN] QTD no fim da linha
-    const looseRegex = /^([A-Z0-9][A-Z0-9.\-\/]{2,15})\s+(.{3,70}?)\s+(?:UN|UND|UNI|UNID|PC|PCT|CX|KG|MT|LT)?\.?\s*[:\-]?\s*(\d{1,4}(?:[.,]\d{1,3})?)\s*(?:UN|UND|UNI|UNID|PC|PCT|CX)?\s*$/i;
-
-    for (const l of linhas) {
-      // ignora linhas claramente de cabeçalho/rodapé/totais
-      if (/total|subtotal|cnpj|endere|telefone|emiss|chave de acesso|valor a pagar/i.test(l)) continue;
-      const m = l.match(looseRegex);
-      if (!m) continue;
-      const quantidade = parseNumeroBR(m[3]);
-      if (quantidade <= 0 || quantidade > 99999) continue;
-      const descricao = m[2].replace(/[-–]\s*$/, "").trim();
-      if (descricao.length < 3) continue;
-      itens.push({
-        id: Math.random().toString(36).slice(2),
-        codigo: m[1],
-        descricao,
-        unidade: "UN",
-        quantidade,
-        valorUnitario: 0,
-        incluir: true,
-      });
-    }
-    return itens;
-  }
-
-  function extrairNumeroNota(texto) {
-    const m = texto.match(/N\.?\s*0*?(\d{4,9})\s*(?:S[ÉE]RIE|SERIE)?/i) || texto.match(/(\d{6,9})/);
-    return m ? m[1] : "";
-  }
-
-  function textoPorLinhas(textContent) {
+  // ---- Leitura da nota: XML (exato), PDF com texto (exato), PDF digitalizado / foto (OCR conferido) ----
+  function nfTextoPorLinhas(textContent) {
     const linhas = {};
     textContent.items.forEach((it) => {
+      if (!it.str || !it.str.trim()) return;
       const y = Math.round(it.transform[5] / 3) * 3; // agrupa por faixa de Y (tolerância)
-      if (!linhas[y]) linhas[y] = [];
-      linhas[y].push(it.str);
+      (linhas[y] = linhas[y] || []).push({ x: it.transform[4], s: it.str });
     });
-    return Object.keys(linhas)
-      .map(Number)
-      .sort((a, b) => b - a) // maior Y = topo da página primeiro
-      .map((y) => linhas[y].join(" "))
+    return Object.keys(linhas).map(Number).sort((a, b) => b - a) // topo da página primeiro
+      .map((y) => linhas[y].sort((a, b) => a.x - b.x).map(p => p.s).join(" ")) // esquerda -> direita
       .join("\n");
   }
 
-  // Pré-processa a imagem (escala de cinza + binarização por limiar de Otsu)
-  // antes de mandar pro OCR. Isso ajuda muito em PDFs feitos por apps de
-  // celular (CamScanner e similares), que costumam ter sombra, baixo
-  // contraste e fundo irregular.
-  function preprocessarImagemOCR(canvas) {
-    const ctx = canvas.getContext("2d");
-    const { width: w, height: h } = canvas;
-    const imgData = ctx.getImageData(0, 0, w, h);
-    const d = imgData.data;
-    const hist = new Array(256).fill(0);
+  // Tira sombra e fundo irregular (divide pelo fundo desfocado) e devolve um canvas novo.
+  // modo "cinza" mantém tons; modo "pb" deixa preto e branco.
+  function nfPrepararImagem(origem, modo, fatorFundo) {
+    const w = origem.width, h = origem.height;
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const ctx = c.getContext("2d", { willReadFrequently: true });
+    ctx.drawImage(origem, 0, 0);
+    const img = ctx.getImageData(0, 0, w, h), d = img.data;
+    const pw = Math.max(8, Math.round(w / fatorFundo)), ph = Math.max(8, Math.round(h / fatorFundo));
+    const p = document.createElement("canvas"); p.width = pw; p.height = ph;
+    const pc = p.getContext("2d"); pc.imageSmoothingEnabled = true; pc.imageSmoothingQuality = "high";
+    pc.drawImage(origem, 0, 0, pw, ph);
+    const f = document.createElement("canvas"); f.width = w; f.height = h;
+    const fc = f.getContext("2d", { willReadFrequently: true }); fc.imageSmoothingEnabled = true; fc.imageSmoothingQuality = "high";
+    fc.drawImage(p, 0, 0, w, h);
+    const fd = fc.getImageData(0, 0, w, h).data;
     for (let i = 0; i < d.length; i += 4) {
-      const gray = Math.round(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
-      d[i] = d[i + 1] = d[i + 2] = gray;
-      hist[gray]++;
-    }
-    const total = w * h;
-    let sum = 0;
-    for (let t = 0; t < 256; t++) sum += t * hist[t];
-    let sumB = 0, wB = 0, maxVar = 0, threshold = 150;
-    for (let t = 0; t < 256; t++) {
-      wB += hist[t];
-      if (wB === 0) continue;
-      const wF = total - wB;
-      if (wF === 0) break;
-      sumB += t * hist[t];
-      const mB = sumB / wB;
-      const mF = (sum - sumB) / wF;
-      const varBetween = wB * wF * (mB - mF) * (mB - mF);
-      if (varBetween > maxVar) { maxVar = varBetween; threshold = t; }
-    }
-    for (let i = 0; i < d.length; i += 4) {
-      const v = d[i] > threshold ? 255 : 0;
+      const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      const b = 0.299 * fd[i] + 0.587 * fd[i + 1] + 0.114 * fd[i + 2];
+      let v = Math.min(255, (g / (b + 1)) * 255);
+      if (modo === "pb") v = v > 200 ? 255 : 0;
       d[i] = d[i + 1] = d[i + 2] = v;
     }
-    ctx.putImageData(imgData, 0, 0);
+    ctx.putImageData(img, 0, 0);
+    return c;
+  }
+
+  // Abre a foto. Fotos HEIC (padrão de vários celulares Samsung/iPhone) o navegador não abre sozinho:
+  // nesse caso carrega um conversor (só na hora que precisa) e transforma em JPG antes de ler.
+  function nfCarregarScript(src) {
+    return new Promise((ok, falha) => {
+      if (document.querySelector(`script[src="${src}"]`) && window.heic2any) return ok();
+      const sc = document.createElement("script"); sc.src = src; sc.onload = () => ok(); sc.onerror = () => falha(new Error("não consegui baixar o conversor de foto HEIC (verifique a internet)"));
+      document.head.appendChild(sc);
+    });
+  }
+  async function nfAbrirImagem(file) {
+    const ehHeic = /\.(heic|heif)$/i.test(file.name || "") || /hei[cf]/i.test(file.type || "");
+    if (!ehHeic) {
+      try { return await createImageBitmap(file); } catch (e) { /* tenta como HEIC abaixo */ }
+    }
+    setPdfStatus("Convertendo a foto HEIC do celular (pode levar alguns segundos)...");
+    try { return await createImageBitmap(file); } catch (e) {}
+    await nfCarregarScript("https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js");
+    try {
+      let jpg = await window.heic2any({ blob: file, toType: "image/jpeg", quality: 0.92 });
+      if (Array.isArray(jpg)) jpg = jpg[0];
+      return await createImageBitmap(jpg);
+    } catch (e) {
+      throw new Error("não consegui abrir essa foto. Tente tirar a foto em JPG (na câmera: Configurações > Formatos > desligar \"Imagens HEIF\") ou mande um print da foto.");
+    }
+  }
+
+  function nfGirar(origem, graus) {
+    if (!graus) return origem;
+    const c = document.createElement("canvas");
+    const deitado = graus % 180 !== 0;
+    c.width = deitado ? origem.height : origem.width;
+    c.height = deitado ? origem.width : origem.height;
+    const ctx = c.getContext("2d");
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate((graus * Math.PI) / 180);
+    ctx.drawImage(origem, -origem.width / 2, -origem.height / 2);
+    return c;
+  }
+
+  // Onde fica a tabela de produtos na página (pelas palavras que o OCR achou).
+  function nfAreaTabela(data, alturaPagina) {
+    let palavras = data.words || [];
+    if (!palavras.length && data.blocks) data.blocks.forEach(b => (b.paragraphs || []).forEach(p => (p.lines || []).forEach(l => palavras.push(...(l.words || [])))));
+    palavras = palavras.filter(w => w && w.bbox && w.text);
+    const norm = t => t.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    let topo = null;
+    for (const w of palavras) {
+      if (!/^DADOS/.test(norm(w.text))) continue;
+      const h = w.bbox.y1 - w.bbox.y0;
+      const prod = palavras.find(v => v !== w && /PRODUT/.test(norm(v.text)) && v.bbox.x0 > w.bbox.x0 && Math.abs(v.bbox.y0 - w.bbox.y0) < h * 1.5 && v.bbox.x0 - w.bbox.x1 < h * 8);
+      if (prod) { topo = Math.min(w.bbox.y0, prod.bbox.y0); break; }
+    }
+    if (topo === null) {
+      const desc = palavras.find(w => /^DESCRI/.test(norm(w.text)) && palavras.some(v => /NCM/.test(norm(v.text)) && Math.abs(v.bbox.y0 - w.bbox.y0) < 60));
+      if (desc) topo = desc.bbox.y0 - 40;
+    }
+    if (topo === null) return null;
+    let fim = palavras.filter(w => w.bbox.y0 > topo + 120 && /ISSQN|ADICIONA|RESERVADO|COMPLEMENTAR|^CALCULO/.test(norm(w.text)))
+      .reduce((m, w) => Math.min(m, w.bbox.y0), alturaPagina);
+    return { y0: Math.max(0, topo - 30), y1: Math.min(alturaPagina, fim + 10) };
+  }
+
+  // A tabela termina na primeira faixa toda em branco (sem texto nem linhas da grade) abaixo do cabeçalho.
+  function nfFimDaTabela(canvas, area) {
+    const w = canvas.width, ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const y0 = Math.round(area.y0 + 120), y1 = Math.round(area.y1);
+    if (y1 - y0 < 40) return area;
+    const d = ctx.getImageData(0, y0, w, y1 - y0).data;
+    const x0 = Math.round(w * 0.08), x1 = Math.round(w * 0.92), faixa = Math.max(25, Math.round(canvas.height * 0.015));
+    let branco = 0;
+    for (let y = 0; y < y1 - y0; y++) {
+      let escuros = 0;
+      for (let x = x0; x < x1; x += 2) if (d[(y * w + x) * 4] < 110) escuros++;
+      if (escuros <= 2) { if (++branco >= faixa) return { y0: area.y0, y1: y0 + y - branco + 25 }; }
+      else branco = 0;
+    }
+    return area;
+  }
+
+  // Recorta a faixa da tabela, mede a inclinação (perfil de linhas) e endireita; amplia para ~4200 px de largura.
+  function nfRecortarEndireitar(origem, area) {
+    const w = origem.width, h = Math.max(20, area.y1 - area.y0);
+    const rc = document.createElement("canvas"); rc.width = w; rc.height = h;
+    const rctx = rc.getContext("2d", { willReadFrequently: true });
+    rctx.fillStyle = "#fff"; rctx.fillRect(0, 0, w, h);
+    rctx.drawImage(origem, 0, area.y0, w, h, 0, 0, w, h);
+    // pontos escuros (amostra a cada 2 px)
+    const d = rctx.getImageData(0, 0, w, h).data, xs = [], ys = [];
+    for (let y = 0; y < h; y += 2) for (let x = 0; x < w; x += 2) { if (d[(y * w + x) * 4] < 128) { xs.push(x); ys.push(y); } }
+    let melhor = 0, melhorNota = -1;
+    for (let a = -4; a <= 4.001; a += 0.25) {
+      const tg = Math.tan((a * Math.PI) / 180), off = Math.ceil(Math.abs(tg) * w) + 2;
+      const hist = new Float64Array(h + 2 * off + 2);
+      for (let i = 0; i < xs.length; i++) hist[Math.round(ys[i] + xs[i] * tg) + off]++;
+      let nota = 0; for (let k = 1; k < hist.length; k++) { const df = hist[k] - hist[k - 1]; nota += df * df; }
+      if (nota > melhorNota) { melhorNota = nota; melhor = a; }
+    }
+    const k = Math.min(3, Math.max(1, 4200 / w));
+    const c = document.createElement("canvas"); c.width = Math.round(w * k); c.height = Math.round(h * k);
+    const ctx = c.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.imageSmoothingQuality = "high";
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate((-melhor * Math.PI) / 180);
+    ctx.drawImage(rc, -c.width / 2, -c.height / 2, c.width, c.height);
+    return c;
+  }
+
+  // Apaga as linhas da grade da tabela (traços longos), que confundem o OCR com "|" e "]".
+  function nfTirarGrade(origem) {
+    const w = origem.width, h = origem.height;
+    const c = document.createElement("canvas"); c.width = w; c.height = h;
+    const ctx = c.getContext("2d", { willReadFrequently: true }); ctx.drawImage(origem, 0, 0);
+    const img = ctx.getImageData(0, 0, w, h), d = img.data;
+    const esc = new Uint8Array(w * h);
+    for (let i = 0; i < w * h; i++) esc[i] = d[i * 4] < 140 ? 1 : 0;
+    const limpar = (i) => { d[i * 4] = d[i * 4 + 1] = d[i * 4 + 2] = 255; };
+    const minH = Math.round(w * 0.03), minV = Math.max(40, Math.round(h * 0.14));
+    for (let y = 0; y < h; y++) {
+      let x = 0;
+      while (x < w) {
+        if (esc[y * w + x]) { const s0 = x; while (x < w && esc[y * w + x]) x++; if (x - s0 >= minH) for (let k = s0; k < x; k++) limpar(y * w + k); }
+        else x++;
+      }
+    }
+    for (let x = 1; x < w - 1; x++) {
+      let y = 0;
+      const on = (yy) => esc[yy * w + x] || esc[yy * w + x - 1] || esc[yy * w + x + 1];
+      while (y < h) {
+        if (on(y)) {
+          const s0 = y; let proprio = 0;
+          while (y < h && on(y)) { proprio += esc[y * w + x]; y++; }
+          if (y - s0 >= minV && proprio / (y - s0) > 0.5) for (let k = s0; k < y; k++) if (esc[k * w + x]) limpar(k * w + x);
+        } else y++;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return c;
+  }
+
+  function nfReduzir(origem, ladoMax) {
+    const k = Math.min(1, ladoMax / Math.max(origem.width, origem.height));
+    if (k >= 1) return origem;
+    const c = document.createElement("canvas");
+    c.width = Math.round(origem.width * k); c.height = Math.round(origem.height * k);
+    const ctx = c.getContext("2d"); ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(origem, 0, 0, c.width, c.height);
+    return c;
+  }
+
+  // Lê uma imagem (página digitalizada ou foto) com OCR: acerta a rotação, faz duas leituras e confere.
+  async function nfOcrImagem(canvasOriginal, rotulo) {
+    let worker = null;
+    let etapa = "";
+    try {
+      worker = await Tesseract.createWorker("por", 1, {
+        logger: (m) => {
+          if (m.status === "recognizing text") setPdfStatus(`${rotulo}: ${etapa}... ${Math.round((m.progress || 0) * 100)}%`);
+          else if (/load|initializ/i.test(m.status || "")) setPdfStatus(`${rotulo}: preparando leitor de texto (só demora na 1ª vez)...`);
+        },
+      });
+      await worker.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1", user_defined_dpi: "300" });
+      const lerTudo = async (canvas, nomeEtapa) => { etapa = nomeEtapa; const { data } = await worker.recognize(canvas); return data; };
+      const ler = async (canvas, nomeEtapa) => (await lerTudo(canvas, nomeEtapa)).text || "";
+
+      // 1) descobre a rotação certa com uma versão pequena da página
+      const pequeno = nfPrepararImagem(nfReduzir(canvasOriginal, 1800), "cinza", 16);
+      let melhorGraus = 0, melhorPonto = -1;
+      for (const graus of [0, 90, 270, 180]) {
+        const t = await ler(nfGirar(pequeno, graus), `verificando a posição da página (${graus}°)`);
+        const pt = nfPontuarTexto(t);
+        if (pt > melhorPonto) { melhorPonto = pt; melhorGraus = graus; }
+        if (graus === 0 && pt >= 8) break; // já está em pé
+      }
+
+      // 2) amplia até ~4000 px no lado maior (o OCR lê melhor letras grandes)
+      let base = nfGirar(canvasOriginal, melhorGraus);
+      const lado = Math.max(base.width, base.height);
+      if (lado < 3800) {
+        const k = Math.min(3, 4000 / lado);
+        const c = document.createElement("canvas"); c.width = Math.round(base.width * k); c.height = Math.round(base.height * k);
+        const ctx = c.getContext("2d"); ctx.imageSmoothingQuality = "high"; ctx.drawImage(base, 0, 0, c.width, c.height);
+        base = c;
+      }
+
+      // 3) duas leituras com tratamentos diferentes da imagem
+      const pagCinza = nfPrepararImagem(base, "cinza", 16);
+      const d1 = await lerTudo(pagCinza, "lendo a nota");
+      const t1 = d1.text || "";
+
+      // 4) acha a tabela "DADOS DOS PRODUTOS", recorta, endireita (foto torta) e lê de perto
+      let area = nfAreaTabela(d1, base.height);
+      if (area) area = nfFimDaTabela(pagCinza, area);
+      if (area) {
+        const recorte = nfRecortarEndireitar(pagCinza, area);
+        const semGrade = nfTirarGrade(recorte);
+        const c1 = await ler(recorte, "lendo a tabela de produtos (1 de 3)");
+        const c2 = await ler(semGrade, "conferindo a tabela de produtos (2 de 3)");
+        const c3 = await ler(nfPrepararImagem(semGrade, "pb", 32), "conferindo a tabela de produtos (3 de 3)");
+        const lc = [c1, c2, c3].map(t => nfLerItensTexto(t).map(nfConferirItem));
+        if (lc.some(l => l.length)) return { textos: [t1, c1, c2, c3], leituras: lc };
+      }
+      const t2 = await ler(nfPrepararImagem(base, "pb", 32), "conferindo os produtos (leitura 2 de 2)");
+      return { textos: [t1, t2], leituras: [t1, t2].map(t => nfLerItensTexto(t).map(nfConferirItem)) };
+    } finally {
+      if (worker) try { await worker.terminate(); } catch (e) {}
+    }
+  }
+
+  function nfMontarPreview(itens, extras) {
+    const lista = itens.map(it => {
+      const casado = nfCasarProduto(it, produtos);
+      let codigo = it.codigo || "";
+      // se o OCR leu o código de 2 jeitos e um deles já existe no cadastro, usa esse
+      if (!casado && (it.codigosLidos || []).length > 1) {
+        const existente = it.codigosLidos.find(c => produtos.some(p => String(p.sku || "").toLowerCase() === c.toLowerCase()));
+        if (existente) codigo = existente;
+      }
+      const it2 = { ...it, codigo };
+      const casado2 = nfCasarProduto(it2, produtos);
+      let produtoId = null, sugestao = null;
+      if (casado2 && casado2.por !== "descricao") { produtoId = casado2.produto.id; it2.codigo = casado2.produto.sku; }
+      else if (casado2) sugestao = { id: casado2.produto.id, sku: casado2.produto.sku, nome: casado2.produto.nome };
+      return {
+        id: Math.random().toString(36).slice(2), incluir: true,
+        codigo: it2.codigo, descricao: it2.descricao || "", unidade: it2.unidade || "UN",
+        quantidade: it2.quantidade, valorUnitario: it2.valorUnitario || 0, valorTotal: it2.valorTotal || 0,
+        conferido: !!it2.conferido, aviso: it2.aviso || "", codigosLidos: it2.codigosLidos || [], quantidadesLidas: it2.quantidadesLidas || [],
+        produtoId, sugestao, infoExtra: it2.infoExtra || "",
+      };
+    });
+    return { itens: lista, ...extras };
+  }
+
+  function nfSelecionarFornecedor(cnpj, nome) {
+    if (notaFornecedorSel) return;
+    const dig = String(cnpj || "").replace(/\D/g, "");
+    let f = dig && fornecedores.find(x => String(x.cnpj || "").replace(/\D/g, "") === dig);
+    if (!f && nome) {
+      const n = String(nome).toUpperCase();
+      f = fornecedores.find(x => [x.razaoSocial, x.nomeFantasia].some(v => v && n.includes(String(v).toUpperCase())));
+    }
+    if (f) setNotaFornecedorSel(String(f.id));
   }
 
   async function processarPdfNota(file) {
     setPdfErro(null);
     setPdfPreview(null);
     setPdfArquivoNome(file.name);
-    setPdfStatus("Lendo arquivo PDF...");
+    const nome = (file.name || "").toLowerCase();
     try {
-      const buf = await file.arrayBuffer();
-      const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+      // ---------- XML da NF-e ----------
+      if (/\.xml$/.test(nome) || /xml/.test(file.type || "")) {
+        setPdfStatus("Lendo XML da nota...");
+        const dados = nfLerXml(await file.text());
+        nfSelecionarFornecedor(dados.cnpjEmitente, dados.nomeEmitente);
+        setPdfStatus(null);
+        setPdfPreview(nfMontarPreview(dados.itens, { numero: dados.numero, origem: "xml", nomeEmitente: dados.nomeEmitente, totalNota: dados.totalProdutos }));
+        return;
+      }
+
+      // ---------- Foto (JPG/PNG) ----------
+      const paginasImagem = [];
       let textoCompleto = "";
-
-      for (let n = 1; n <= pdf.numPages; n++) {
-        const page = await pdf.getPage(n);
-        const textContent = await page.getTextContent();
-        let textoPagina = textoPorLinhas(textContent);
-
-        if (textoPagina.replace(/\s/g, "").length < 80) {
-          // Página sem camada de texto (digitalizada/foto) -> OCR
-          const viewport = page.getViewport({ scale: 3.5 });
+      let leiturasOcr = [];
+      if (/^image\//.test(file.type || "") || /\.(jpe?g|png|webp|heic)$/.test(nome)) {
+        setPdfStatus("Abrindo a foto...");
+        const bmp = await nfAbrirImagem(file);
+        const c = document.createElement("canvas"); c.width = bmp.width; c.height = bmp.height;
+        c.getContext("2d").drawImage(bmp, 0, 0);
+        paginasImagem.push({ canvas: c, rotulo: "Foto" });
+      } else {
+        // ---------- PDF ----------
+        setPdfStatus("Lendo arquivo PDF...");
+        const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+        for (let n = 1; n <= pdf.numPages; n++) {
+          const page = await pdf.getPage(n);
+          const textoPagina = nfTextoPorLinhas(await page.getTextContent());
+          const itensTexto = nfLerItensTexto(textoPagina);
+          if (itensTexto.length > 0) {
+            // PDF original do sistema do fornecedor: o texto vem exato, sem OCR
+            textoCompleto += "\n" + textoPagina;
+            // texto exato: confere a conta só para mostrar; não precisa de revisão por erro de leitura
+            leiturasOcr.push([itensTexto.map(it => { const c = nfConferirItem(it); return c.conferido ? c : { ...it, conferido: true, aviso: "" }; })]);
+            continue;
+          }
+          // Página digitalizada/foto (ou com camada de texto ruim, como a do CamScanner) -> OCR
+          textoCompleto += "\n" + textoPagina;
+          const v1 = page.getViewport({ scale: 1 });
+          const escala = Math.min(6, Math.max(2, 3000 / Math.max(v1.width, v1.height)));
+          const viewport = page.getViewport({ scale: escala });
           const canvas = document.createElement("canvas");
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          const ctx = canvas.getContext("2d");
-          setPdfStatus(`PDF digitalizado detectado — preparando imagem da página ${n}/${pdf.numPages}...`);
-          await page.render({ canvasContext: ctx, viewport }).promise;
-          preprocessarImagemOCR(canvas);
-          setPdfStatus(`Rodando OCR na página ${n}/${pdf.numPages} (pode levar até 1 minuto)...`);
-          const { data } = await Tesseract.recognize(canvas, "por", {
-            logger: (m) => {
-              if (m.status === "recognizing text") {
-                setPdfStatus(`Reconhecendo texto (OCR) — página ${n}/${pdf.numPages}... ${Math.round((m.progress || 0) * 100)}%`);
-              }
-            },
-          });
-          textoPagina = data.text;
+          canvas.width = Math.round(viewport.width); canvas.height = Math.round(viewport.height);
+          setPdfStatus(`Preparando a imagem da página ${n}/${pdf.numPages}...`);
+          await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+          paginasImagem.push({ canvas, rotulo: `Página ${n}/${pdf.numPages}` });
         }
-        textoCompleto += "\n" + textoPagina;
       }
 
-      let itens = parseItensDanfe(textoCompleto);
-      let usouFallback = false;
-      if (itens.length === 0) {
-        itens = parseItensFallback(textoCompleto);
-        usouFallback = itens.length > 0;
+      for (const pg of paginasImagem) {
+        const r = await nfOcrImagem(pg.canvas, pg.rotulo);
+        textoCompleto += "\n" + r.textos.join("\n");
+        leiturasOcr.push(r.leituras);
       }
-      const numero = extrairNumeroNota(textoCompleto);
+
+      const itens = leiturasOcr.flatMap(leituras => nfMesclarLeituras(leituras));
+      const chave = nfAcharChave(textoCompleto);
+      const daChave = nfDadosDaChave(chave);
+      if (daChave) nfSelecionarFornecedor(daChave.cnpjEmitente);
+      const numero = daChave ? daChave.numero : nfAcharNumero(textoCompleto);
       setPdfStatus(null);
 
+      const origem = paginasImagem.length ? "ocr" : "texto";
+      setPdfPreview(nfMontarPreview(itens, { numero, origem }));
       if (itens.length === 0) {
-        setPdfErro("Não consegui identificar itens automaticamente neste PDF. Isso pode acontecer com fotos de baixa qualidade, mal enquadradas ou com texto cortado. Confira/adicione os itens manualmente abaixo, ou tente escanear a nota novamente (luz uniforme, sem sombra, texto reto e dentro do enquadramento).");
-        setPdfPreview({ itens: [], numero });
-      } else {
-        setPdfPreview({ itens, numero });
-        if (usouFallback) {
-          setPdfErro("Os itens foram identificados com um modo de leitura mais flexível — revise com atenção os códigos, descrições e quantidades abaixo antes de confirmar, pois a chance de erro é maior nesse modo.");
-        }
+        setPdfErro("Não consegui achar a tabela de produtos neste arquivo. Se tiver o XML da nota, use ele (a leitura é exata). Se for foto ou digitalização, tire de novo com a nota reta, bem iluminada e sem sombra — ou adicione os itens manualmente abaixo.");
       }
     } catch (err) {
       console.error(err);
       setPdfStatus(null);
-      setPdfErro("Erro ao processar o PDF: " + err.message);
+      setPdfErro("Erro ao ler o arquivo: " + err.message);
     }
   }
 
   function atualizarItemPdf(id, campo, valor) {
     setPdfPreview(prev => ({
       ...prev,
-      itens: prev.itens.map(it => it.id === id ? { ...it, [campo]: valor } : it),
+      itens: prev.itens.map(it => {
+        if (it.id !== id) return it;
+        const novo = { ...it, [campo]: valor };
+        if (campo === "codigo") {
+          const p = produtos.find(x => x.sku && String(x.sku).trim().toLowerCase() === String(valor).trim().toLowerCase());
+          novo.produtoId = p ? p.id : null;
+          if (p) novo.sugestao = null;
+        }
+        if (campo === "quantidade") { novo.conferido = true; novo.aviso = ""; novo.revisado = true; }
+        return novo;
+      }),
+    }));
+  }
+
+  function usarProdutoSugerido(id) {
+    setPdfPreview(prev => ({
+      ...prev,
+      itens: prev.itens.map(it => it.id === id && it.sugestao ? { ...it, codigo: it.sugestao.sku, produtoId: it.sugestao.id, sugestao: null } : it),
     }));
   }
 
@@ -3996,7 +4859,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       ...(prev || { numero: "" }),
       itens: [...(prev?.itens || []), {
         id: Math.random().toString(36).slice(2),
-        codigo: "", descricao: "", unidade: "UN", quantidade: 1, valorUnitario: 0, incluir: true,
+        codigo: "", descricao: "", unidade: "UN", quantidade: 1, valorUnitario: 0, incluir: true, conferido: true, aviso: "",
       }],
     }));
   }
@@ -4008,6 +4871,22 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       setPdfErro("Nenhum item válido para importar. Verifique código e quantidade dos itens.");
       return;
     }
+    const numeroNf = String(pdfPreview.numero || modalNota?.numero || "").trim();
+    if (numeroNf && !pdfPreview.confirmarRepetida) {
+      const { data: jaTem } = await supabaseClient.from("entradas").select("id, data").eq("numero_nf", numeroNf).limit(1);
+      if (jaTem && jaTem.length) {
+        const quando = jaTem[0].data ? new Date(jaTem[0].data).toLocaleDateString("pt-BR") : "";
+        setPdfErro(`Atenção: a NF ${numeroNf} já teve entrada lançada${quando ? " em " + quando : ""}. Lançar de novo vai SOMAR as quantidades outra vez no estoque. Se for mesmo outra entrada, clique em "Confirmar e lançar no estoque" de novo.`);
+        setPdfPreview(prev => ({ ...prev, confirmarRepetida: true }));
+        return;
+      }
+    }
+    const pendentes = pdfPreview.itens.filter(it => it.incluir && (!it.conferido || !it.codigo)).length;
+    if (pendentes > 0 && !pdfPreview.confirmarMesmoAssim) {
+      setPdfErro(`Ainda há ${pendentes} item(ns) marcado(s) em amarelo. Confira a quantidade e o código desses itens na nota (ao corrigir a quantidade, o item fica conferido). Se já conferiu, clique em "Confirmar e lançar no estoque" de novo.`);
+      setPdfPreview(prev => ({ ...prev, confirmarMesmoAssim: true }));
+      return;
+    }
     const empresaIdAtual = notaEmpresaSel ? notaEmpresaSel : (empresas[0]?.id || null);
     const fornecedorIdAtual = notaFornecedorSel ? notaFornecedorSel : (fornecedores[0]?.id || null);
     const hoje = new Date().toISOString().slice(0, 10);
@@ -4015,7 +4894,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     try {
       // Importação feita no banco, numa única operação (importar_itens_nf): soma nos produtos
       // existentes (pelo SKU), cadastra os novos e grava as entradas. Se der erro, nada é gravado.
-      const { error } = await supabaseClient.rpc("importar_itens_nf", {
+      const { data: resImp, error } = await supabaseClient.rpc("importar_itens_nf", {
         p_itens: itensValidos.map(it => ({ codigo: String(it.codigo), descricao: it.descricao || "", unidade: it.unidade || "UN", quantidade: Number(it.quantidade) })),
         p_empresa_id: empresaIdAtual || null, p_fornecedor_id: fornecedorIdAtual || null,
         p_numero_nf: pdfPreview.numero || modalNota?.numero || "", p_usuario: usuarioLogado.email,
@@ -4024,7 +4903,9 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       await recarregarTudo();
       setPdfPreview(null);
       setPdfErro(null);
-      setPdfStatus(`${itensValidos.length} item(ns) lançado(s) no estoque com sucesso a partir da NF.`);
+      const novosImp = resImp && resImp.novos ? ` (${resImp.novos} produto(s) novo(s) cadastrado(s))` : "";
+      setPdfStatus(`${itensValidos.length} item(ns) lançado(s) no estoque com sucesso a partir da NF${novosImp}.`);
+      setPdfArquivoNome("");
       setTimeout(() => setPdfStatus(null), 5000);
     } catch (e) {
       setPdfErro("Erro ao lançar itens no estoque: " + e.message);
@@ -4094,6 +4975,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   const [contMsg, setContMsg] = useState(rascunhoCont && rascunhoCont.pp ? { tipo: "info", texto: `Contagem de ${rascunhoCont.pp.codigo} recuperada — continue de onde parou.` } : null);
   const [contZerar, setContZerar] = useState(true);
   const [contConfirmar, setContConfirmar] = useState(false);
+  const [contPaletes, setContPaletes] = useState(null);   // ao finalizar: quantos paletes ficaram na posição (1 ou 2)
   const [contAplicando, setContAplicando] = useState(false);
   const [contagens, setContagens] = useState([]);
   const [contagemAberta, setContagemAberta] = useState(null); // { contagem, itens }
@@ -4250,6 +5132,16 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     }).filter(Boolean);
   })();
 
+  // depois de aplicar, a posição continua com algum produto? (aí precisa dizer se são 1 ou 2 paletes)
+  const contFicaOcupada = contLinhas.some(l => (l.contado !== null ? l.contado : (contZerar ? 0 : l.sistema)) > 0);
+  const contPPLarg = (() => { if (!contPP) return false; const ppx = portaPaletes.find(p => p.id === contPP.id); if (!ppx) return false;
+    return portaPaletes.filter(p => p.id !== ppx.id && Number(p.fileira) === Number(ppx.fileira) && String(p.porta || "").toUpperCase() === String(ppx.porta || "").toUpperCase() && Number(p.nivel) === Number(ppx.nivel)).length > 0; })();
+  const contPedePaletes = contFicaOcupada && !contPPLarg;
+  function abrirFinalizarContagem() {
+    setContPaletes(null);   // na contagem a pessoa está olhando a posição: sempre confirma de novo (1 toque)
+    setContConfirmar(true);
+  }
+
   function adicionarNaContagemProduto(prod) {
     let qtd = 1;
     if (contModo === "digitar") {
@@ -4314,6 +5206,7 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
 
   async function aplicarContagem() {
     if (!contPP || contAplicando) return;
+    if (contPedePaletes && !contPaletes) { tocarSom("erro"); return; }
     setContAplicando(true);
     try {
       const itens = Object.entries(contItens)
@@ -4332,7 +5225,9 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
       }
       tocarSom("completo");
       const dt = Number(data.diferenca_total) || 0;
-      setContMsg({ tipo: "ok", texto: `✓ Contagem de ${contPP.codigo} aplicada: ${data.itens} produto(s), ${data.itens_alterados} com diferença (${dt > 0 ? "+" : ""}${dt} un. no total).` });
+      let avisoPal = "";
+      if (contPedePaletes && contPaletes) { try { await salvarPaletesPP(contPP.id, contPaletes, usuarioLogado.email); } catch (e) { avisoPal = " ⚠ Não gravou a quantidade de paletes (" + (e.message || e) + ") — marque pelo Mapa 3D."; } }
+      setContMsg({ tipo: avisoPal ? "erro" : "ok", texto: `✓ Contagem de ${contPP.codigo} aplicada: ${data.itens} produto(s), ${data.itens_alterados} com diferença (${dt > 0 ? "+" : ""}${dt} un. no total).` + (contPedePaletes && contPaletes && !avisoPal ? ` Posição com ${contPaletes} palete${contPaletes > 1 ? "s" : ""}.` : "") + avisoPal });
       setContPP(null); setContItens({}); setContOrdem([]); setContConfirmar(false);
       await Promise.all([recarregarTudo(), recarregarContagens()]);
     } finally {
@@ -4413,6 +5308,8 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   const [presencas, setPresencas] = useState([]);
   const presencaCanalRef = useRef(null);
   const presencaDadosRef = useRef(null);
+  const minhaChaveRef = useRef((usuarioLogado.email || "anon") + ":" + Math.random().toString(36).slice(2, 8));
+  const ouvinteFrotaRef = useRef(null);   // o Mapa 3D registra aqui quem recebe as paleteiras do mapa "condutor"
   presencaDadosRef.current = contPP
     ? { tipo: "contagem", usuario: usuarioLogado.email, ppId: contPP.id, ppCodigo: contPP.codigo,
         itens: Object.values(contItens || {}).filter(q => Number(q) > 0).length,
@@ -4423,7 +5320,20 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
         ? { tipo: "separacaoPP", usuario: usuarioLogado.email, itens: itensSeparPP.length,
             ppId: scanPortaPaletePP ? scanPortaPaletePP.id : ((itensSeparPP.filter(i => i.ppId).slice(-1)[0] || {}).ppId || null) }
         : { tipo: null, usuario: usuarioLogado.email };
+  presencaDadosRef.current = { ...presencaDadosRef.current, chave: minhaChaveRef.current, mapa: tela === "mapa3d" };
   const assinaturaPresenca = JSON.stringify(presencaDadosRef.current);
+  // o mapa aberto há mais tempo (menor chave entre quem está no Mapa 3D) conduz as paleteiras; os outros só mostram o mesmo movimento
+  const visoresMapa = presencas.filter(p => p.mapa && p.chave).map(p => p.chave).sort();
+  const souCondutor = !visoresMapa.length || visoresMapa[0] === minhaChaveRef.current || !visoresMapa.includes(minhaChaveRef.current);
+  const syncFrota = useMemo(() => ({
+    lider: souCondutor,
+    enviar: (payload) => { const c = presencaCanalRef.current; if (!c || !c.send) return; try { const r = c.send({ type: "broadcast", event: "frota", payload }); if (r && r.catch) r.catch(() => {}); } catch (e) {} },
+    registrar: (fn) => { ouvinteFrotaRef.current = fn; },
+  }), [souCondutor]);
+  // O Supabase limita quantas vezes cada aparelho pode atualizar a presença (ClientPresenceRateLimitReached).
+  // Antes, cada bipe da contagem mandava uma atualização: com bipes rápidos o servidor bloqueava aquele
+  // celular e ele sumia do mapa (e ficava "0 peças"). Agora: no máximo 1 envio a cada 4 s, juntando os bipes,
+  // e reconexão automática se o canal cair ou o celular voltar da tela bloqueada.
   // Limite do Supabase: ~5 atualizações de presença a cada 30 s por aparelho. Usamos no máximo 4 por 30 s
   // (com pelo menos 1,5 s entre elas): as primeiras saem na hora e, durante bipes seguidos, o último estado
   // é enviado assim que liberar.
@@ -4452,13 +5362,14 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
     const conectar = () => {
       if (!ativo) return;
       if (canal) { const velho = canal; canal = null; presencaCanalRef.current = null; try { supabaseClient.removeChannel && supabaseClient.removeChannel(velho); } catch (e) {} }
-      const chave = (usuarioLogado.email || "anon") + ":" + Math.random().toString(36).slice(2, 8);
-      const c = supabaseClient.channel("stockctrl-presenca", { config: { presence: { key: chave } } });
+      const chave = minhaChaveRef.current;
+      const c = supabaseClient.channel("stockctrl-presenca", { config: { presence: { key: chave }, broadcast: { self: false } } });
       canal = c;
+      c.on("broadcast", { event: "frota" }, (msg) => { if (ouvinteFrotaRef.current && msg) ouvinteFrotaRef.current(msg.payload); });
       c.on("presence", { event: "sync" }, () => {
         const estado = c.presenceState ? c.presenceState() : {};
         const lista = [];
-        Object.values(estado).forEach(arr => (arr || []).forEach(p => { if (p && p.tipo) lista.push(p); }));
+        Object.values(estado).forEach(arr => (arr || []).forEach(p => { if (p && (p.tipo || p.mapa)) lista.push(p); }));
         setPresencas(lista);
       });
       c.subscribe((status) => {
@@ -4509,6 +5420,10 @@ ${linhas.map(l => `<tr><td>${h(l.sku)}</td><td>${h(l.barras)}</td><td>${h(l.codF
   }
 
   useEffect(() => { recarregarPortaPaletes(); }, []);
+  useEffect(() => {   // alguém marcou 1 ou 2 paletes numa posição: atualiza na hora (o tempo real confirma depois)
+    const f = (e) => { const d = e.detail || {}; setPortaPaletes(prev => prev.map(pp => pp.id === d.ppId ? { ...pp, paletes: d.paletes } : pp)); };
+    window.addEventListener("stockctrl:pp-paletes", f); return () => window.removeEventListener("stockctrl:pp-paletes", f);
+  }, []);
 
   async function recarregarEstoquePP() {
     try {
@@ -4956,6 +5871,16 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
               <Stat label="PRODUTOS PARADOS (30+ DIAS)" value={stats.parados} tone="danger" />
               <Stat label="FORNECEDORES ATIVOS" value={fornecedores.length} />
             </div>
+            {portaPaletes.length > 0 && (
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 26, marginTop: -12 }}>
+                <Stat label="VAGAS DE PALETE LIVRES (CONFIRMADAS)" value={vagasPalete.livres} sub={"de " + vagasPalete.total + " vagas no galpão"} tone="success" />
+                <Stat label="POSIÇÕES TOTALMENTE LIVRES" value={vagasPalete.posLivres} sub={"de " + portaPaletes.length + " porta-paletes"} />
+                <Stat label="OCUPAÇÃO DO GALPÃO" value={(vagasPalete.total ? Math.round(vagasPalete.usadas / vagasPalete.total * 100) : 0) + "%"} sub={vagasPalete.usadas + " paletes"} />
+                <Stat label="POSIÇÕES A CONFERIR (1 OU 2 PALETES)" value={vagasPalete.aConferir} sub="sem confirmação: contam como cheias" tone={vagasPalete.aConferir ? "warning" : "default"} />
+              </div>
+            )}
+
+            <GraficoGiro movimentacoes={movimentacoes} produtos={produtos} />
 
             <div style={{ display: "grid", gridTemplateColumns: "1.3fr 1fr", gap: 16 }}>
               <div style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, padding: 20 }}>
@@ -5120,7 +6045,6 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                 <Btn variant="primary" icon="plus" onClick={() => abrirModalProduto(null)}>Novo produto</Btn>
               </div>
             </div>
-
             <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
               <div style={{ position: "relative", flex: 1, minWidth: 240, maxWidth: 340 }}>
                 <Icon name="search" size={15} style={{ position: "absolute", left: 12, top: 11, color: "#5C6678" }}  />
@@ -5221,12 +6145,12 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         {tela === "entrada" && (
           <>
             <h1 style={{ fontFamily: "'Archivo', sans-serif", fontSize: 24, fontWeight: 800, marginBottom: 4 }}>Movimentação de entrada</h1>
-            <p style={{ color: "#8893A6", fontSize: 13.5, marginBottom: 20 }}>Importe o PDF da nota fiscal para identificar os produtos automaticamente, ou registre uma entrada manualmente</p>
+            <p style={{ color: "#8893A6", fontSize: 13.5, marginBottom: 20 }}>Importe a nota fiscal (XML, PDF ou foto) para identificar os produtos automaticamente, ou registre uma entrada manualmente</p>
 
             <div style={{ background: "#161D29", border: "1px solid #2A3445", borderRadius: 12, padding: 20, marginBottom: 20 }}>
-              <div style={{ fontSize: 14, fontWeight: 700, color: "#D2A256", marginBottom: 6 }}>Importar nota fiscal por PDF</div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: "#D2A256", marginBottom: 6 }}>Importar nota fiscal</div>
               <p style={{ fontSize: 12.5, color: "#8893A6", marginBottom: 14, lineHeight: 1.5 }}>
-                Funciona com PDF em texto e com PDF digitalizado/foto (ex.: gerado pelo CamScanner) — nesse caso o OCR roda automaticamente. Nem todo PDF tem qualidade suficiente para identificar os produtos sozinho; quando isso acontecer, revise e ajuste os itens na lista antes de confirmar.
+                <b style={{ color: "#E8E4D9" }}>Melhor opção: o XML da nota</b> (o arquivo .xml que o fornecedor manda junto com o PDF) — a leitura é exata. Também aceita o PDF original da nota e PDF digitalizado ou foto; nesses dois últimos o sistema lê a imagem e confere cada quantidade com o valor total da linha, marcando em amarelo o que precisa da sua revisão.
               </p>
 
               <div style={{ display: "flex", gap: 10, marginBottom: 14 }}>
@@ -5266,8 +6190,8 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                   padding: "4px 10px", fontSize: 12.5, fontWeight: 600, color: "#E8E4D9"
                 }}>Escolher arquivo</span>
                 {pdfArquivoNome || "Nenhum arquivo selecionado"}
-                <input type="file" accept="application/pdf" style={{ display: "none" }}
-                  onChange={e => { if (e.target.files[0]) processarPdfNota(e.target.files[0]); }} />
+                <input type="file" accept="application/pdf,.pdf,.xml,text/xml,application/xml,image/*,.heic,.heif" style={{ display: "none" }}
+                  onChange={e => { if (e.target.files[0]) processarPdfNota(e.target.files[0]); e.target.value = ""; }} />
               </label>
 
               {pdfStatus && (
@@ -5281,44 +6205,108 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                 </div>
               )}
 
-              {pdfPreview && (
-                <div style={{ marginTop: 14 }}>
-                  <div style={{ fontSize: 12.5, fontWeight: 700, color: "#AEB7C7", marginBottom: 8 }}>
-                    Itens identificados — revise antes de confirmar
+              {pdfPreview && (() => {
+                const its = pdfPreview.itens;
+                const incl = its.filter(i => i.incluir);
+                const revisar = incl.filter(i => !i.conferido || !i.codigo).length;
+                const novos = incl.filter(i => !i.produtoId).length;
+                const soma = incl.reduce((s, i) => s + (Number(i.quantidade) || 0) * (Number(i.valorUnitario) || 0), 0);
+                const brl = v => v.toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+                const nomeOrigem = { xml: "XML da NF-e — leitura exata", texto: "PDF original — texto lido direto do arquivo", ocr: "Imagem (digitalização/foto) — lida por OCR e conferida pelos valores" }[pdfPreview.origem] || "";
+                return (
+                <div style={{ marginTop: 14 }} data-teste="nf-preview">
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center", marginBottom: 10 }}>
+                    <div style={{ fontSize: 12.5, fontWeight: 700, color: "#AEB7C7" }}>Itens identificados — revise antes de confirmar</div>
+                    {nomeOrigem && <span style={{ fontSize: 11.5, color: pdfPreview.origem === "ocr" ? "#FFC107" : "#2BD45F", background: "#0F141C", border: "1px solid #2A3445", borderRadius: 6, padding: "3px 8px" }}>{nomeOrigem}</span>}
+                    <label style={{ fontSize: 12, color: "#8893A6", display: "flex", alignItems: "center", gap: 6, marginLeft: "auto" }}>
+                      Nº da NF
+                      <input value={pdfPreview.numero || ""} onChange={e => setPdfPreview(prev => ({ ...prev, numero: e.target.value }))}
+                        style={{ ...inputStyle, width: 100, fontSize: 12.5, padding: "5px 8px" }} />
+                    </label>
                   </div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 320, overflow: "auto" }}>
-                    {pdfPreview.itens.map(item => (
-                      <div key={item.id} style={{
-                        display: "flex", gap: 6, alignItems: "center",
-                        background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, padding: 8
+                  {its.length > 0 && (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 10, fontSize: 12 }}>
+                      <span style={{ background: "#0F141C", border: "1px solid #2A3445", borderRadius: 6, padding: "4px 9px", color: "#E8E4D9" }}>{incl.length} item(ns)</span>
+                      <span data-teste="nf-revisar" style={{ background: revisar ? "#2B2410" : "#0F2417", border: "1px solid " + (revisar ? "#6B5512" : "#1F5A33"), borderRadius: 6, padding: "4px 9px", color: revisar ? "#FFC107" : "#2BD45F" }}>
+                        {revisar ? `${revisar} para revisar` : "Tudo conferido"}
+                      </span>
+                      <span style={{ background: "#0F141C", border: "1px solid #2A3445", borderRadius: 6, padding: "4px 9px", color: "#AEB7C7" }}>{novos} produto(s) novo(s) serão cadastrados</span>
+                      {soma > 0 && <span style={{ background: "#0F141C", border: "1px solid #2A3445", borderRadius: 6, padding: "4px 9px", color: "#AEB7C7" }}>
+                        Soma dos itens: <b style={{ color: "#E8E4D9" }}>{brl(soma)}</b>{pdfPreview.totalNota ? ` · total dos produtos na nota: ${brl(pdfPreview.totalNota)}` : " — compare com o \"Valor total dos produtos\" da nota"}
+                      </span>}
+                    </div>
+                  )}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8, maxHeight: 420, overflow: "auto" }}>
+                    {its.map(item => {
+                      const alerta = item.incluir && (!item.conferido || !item.codigo);
+                      const prod = item.produtoId ? produtos.find(p => p.id === item.produtoId) : null;
+                      return (
+                      <div key={item.id} data-teste="nf-item" style={{
+                        background: "#1B2433", border: "1px solid " + (alerta ? "#8A6A12" : "#2A3445"), borderLeft: "4px solid " + (!item.incluir ? "#2A3445" : alerta ? "#FFC107" : "#2BD45F"),
+                        borderRadius: 8, padding: 8, opacity: item.incluir ? 1 : 0.55
                       }}>
-                        <input type="checkbox" checked={item.incluir}
-                          onChange={e => atualizarItemPdf(item.id, "incluir", e.target.checked)} />
-                        <input value={item.codigo} placeholder="SKU/Código"
-                          onChange={e => atualizarItemPdf(item.id, "codigo", e.target.value)}
-                          style={{ ...inputStyle, width: 110, fontSize: 12.5 }} />
-                        <input value={item.descricao} placeholder="Descrição"
-                          onChange={e => atualizarItemPdf(item.id, "descricao", e.target.value)}
-                          style={{ ...inputStyle, flex: 1, fontSize: 12.5 }} />
-                        <input value={item.quantidade} type="number" min="0" placeholder="Qtd"
-                          onChange={e => atualizarItemPdf(item.id, "quantidade", e.target.value)}
-                          style={{ ...inputStyle, width: 70, fontSize: 12.5 }} />
-                        <button type="button" onClick={() => removerItemPdf(item.id)}
-                          style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer" }}>
-                          <Icon name="trash" size={14} />
-                        </button>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                          <input type="checkbox" checked={item.incluir}
+                            onChange={e => atualizarItemPdf(item.id, "incluir", e.target.checked)} />
+                          <input value={item.codigo} placeholder="Código"
+                            onChange={e => atualizarItemPdf(item.id, "codigo", e.target.value)}
+                            style={{ ...inputStyle, width: 130, fontSize: 12.5, borderColor: item.codigo ? undefined : "#8A6A12" }} />
+                          <input value={item.descricao} placeholder="Descrição"
+                            onChange={e => atualizarItemPdf(item.id, "descricao", e.target.value)}
+                            style={{ ...inputStyle, flex: 1, minWidth: 180, fontSize: 12.5 }} />
+                          <input value={item.quantidade} type="number" min="0" placeholder="Qtd" data-teste="nf-qtd"
+                            onChange={e => atualizarItemPdf(item.id, "quantidade", e.target.value)}
+                            style={{ ...inputStyle, width: 95, fontSize: 12.5, borderColor: alerta && item.codigo ? "#8A6A12" : undefined }} />
+                          <span style={{ fontSize: 11.5, color: "#8893A6", width: 30 }}>{item.unidade}</span>
+                          <button type="button" onClick={() => removerItemPdf(item.id)} title="Remover"
+                            style={{ background: "none", border: "none", color: "#8893A6", cursor: "pointer" }}>
+                            <Icon name="trash" size={14} />
+                          </button>
+                        </div>
+                        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 5, marginLeft: 22, fontSize: 11.5, alignItems: "center" }}>
+                          {prod
+                            ? <span style={{ color: "#2BD45F" }}>✓ Já cadastrado: {prod.nome} (estoque atual {Number(prod.qtd || 0).toLocaleString("pt-BR")}) — vai somar</span>
+                            : <span style={{ color: "#AEB7C7" }}>+ Produto novo — será cadastrado com este código</span>}
+                          {item.sugestao && (
+                            <span style={{ color: "#6FB0E0" }}>
+                              Parece com "{item.sugestao.nome}" ({item.sugestao.sku})
+                              <button type="button" onClick={() => usarProdutoSugerido(item.id)}
+                                style={{ marginLeft: 6, background: "#15243A", border: "1px solid #1F4561", color: "#6FB0E0", borderRadius: 5, padding: "1px 7px", cursor: "pointer", fontSize: 11.5 }}>usar este</button>
+                            </span>
+                          )}
+                          {item.codigosLidos && item.codigosLidos.length > 1 && (
+                            <span style={{ color: "#FFC107" }}>Código lido de {item.codigosLidos.length} jeitos:{" "}
+                              {item.codigosLidos.map(c => (
+                                <button key={c} type="button" onClick={() => atualizarItemPdf(item.id, "codigo", c)}
+                                  style={{ marginLeft: 4, background: c === item.codigo ? "#2B2410" : "#0F141C", border: "1px solid #6B5512", color: "#FFC107", borderRadius: 5, padding: "1px 6px", cursor: "pointer", fontSize: 11.5, fontFamily: "monospace" }}>{c}</button>
+                              ))}
+                            </span>
+                          )}
+                          {!item.revisado && item.quantidadesLidas && item.quantidadesLidas.length > 1 && (
+                            <span style={{ color: "#FFC107" }}>Quantidade lida de {item.quantidadesLidas.length} jeitos — toque na certa:{" "}
+                              {item.quantidadesLidas.map(q => (
+                                <button key={q} type="button" data-teste="nf-qtd-opcao" onClick={() => atualizarItemPdf(item.id, "quantidade", q)}
+                                  style={{ marginLeft: 4, background: "#0F141C", border: "1px solid #6B5512", color: "#FFC107", borderRadius: 5, padding: "1px 7px", cursor: "pointer", fontSize: 12 }}>{Number(q).toLocaleString("pt-BR")}</button>
+                              ))}
+                            </span>
+                          )}
+                          {item.valorUnitario > 0 && <span style={{ color: "#5C6678" }}>V. unit. {Number(item.valorUnitario).toLocaleString("pt-BR", { maximumFractionDigits: 4 })}{item.valorTotal > 0 ? ` · V. total ${Number(item.valorTotal).toLocaleString("pt-BR", { minimumFractionDigits: 2 })}` : ""}</span>}
+                          {item.aviso && <span data-teste="nf-aviso" style={{ color: item.conferido ? "#6FB0E0" : "#FFC107" }}>⚠ {item.aviso}</span>}
+                          {item.incluir && !item.codigo && <span style={{ color: "#FFC107" }}>⚠ Falta o código — digite o código do produto</span>}
+                          {item.revisado && <span style={{ color: "#2BD45F" }}>✓ quantidade revisada por você</span>}
+                        </div>
                       </div>
-                    ))}
-                    {pdfPreview.itens.length === 0 && (
+                    ); })}
+                    {its.length === 0 && (
                       <div style={{ fontSize: 12.5, color: "#5C6678" }}>Nenhum item ainda — adicione manualmente abaixo se preferir.</div>
                     )}
                   </div>
-                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                  <div style={{ display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
                     <Btn type="button" icon="plus" onClick={adicionarItemPdfManual}>Adicionar item</Btn>
                     <Btn type="button" variant="primary" onClick={confirmarImportacaoPdf}>Confirmar e lançar no estoque</Btn>
                   </div>
                 </div>
-              )}
+              ); })()}
             </div>
 
             <Btn variant="default" icon="plus" onClick={abrirModalEntrada} style={{ marginBottom: 20 }}>Registrar entrada manual</Btn>
@@ -6046,7 +7034,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
                     </div>
                     <div style={{ display: "flex", gap: 8 }}>
                       <Btn onClick={cancelarContagem}>Cancelar contagem</Btn>
-                      <Btn variant="primary" icon="check-circle" onClick={() => setContConfirmar(true)}>Finalizar contagem</Btn>
+                      <Btn variant="primary" icon="check-circle" onClick={abrirFinalizarContagem}>Finalizar contagem</Btn>
                     </div>
                   </div>
                   <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 13, color: "#AEB7C7", marginBottom: 12, cursor: "pointer" }}>
@@ -6166,7 +7154,7 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         {tela === "mapa3d" && (
           <Mapa3D portaPaletes={portaPaletes} estoquePP={estoquePP} produtos={produtos} pedidos={pedidosSeparacao}
             itensPorPedido={itensSeparacaoPorPedido} contagens={contagens} fornecedorNome={fornecedorNome}
-            movimentacoes={movimentacoes} usuarioEmail={usuarioLogado && usuarioLogado.email} presencas={presencas} />
+            movimentacoes={movimentacoes} usuarioEmail={usuarioLogado && usuarioLogado.email} presencas={presencas} sync={syncFrota} />
         )}
         {tela === "separacaoPP" && (() => {
           const msgColors = { ok: "#5CC98E", erro: "#E07A7A", info: "#6FB0E0" };
@@ -6791,7 +7779,18 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
         const iconBtn = { background: "#1B2433", border: "1px solid #2A3445", borderRadius: 8, color: "#D2A256", cursor: "pointer", width: 40, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" };
         const col = { flex: 1, minWidth: 0 };
         const prodSel = produtos.find(p => String(p.id) === String(entradaProdutoId));
-        const campoPP = (
+        const alvoPal = alvoPPEntrada();
+        const seletorPaletes = alvoPal && (
+          <div style={{ marginTop: 8, background: "#141B26", border: "1px solid " + (entradaPaletes ? "#2A3445" : "#5C4322"), borderRadius: 8, padding: "8px 10px" }}>
+            <div style={{ fontSize: 12.5, color: "#AEB7C7", marginBottom: 6 }}>Depois de guardar, quantos paletes ficam em <b style={{ color: "#E6EAF2" }}>{alvoPal.codigo}</b>?
+              {(alvoPal.paletes === 1 || alvoPal.paletes === 2) && <span style={{ color: "#8893A6" }}> (hoje: {alvoPal.paletes})</span>}</div>
+            <div style={{ display: "flex", gap: 6 }}>
+              {[1, 2].map(n => <button key={n} type="button" data-paletes-entrada={n} onClick={() => setEntradaPaletes(n)} style={{ flex: 1, padding: "8px 6px", borderRadius: 8, cursor: "pointer", fontWeight: 700, fontSize: 13,
+                border: "1px solid " + (entradaPaletes === n ? "#5CC98E" : "#2A3445"), background: entradaPaletes === n ? "#16352A" : "#0F141C", color: entradaPaletes === n ? "#5CC98E" : "#E6EAF2" }}>{n === 1 ? "1 palete" : "2 paletes"}</button>)}
+            </div>
+          </div>
+        );
+        const campoPP = (<div>
           <div style={{ display: "flex", gap: 6 }}>
             <select value={entradaPPSel} onChange={e => escolherPPNaEntrada(e.target.value)} style={{ flex: 1, minWidth: 0 }}>
               <option value="">{entradaModo === "novo" ? "Selecione ou preencha abaixo" : "Manter localização atual"}</option>
@@ -6803,7 +7802,8 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
               <Icon name="plus" size={15} />
             </button>
           </div>
-        );
+          {seletorPaletes}
+        </div>);
         return (
         <Modal title="Registrar entrada de produto" onClose={() => setModalEntrada(false)} width={entradaModo === "novo" ? 600 : 480}>
           <form onSubmit={e => {
@@ -7128,9 +8128,23 @@ Gerado em: ${new Date().toLocaleString("pt-BR")}
             ) : (
               <div style={{ color: "#5CC98E", fontSize: 13.5, marginBottom: 12 }}>✓ Tudo bate com o sistema.</div>
             )}
+            {contPedePaletes && (
+              <div style={{ background: "#141B26", border: "1px solid " + (contPaletes ? "#2A3445" : "#5C4322"), borderRadius: 10, padding: "10px 12px", marginBottom: 12 }}>
+                <div style={{ fontSize: 13.5, fontWeight: 700, marginBottom: 8 }}>Quantos paletes tem nesta posição?
+                  {(() => { const ppx = portaPaletes.find(p => p.id === contPP.id); return ppx && (ppx.paletes === 1 || ppx.paletes === 2) ? <span style={{ fontWeight: 500, color: "#8893A6", fontSize: 12 }}> (antes: {ppx.paletes})</span> : null; })()}</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {[1, 2].map(n => (
+                    <button key={n} data-paletes={n} onClick={() => setContPaletes(n)} style={{ flex: 1, padding: "12px 8px", borderRadius: 8, cursor: "pointer", fontWeight: 800, fontSize: 15,
+                      border: "2px solid " + (contPaletes === n ? "#5CC98E" : "#2A3445"), background: contPaletes === n ? "#16352A" : "#0F141C", color: contPaletes === n ? "#5CC98E" : "#E6EAF2" }}>
+                      {n === 1 ? "1 palete" : "2 paletes"}<div style={{ fontSize: 11.5, fontWeight: 500, color: "#8893A6", marginTop: 2 }}>{n === 1 ? "sobra 1 vaga livre" : "posição cheia"}</div>
+                    </button>))}
+                </div>
+                {!contPaletes && <div style={{ fontSize: 12, color: "#E8B458", marginTop: 8 }}>Escolha antes de confirmar.</div>}
+              </div>
+            )}
             <div style={{ fontSize: 12, color: "#5C6678", marginBottom: 16 }}>Os números do "Sistema" são conferidos de novo no banco na hora de aplicar. O estoque total de cada produto é ajustado pela diferença.</div>
             <div style={{ display: "flex", gap: 10 }}>
-              <Btn variant="primary" icon="check-circle" onClick={aplicarContagem} style={{ opacity: contAplicando ? 0.6 : 1 }}>{contAplicando ? "Aplicando..." : "Confirmar e aplicar"}</Btn>
+              <Btn variant="primary" icon="check-circle" onClick={aplicarContagem} style={{ opacity: contAplicando || (contPedePaletes && !contPaletes) ? 0.5 : 1 }}>{contAplicando ? "Aplicando..." : "Confirmar e aplicar"}</Btn>
               <Btn onClick={() => setContConfirmar(false)}>Voltar</Btn>
             </div>
           </Modal>
